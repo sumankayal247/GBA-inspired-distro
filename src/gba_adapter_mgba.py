@@ -12,8 +12,12 @@ import subprocess
 import time
 import logging
 
-logging.basicConfig(level=logging.INFO, format="[adapter] %(message)s")
-logger = logging.getLogger("gba.adapter")
+# Ensure local src directory is on sys.path
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from common import setup_logging
+logger = setup_logging("gba.adapter")
 
 def find_mgba_binary() -> str:
     candidates = [
@@ -70,6 +74,11 @@ def main():
 
     mgba_bin = find_mgba_binary()
 
+    # If running inside an X11 appliance session, ensure SDL_VIDEODRIVER does not force KMSDRM
+    if "DISPLAY" in os.environ and os.environ.get("SDL_VIDEODRIVER") == "KMSDRM":
+        logger.info("Unsetting SDL_VIDEODRIVER=KMSDRM in X11 environment for mGBA compatibility")
+        del os.environ["SDL_VIDEODRIVER"]
+
     # Determine display mode: fullscreen unless running in desktop test window
     is_windowed = os.environ.get("GBA_WINDOWED", "0") == "1"
 
@@ -88,7 +97,7 @@ def main():
     logger.info("Executing mGBA: %s", " ".join(cmd))
 
     # Child process management with signal forwarding (Rule H7, H9)
-    child = subprocess.Popen(cmd)
+    child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
     def handle_signal(sig, frame):
         logger.info("Adapter received signal %d, forwarding to child %d", sig, child.pid)
@@ -99,6 +108,13 @@ def main():
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
+
+    if child.stdout:
+        for line in iter(child.stdout.readline, ""):
+            cleaned = line.strip()
+            if cleaned:
+                logger.info("[mgba] %s", cleaned)
+        child.stdout.close()
 
     ret = child.wait()
     logger.info("Child mGBA exited with code %d", ret)

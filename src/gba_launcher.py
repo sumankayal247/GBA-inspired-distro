@@ -24,9 +24,12 @@ from common import (
     get_run_dir,
     get_data_dir,
     get_games_dir,
+    setup_logging,
     SYS_CONTRACT_VERSION
 )
 from library import Library
+
+logger = setup_logging("gba.launcher")
 
 # Virtual Canvas Dimensions (2x native GBA 240x160 resolution)
 CANVAS_WIDTH = 480
@@ -462,11 +465,47 @@ class GBALauncher:
     def handle_input(self):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
+                logger.info("Window close event received.")
                 sys.exit(0)
+
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1: # Left click
+                    mx, my = event.pos
+                    # Scale mouse coords into 480x320 virtual canvas
+                    scale = min(self.screen_w // CANVAS_WIDTH, self.screen_h // CANVAS_HEIGHT)
+                    scale = max(1, scale)
+                    scaled_w = CANVAS_WIDTH * scale
+                    scaled_h = CANVAS_HEIGHT * scale
+                    offset_x = (self.screen_w - scaled_w) // 2
+                    offset_y = (self.screen_h - scaled_h) // 2
+                    cx = (mx - offset_x) // scale
+                    cy = (my - offset_y) // scale
+
+                    # Top tabs click
+                    if 8 <= cy <= 32:
+                        for i, tx in enumerate([146, 226, 306]):
+                            if tx - 30 <= cx <= tx + 30:
+                                self.current_tab = i
+                                logger.info("Mouse switched to tab %d (%s)", i, self.tabs[i])
+                                break
+                    # Item list click (left panel)
+                    elif 44 <= cx <= 248 and 42 <= cy <= 276:
+                        clicked_idx = (cy - 42) // 48
+                        items = self.get_current_items()
+                        if 0 <= clicked_idx < len(items):
+                            if self.selected_indices[self.current_tab] == clicked_idx:
+                                self.trigger_action()
+                            else:
+                                self.selected_indices[self.current_tab] = clicked_idx
+                                logger.info("Mouse selected item %d (%s)", clicked_idx, items[clicked_idx].get("title"))
+                    # Launch button click (right panel)
+                    elif 270 <= cx <= 405 and 215 <= cy <= 245:
+                        self.trigger_action()
 
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_TAB:
                     self.current_tab = (self.current_tab + 1) % len(self.tabs)
+                    logger.info("Tab switched to: %s", self.tabs[self.current_tab])
                 elif event.key == pygame.K_RIGHT:
                     self.current_tab = (self.current_tab + 1) % len(self.tabs)
                 elif event.key == pygame.K_LEFT:
@@ -488,6 +527,7 @@ class GBALauncher:
                     if self.current_tab != 0:
                         self.current_tab = 0
                     else:
+                        logger.info("User requested exit from launcher.")
                         sys.exit(0)
 
             elif event.type == pygame.JOYHATMOTION:
@@ -519,6 +559,7 @@ class GBALauncher:
 
         item = items[idx]
         handler = item.get("handler")
+        logger.info("Trigger action: tab=%d item=%s handler=%s", self.current_tab, item.get("title"), handler)
 
         if item["type"] == "game":
             run_dir = get_run_dir()
@@ -529,15 +570,139 @@ class GBALauncher:
                 "handler": handler,
                 "title": item["title"]
             }
+            logger.info("Writing launch request to %s: %s", req_path, req_data)
             with open(req_path, "w", encoding="utf-8") as f:
                 json.dump(req_data, f, indent=2)
             sys.exit(EXIT_CODE_LAUNCH_REQUEST)
 
         elif handler == "internal_reboot":
+            logger.info("User requested system reboot.")
             sys.exit(EXIT_CODE_REBOOT)
 
         elif handler == "internal_poweroff":
+            logger.info("User requested system poweroff.")
             sys.exit(EXIT_CODE_POWEROFF)
+
+        elif handler == "internal_system_monitor":
+            self.show_system_monitor()
+
+        elif handler == "internal_controller_tester":
+            self.show_controller_tester()
+
+        elif handler == "internal_settings_scale":
+            self.cycle_display_scaling()
+
+    def show_system_monitor(self):
+        logger.info("Opening System Monitor modal...")
+        in_modal = True
+        while in_modal:
+            for event in pygame.event.get():
+                if event.type in (pygame.QUIT,):
+                    in_modal = False
+                elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_x, pygame.K_b, pygame.K_RETURN, pygame.K_SPACE):
+                    in_modal = False
+                elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.JOYBUTTONDOWN):
+                    in_modal = False
+
+            overlay = pygame.Surface((CANVAS_WIDTH, CANVAS_HEIGHT), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 180))
+            self.canvas.blit(overlay, (0, 0))
+
+            modal_rect = pygame.Rect(40, 30, 400, 260)
+            pygame.draw.rect(self.canvas, COLOR_BG_PANEL, modal_rect, border_radius=8)
+            pygame.draw.rect(self.canvas, COLOR_ACCENT_GOLD, modal_rect, 2, border_radius=8)
+
+            title_surf = self.font_header.render("SYSTEM DIAGNOSTICS", True, COLOR_ACCENT_GOLD)
+            self.canvas.blit(title_surf, (modal_rect.centerx - title_surf.get_width() // 2, 42))
+
+            disk_info = shutil.disk_usage("/")
+            disk_free_gb = disk_info.free / (1024**3)
+            disk_total_gb = disk_info.total / (1024**3)
+
+            stats = [
+                f"OS: GBA OS V1 (antiX appliance)",
+                f"Contract: Version {SYS_CONTRACT_VERSION}",
+                f"Driver: {pygame.display.get_driver()}",
+                f"Resolution: {self.screen_w}x{self.screen_h}",
+                f"Storage (/): {disk_free_gb:.1f} GB free of {disk_total_gb:.1f} GB",
+                f"ROMs: {len(self.games)} games found in /games",
+                f"Gamepads: {pygame.joystick.get_count()} connected",
+                f"Log File: latest.log active",
+                f"Press (B) or Click to Return"
+            ]
+
+            sy = 72
+            for s in stats:
+                col = COLOR_ACCENT_CYAN if "Press" in s else COLOR_TEXT_LIGHT
+                s_surf = self.font_small.render(s, True, col)
+                self.canvas.blit(s_surf, (60, sy))
+                sy += 18
+
+            self.render()
+            self.clock.tick(30)
+
+    def show_controller_tester(self):
+        logger.info("Opening Input Diagnostics modal...")
+        in_modal = True
+        last_key = "None"
+        while in_modal:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    in_modal = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                        in_modal = False
+                    else:
+                        last_key = f"Key: {pygame.key.name(event.key).upper()}"
+                elif event.type == pygame.JOYBUTTONDOWN:
+                    last_key = f"Button: #{event.button}"
+                elif event.type == pygame.JOYHATMOTION:
+                    last_key = f"D-Pad: {event.value}"
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.pos[1] > 260:
+                    in_modal = False
+
+            overlay = pygame.Surface((CANVAS_WIDTH, CANVAS_HEIGHT), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 180))
+            self.canvas.blit(overlay, (0, 0))
+
+            modal_rect = pygame.Rect(40, 30, 400, 260)
+            pygame.draw.rect(self.canvas, COLOR_BG_PANEL, modal_rect, border_radius=8)
+            pygame.draw.rect(self.canvas, COLOR_ACCENT_CYAN, modal_rect, 2, border_radius=8)
+
+            title_surf = self.font_header.render("INPUT DIAGNOSTICS", True, COLOR_ACCENT_CYAN)
+            self.canvas.blit(title_surf, (modal_rect.centerx - title_surf.get_width() // 2, 42))
+
+            num_j = pygame.joystick.get_count()
+            j_name = pygame.joystick.Joystick(0).get_name() if num_j > 0 else "Keyboard Only"
+
+            info_lines = [
+                f"Connected Gamepads: {num_j}",
+                f"Device: {j_name}",
+                f"Controls Mapping:",
+                f"  D-Pad: Arrow Keys / Controller D-Pad",
+                f"  (A) Button: Z / Enter / Button 0",
+                f"  (B) Button: X / Backspace / Button 1",
+                f"  [Tab]: Switch Category",
+                f"Last Detected Input: {last_key}",
+                f"Press [Esc] or Click Bottom to Return"
+            ]
+
+            sy = 72
+            for l in info_lines:
+                col = COLOR_ACCENT_GOLD if "Last Detected" in l else COLOR_TEXT_LIGHT
+                l_surf = self.font_small.render(l, True, col)
+                self.canvas.blit(l_surf, (60, sy))
+                sy += 18
+
+            self.render()
+            self.clock.tick(30)
+
+    def cycle_display_scaling(self):
+        modes = ["Integer Aspect (Crisp)", "Fullscreen Stretched"]
+        cur = getattr(self, "scaling_mode", 0)
+        self.scaling_mode = (cur + 1) % len(modes)
+        logger.info("Switched display scaling mode to: %s", modes[self.scaling_mode])
+        self.last_outcome = f"Scale: {modes[self.scaling_mode]}"
 
     def run(self):
         if self.screenshot_path:

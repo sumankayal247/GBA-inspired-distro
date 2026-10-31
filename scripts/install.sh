@@ -47,26 +47,53 @@ fi
 # 1. Install TTY1 wrapper
 cat << "EOF_TTY" > /usr/local/bin/gba-tty1-wrapper
 #!/bin/bash
+# ==============================================================================
+# GBA OS Appliance Console Wrapper
+# Launches GBA OS V1 with persistent timestamped logging to /data/logs/
+# ==============================================================================
+
 if grep -q "gba_mode=1" /proc/cmdline 2>/dev/null; then
     exec 0</dev/tty1 1>/dev/tty1 2>&1
     clear
+
+    # Setup persistent logging and runtime directories
+    mkdir -p /data/logs /run/gba /tmp/gba-run
+    chown -R suman:suman /data/logs /run/gba /tmp/gba-run 2>/dev/null || true
+    chmod -R 775 /data/logs /run/gba /tmp/gba-run 2>/dev/null || true
+
+    BOOT_TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
+    LOG_FILE="/data/logs/boot_${BOOT_TIMESTAMP}.log"
+    LATEST_LOG="/data/logs/latest.log"
+
+    # Maintain latest.log symlink
+    rm -f "$LATEST_LOG" 2>/dev/null || true
+    ln -sf "$LOG_FILE" "$LATEST_LOG"
+    chown -h suman:suman "$LATEST_LOG" 2>/dev/null || true
+
+    # Redirect ALL stdout/stderr to screen AND boot log file
+    exec > >(tee -a "$LOG_FILE") 2>&1
+
     echo "=========================================================="
     echo "                   LAUNCHING GBA OS V1                    "
     echo "=========================================================="
+    echo "[boot] Timestamp: $(date +"%Y-%m-%d %H:%M:%S")"
+    echo "[boot] Active Session Log: $LOG_FILE"
+    echo "[boot] Kernel cmdline: $(cat /proc/cmdline 2>/dev/null)"
+    echo "[boot] Active User: $(id)"
+    echo "[boot] Available DRI devices:"
+    ls -l /dev/dri/ 2>/dev/null || echo "  (none)"
+    echo "[boot] Available ROMs in /games:"
+    ls -lh /games/ 2>/dev/null || echo "  (no games found)"
+
     export HOME=/home/suman
     export USER=suman
     export TERM=linux
     export SYS_CONTRACT=1
+    export GBA_LOG_FILE="$LOG_FILE"
     cd /home/suman
 
-    # Try KMSDRM directly first
-    if su - suman -c "export SDL_VIDEODRIVER=KMSDRM; export SDL_KMSDRM_DEVICE_INDEX=0; python3 -c \"import sys, pygame; pygame.display.init(); sys.exit(0)\"" >/dev/null 2>&1; then
-        echo "Starting GBA OS appliance via KMSDRM..."
-        exec su - suman -c "export SDL_VIDEODRIVER=KMSDRM; export SDL_KMSDRM_DEVICE_INDEX=0; /opt/gba-distro/bin/gba-supervisor --appliance"
-    else
-        echo "Starting dedicated GBA OS appliance session..."
-        exec su - suman -c "xinit /opt/gba-distro/bin/gba-supervisor --appliance -- :0 vt1 -nocursor -quiet"
-    fi
+    echo "[boot] Launching dedicated GBA OS console appliance on vt1..."
+    exec su - suman -c "export GBA_LOG_FILE=\"$LOG_FILE\"; unset SDL_VIDEODRIVER; xinit /opt/gba-distro/bin/gba-supervisor --appliance -- :0 vt1 -nocursor -quiet"
 else
     exec /sbin/getty --noclear 38400 "$@"
 fi

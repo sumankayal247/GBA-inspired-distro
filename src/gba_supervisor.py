@@ -23,15 +23,12 @@ from common import (
     get_data_dir,
     get_games_dir,
     get_run_dir,
+    get_current_log_file,
+    setup_logging,
     SYS_CONTRACT_VERSION,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[supervisor %(asctime)s] %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S"
-)
-logger = logging.getLogger("gba.supervisor")
+logger = setup_logging("gba.supervisor")
 
 # Contract constants
 GRACE_PERIOD_SECONDS = 3.0
@@ -94,8 +91,10 @@ class Supervisor:
             except Exception:
                 pass
 
-        logger.info("Starting launcher foreground session...")
-        proc = subprocess.Popen(cmd)
+        env = os.environ.copy()
+        env["GBA_LOG_FILE"] = get_current_log_file()
+        logger.info("Starting launcher foreground session (cmd: %s)...", " ".join(cmd))
+        proc = subprocess.Popen(cmd, env=env)
         ret = proc.wait()
         logger.info("Launcher exited with status code: %d", ret)
 
@@ -143,7 +142,8 @@ class Supervisor:
             "SYS_SAVE_DIR": save_dir,
             "SYS_DATA_DIR": handler_data_dir,
             "SYS_CONFIG_DIR": handler_config_dir,
-            "GBA_WINDOWED": "1" if self.is_desktop_mode else "0"
+            "GBA_WINDOWED": "1" if self.is_desktop_mode else "0",
+            "GBA_LOG_FILE": get_current_log_file()
         })
 
         if not os.path.exists(content_path):
@@ -151,10 +151,10 @@ class Supervisor:
             return "launch-failure"
 
         cmd = [sys.executable, handler_bin]
-        logger.info("Starting handler: %s for entry %s", handler_name, entry_id)
+        logger.info("Starting handler: %s for entry %s (%s)", handler_name, entry_id, content_path)
 
         try:
-            proc = subprocess.Popen(cmd, env=env)
+            proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         except Exception as e:
             logger.error("Failed to start handler process: %s", e)
             return "launch-failure"
@@ -162,15 +162,22 @@ class Supervisor:
         termination_requested = False
         outcome = "unknown"
 
-        # Wait for handler with graceful termination watchdog
+        # Stream handler and emulator output directly into logger and wait
         try:
+            if proc.stdout:
+                for line in iter(proc.stdout.readline, ""):
+                    cleaned = line.strip()
+                    if cleaned:
+                        logger.info("[handler] %s", cleaned)
+                proc.stdout.close()
             ret = proc.wait()
             if ret == 0:
                 outcome = "clean"
             elif ret > 0:
                 outcome = "error"
             else:
-                # Killed by signal without supervisor request
+                outcome = "crash"
+        except KeyboardInterrupt:
                 outcome = "crash"
         except KeyboardInterrupt:
             logger.info("Supervisor requested termination of handler (SIGTERM)...")

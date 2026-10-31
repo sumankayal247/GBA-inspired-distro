@@ -45,6 +45,72 @@ def get_run_dir() -> str:
     os.makedirs(run_dir, exist_ok=True)
     return run_dir
 
+def get_logs_dir() -> str:
+    log_dir = os.path.join(get_data_dir(), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    return log_dir
+
+def get_current_log_file() -> str:
+    """Returns the path to the current boot session log file (Rule D-LOG)."""
+    env_log = os.environ.get("GBA_LOG_FILE")
+    if env_log:
+        return env_log
+    
+    log_dir = get_logs_dir()
+    latest_symlink = os.path.join(log_dir, "latest.log")
+    
+    # If GBA-tty1-wrapper already created a latest.log symlink pointing to current boot log
+    if os.path.islink(latest_symlink):
+        try:
+            target = os.path.realpath(latest_symlink)
+            if os.path.exists(target):
+                os.environ["GBA_LOG_FILE"] = target
+                return target
+        except Exception:
+            pass
+
+    # Create new timestamped log
+    ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = os.path.join(log_dir, f"boot_{ts}.log")
+    os.environ["GBA_LOG_FILE"] = log_path
+    try:
+        if os.path.lexists(latest_symlink):
+            os.remove(latest_symlink)
+        os.symlink(log_path, latest_symlink)
+    except Exception:
+        pass
+    return log_path
+
+def setup_logging(name: str):
+    """Configures centralized timestamped logging to file and console."""
+    import logging
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+    
+    logger.setLevel(logging.DEBUG)
+    log_file = get_current_log_file()
+    
+    formatter = logging.Formatter(
+        "[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    
+    try:
+        fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+    except Exception:
+        pass
+        
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    
+    return logger
+
 def compute_content_id(file_path: str) -> str:
     """Derives a stable cryptographic entry ID from file content (Rule L2)."""
     hasher = hashlib.sha256()
