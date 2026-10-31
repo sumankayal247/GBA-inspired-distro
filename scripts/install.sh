@@ -44,7 +44,17 @@ if [ ! -f "$KERNEL_PATH" ]; then
     INITRD_PATH="/boot/initrd.img-6.6.119-antix.1-amd64-smp"
 fi
 
-# 1. Install TTY1 wrapper
+# 1. Install session runner and TTY1 wrapper
+cat << "EOF_SESSION" > /usr/local/bin/gba-session
+#!/bin/bash
+export DISPLAY="${DISPLAY:-:0}"
+xhost +local: >/dev/null 2>&1 || true
+exec su - suman -c "export DISPLAY=\"$DISPLAY\"; export GBA_LOG_FILE=\"$GBA_LOG_FILE\"; unset SDL_VIDEODRIVER; /opt/gba-distro/bin/gba-supervisor --appliance"
+EOF_SESSION
+chmod +x /usr/local/bin/gba-session
+
+chmod u+s /usr/lib/xorg/Xorg 2>/dev/null || true
+
 cat << "EOF_TTY" > /usr/local/bin/gba-tty1-wrapper
 #!/bin/bash
 # ==============================================================================
@@ -57,7 +67,8 @@ if grep -q "gba_mode=1" /proc/cmdline 2>/dev/null; then
     clear
 
     # Setup persistent logging and runtime directories
-    mkdir -p /data/logs /run/gba /tmp/gba-run
+    mkdir -p /data/logs /run/gba /tmp/gba-run /tmp/.X11-unix
+    chmod 1777 /tmp/.X11-unix 2>/dev/null || true
     chown -R suman:suman /data/logs /run/gba /tmp/gba-run 2>/dev/null || true
     chmod -R 775 /data/logs /run/gba /tmp/gba-run 2>/dev/null || true
 
@@ -85,15 +96,20 @@ if grep -q "gba_mode=1" /proc/cmdline 2>/dev/null; then
     echo "[boot] Available ROMs in /games:"
     ls -lh /games/ 2>/dev/null || echo "  (no games found)"
 
-    export HOME=/home/suman
-    export USER=suman
+    export HOME=/root
     export TERM=linux
     export SYS_CONTRACT=1
     export GBA_LOG_FILE="$LOG_FILE"
-    cd /home/suman
 
     echo "[boot] Launching dedicated GBA OS console appliance on vt1..."
-    exec su - suman -c "export GBA_LOG_FILE=\"$LOG_FILE\"; unset SDL_VIDEODRIVER; xinit /opt/gba-distro/bin/gba-supervisor --appliance -- :0 vt1 -nocursor -quiet"
+    xinit /usr/local/bin/gba-session -- :0 vt1 -nocursor -quiet
+    EXIT_CODE=$?
+
+    echo "[boot] GBA OS session terminated with status code: $EXIT_CODE"
+    if [ "$EXIT_CODE" -ne 0 ]; then
+        echo "[boot] Error detected. Pausing 5 seconds before restart to prevent thrashing..."
+        sleep 5
+    fi
 else
     exec /sbin/getty --noclear 38400 "$@"
 fi
