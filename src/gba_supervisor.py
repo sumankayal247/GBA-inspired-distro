@@ -83,6 +83,8 @@ class Supervisor:
             cmd.extend(["--outcome", self.last_outcome])
         if self.is_desktop_mode:
             cmd.append("--windowed")
+        else:
+            cmd.append("--appliance")
 
         # Clean out any old launch request
         if os.path.exists(self.launch_request_file):

@@ -45,10 +45,67 @@ if [ ! -f "$KERNEL_PATH" ]; then
 fi
 
 # 1. Install session runner and TTY1 wrapper
+mkdir -p /etc/jwm /etc/skel/.config/mgba /home/suman/.config/mgba
+
+cat << "EOF_JWM" > /etc/jwm/gba-jwmrc
+<JWM>
+    <!-- GBA OS Appliance Window Manager Configuration -->
+    <WindowStyle>
+        <Font>-*-fixed-*-*-*-*-10-*-*-*-*-*-*-*</Font>
+        <Width>0</Width>
+        <Height>0</Height>
+    </WindowStyle>
+    <FocusModel>sloppy</FocusModel>
+    <Key key="Escape">close</Key>
+    <Key mask="A" key="F4">close</Key>
+    <Key mask="C" key="q">close</Key>
+    <Group>
+        <Class>mgba</Class>
+        <Option>fullscreen</Option>
+        <Option>noborder</Option>
+        <Option>notitle</Option>
+    </Group>
+    <Group>
+        <Class>pygame</Class>
+        <Option>fullscreen</Option>
+        <Option>noborder</Option>
+        <Option>notitle</Option>
+    </Group>
+</JWM>
+EOF_JWM
+chmod 644 /etc/jwm/gba-jwmrc
+
+cat << "EOF_MGBA_CFG" > /etc/skel/.config/mgba/config.ini
+[ports.sdl]
+fullscreen=1
+lockAspectRatio=1
+lockIntegerScaling=0
+
+[input.SDLK]
+keyUp=1073741906
+keyDown=1073741905
+keyLeft=1073741904
+keyRight=1073741903
+keyA=120
+keyB=122
+keyL=97
+keyR=115
+keyStart=13
+keySelect=8
+EOF_MGBA_CFG
+
+cp /etc/skel/.config/mgba/config.ini /home/suman/.config/mgba/config.ini
+chown -R suman:suman /home/suman/.config/mgba 2>/dev/null || true
+
 cat << "EOF_SESSION" > /usr/local/bin/gba-session
 #!/bin/bash
 export DISPLAY="${DISPLAY:-:0}"
 xhost +local: >/dev/null 2>&1 || true
+
+if [ -x /usr/bin/jwm ]; then
+    su - suman -c "export DISPLAY=\"$DISPLAY\"; /usr/bin/jwm -f /etc/jwm/gba-jwmrc" &
+fi
+
 exec su - suman -c "export DISPLAY=\"$DISPLAY\"; export GBA_LOG_FILE=\"$GBA_LOG_FILE\"; unset SDL_VIDEODRIVER; /opt/gba-distro/bin/gba-supervisor --appliance"
 EOF_SESSION
 chmod +x /usr/local/bin/gba-session

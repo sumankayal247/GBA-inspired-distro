@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pygame
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from common import (
     get_run_dir,
@@ -62,12 +62,14 @@ class GBALauncher:
         last_outcome: Optional[str] = None,
         windowed: bool = False,
         screenshot_path: Optional[str] = None,
-        initial_tab: int = 0
+        initial_tab: int = 0,
+        appliance_mode: bool = False
     ):
         self.focus_id = focus_id
         self.last_outcome = last_outcome
         self.windowed = windowed
         self.screenshot_path = screenshot_path
+        self.appliance_mode = appliance_mode or (not windowed and not screenshot_path) or (os.environ.get("GBA_APPLIANCE") == "1")
         
         self.library = Library()
         self.games = self.library.scan_games()
@@ -412,6 +414,17 @@ class GBALauncher:
             pygame.draw.rect(self.canvas, btn_color, (detail_rect.x + 12, meta_y + 60, 100, 22), width=1, border_radius=4)
             self.canvas.blit(btn_surf, (detail_rect.x + 22, meta_y + 65))
 
+    def screen_to_canvas(self, mx: int, my: int) -> Tuple[int, int]:
+        scale = min(self.screen_w // CANVAS_WIDTH, self.screen_h // CANVAS_HEIGHT)
+        scale = max(1, scale)
+        scaled_w = CANVAS_WIDTH * scale
+        scaled_h = CANVAS_HEIGHT * scale
+        offset_x = (self.screen_w - scaled_w) // 2
+        offset_y = (self.screen_h - scaled_h) // 2
+        cx = (mx - offset_x) // scale
+        cy = (my - offset_y) // scale
+        return cx, cy
+
     def draw_bottom_bar(self):
         """Draws the controller / keyboard hints and outcome banner."""
         pygame.draw.rect(self.canvas, (20, 16, 32), (0, 286, CANVAS_WIDTH, 34))
@@ -426,11 +439,10 @@ class GBALauncher:
             hint_y = 296
 
         hints = [
-            ("(A)", "Select", COLOR_ACCENT_GOLD),
-            ("(B)", "Back", COLOR_TEXT_MUTED),
+            ("(A) / [Enter]", "Select/Launch", COLOR_ACCENT_GOLD),
+            ("(B) / [X]", "Back", COLOR_TEXT_MUTED),
             ("(▲/▼)", "Navigate", COLOR_TEXT_MUTED),
-            ("[Tab]", "Category", COLOR_ACCENT_CYAN),
-            ("[Esc]", "Quit", COLOR_TEXT_MUTED)
+            ("[Tab]", "Category", COLOR_ACCENT_CYAN)
         ]
         hx = 14
         for key, desc, col in hints:
@@ -441,13 +453,15 @@ class GBALauncher:
             self.canvas.blit(d_surf, (hx, hint_y))
             hx += d_surf.get_width() + 14
 
-    def render(self):
-        """Renders the entire canvas and copies to screen with scaling."""
+    def render_base(self):
+        """Renders the standard library canvas."""
         self.canvas.fill(COLOR_BG_DARK)
         self.draw_top_bar()
         self.draw_library_view()
         self.draw_bottom_bar()
 
+    def present(self):
+        """Scales and presents the canvas to the physical display."""
         if not self.screenshot_path:
             scale = min(self.screen_w // CANVAS_WIDTH, self.screen_h // CANVAS_HEIGHT)
             if scale < 1:
@@ -462,24 +476,23 @@ class GBALauncher:
             self.window.blit(scaled_canvas, (offset_x, offset_y))
             pygame.display.flip()
 
+    def render(self):
+        """Renders the entire canvas and copies to screen with scaling."""
+        self.render_base()
+        self.present()
+
     def handle_input(self):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 logger.info("Window close event received.")
-                sys.exit(0)
+                if not self.appliance_mode:
+                    sys.exit(0)
+                else:
+                    logger.info("Appliance mode active: ignoring window close event.")
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1: # Left click
-                    mx, my = event.pos
-                    # Scale mouse coords into 480x320 virtual canvas
-                    scale = min(self.screen_w // CANVAS_WIDTH, self.screen_h // CANVAS_HEIGHT)
-                    scale = max(1, scale)
-                    scaled_w = CANVAS_WIDTH * scale
-                    scaled_h = CANVAS_HEIGHT * scale
-                    offset_x = (self.screen_w - scaled_w) // 2
-                    offset_y = (self.screen_h - scaled_h) // 2
-                    cx = (mx - offset_x) // scale
-                    cy = (my - offset_y) // scale
+                    cx, cy = self.screen_to_canvas(*event.pos)
 
                     # Top tabs click
                     if 8 <= cy <= 32:
@@ -527,8 +540,11 @@ class GBALauncher:
                     if self.current_tab != 0:
                         self.current_tab = 0
                     else:
-                        logger.info("User requested exit from launcher.")
-                        sys.exit(0)
+                        if not self.appliance_mode:
+                            logger.info("User requested exit from launcher.")
+                            sys.exit(0)
+                        else:
+                            logger.info("Already on primary tab (Games); staying active.")
 
             elif event.type == pygame.JOYHATMOTION:
                 hat_x, hat_y = event.value
@@ -551,6 +567,126 @@ class GBALauncher:
                 elif event.button == 1:
                     self.current_tab = 0
 
+    def show_launch_confirmation(self, item: Dict[str, Any]) -> bool:
+        """Displays full controls reference before launching emulator (interactive with 3.5s auto-launch)."""
+        if self.screenshot_path:
+            return True
+
+        logger.info("Showing launch confirmation for: %s", item.get("title"))
+        start_time = time.time()
+        timeout = 3.5
+        in_modal = True
+
+        while in_modal:
+            elapsed = time.time() - start_time
+            remaining = max(0.0, timeout - elapsed)
+            if remaining <= 0:
+                logger.info("Launch confirmation auto-timed out, starting game.")
+                return True
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    if not self.appliance_mode:
+                        return False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_x, pygame.K_z):
+                        logger.info("User started game immediately via key.")
+                        return True
+                    elif event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                        logger.info("User cancelled launch via key.")
+                        return False
+                elif event.type == pygame.JOYBUTTONDOWN:
+                    if event.button == 0:
+                        return True
+                    elif event.button == 1:
+                        return False
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if event.button == 1:
+                        cx, cy = self.screen_to_canvas(*event.pos)
+                        # [Enter] START NOW button
+                        if 60 <= cx <= 230 and 222 <= cy <= 250:
+                            return True
+                        # [Esc] CANCEL button
+                        elif 250 <= cx <= 420 and 222 <= cy <= 250:
+                            return False
+
+            self.render_base()
+
+            # Translucent dark backdrop
+            overlay = pygame.Surface((CANVAS_WIDTH, CANVAS_HEIGHT), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 200))
+            self.canvas.blit(overlay, (0, 0))
+
+            modal_rect = pygame.Rect(35, 18, 410, 284)
+            pygame.draw.rect(self.canvas, COLOR_BG_PANEL, modal_rect, border_radius=8)
+            pygame.draw.rect(self.canvas, COLOR_ACCENT_GOLD, modal_rect, 2, border_radius=8)
+
+            # Header
+            title_badge = self.font_small.render("GBA APPLIANCE RUNNER", True, COLOR_ACCENT_CYAN)
+            self.canvas.blit(title_badge, (modal_rect.centerx - title_badge.get_width() // 2, 26))
+
+            game_title = self.font_header.render(item.get("title", "GBA Game"), True, (255, 255, 255))
+            self.canvas.blit(game_title, (modal_rect.centerx - game_title.get_width() // 2, 42))
+
+            # Divider
+            pygame.draw.line(self.canvas, COLOR_BORDER, (modal_rect.x + 20, 64), (modal_rect.right - 20, 64), 1)
+
+            # Controls Box
+            ctrl_rect = pygame.Rect(modal_rect.x + 20, 70, modal_rect.width - 40, 142)
+            pygame.draw.rect(self.canvas, (18, 14, 30), ctrl_rect, border_radius=6)
+            pygame.draw.rect(self.canvas, (50, 40, 75), ctrl_rect, 1, border_radius=6)
+
+            ctrl_title = self.font_small.render("CONTROLS QUICK REFERENCE", True, COLOR_ACCENT_GOLD)
+            self.canvas.blit(ctrl_title, (ctrl_rect.x + 12, ctrl_rect.y + 8))
+
+            controls = [
+                ("[Enter]", "START (Press Enter in game to start!)", COLOR_ACCENT_CYAN),
+                ("[Arrow Keys]", "D-Pad / Directional movement", COLOR_TEXT_WHITE),
+                ("[X] Key", "GBA (A) Button - Action / Jump", COLOR_TEXT_WHITE),
+                ("[Z] Key", "GBA (B) Button - Cancel / Dash", COLOR_TEXT_WHITE),
+                ("[A] / [S]", "GBA (L) / (R) Shoulder Triggers", COLOR_TEXT_WHITE),
+                ("[Escape]", "EXIT GAME -> Returns to this Menu!", COLOR_ACCENT_RED)
+            ]
+
+            cy = ctrl_rect.y + 26
+            for key_lbl, desc_lbl, col in controls:
+                k_surf = self.font_small.render(f"{key_lbl:<14}", True, col)
+                d_surf = self.font_small.render(desc_lbl, True, COLOR_TEXT_WHITE if col != COLOR_ACCENT_RED else COLOR_ACCENT_RED)
+                self.canvas.blit(k_surf, (ctrl_rect.x + 12, cy))
+                self.canvas.blit(d_surf, (ctrl_rect.x + 105, cy))
+                cy += 18
+
+            # Bottom buttons
+            btn_start = pygame.Rect(modal_rect.x + 25, 222, 170, 26)
+            pygame.draw.rect(self.canvas, (50, 40, 85), btn_start, border_radius=4)
+            pygame.draw.rect(self.canvas, COLOR_ACCENT_GOLD, btn_start, 2, border_radius=4)
+            s_lbl = self.font_small.render("[Enter] START NOW", True, COLOR_ACCENT_GOLD)
+            self.canvas.blit(s_lbl, (btn_start.centerx - s_lbl.get_width() // 2, btn_start.centery - s_lbl.get_height() // 2))
+
+            btn_cancel = pygame.Rect(modal_rect.right - 195, 222, 170, 26)
+            pygame.draw.rect(self.canvas, (35, 25, 55), btn_cancel, border_radius=4)
+            pygame.draw.rect(self.canvas, (80, 70, 110), btn_cancel, 1, border_radius=4)
+            c_lbl = self.font_small.render("[Esc] CANCEL", True, COLOR_TEXT_MUTED)
+            self.canvas.blit(c_lbl, (btn_cancel.centerx - c_lbl.get_width() // 2, btn_cancel.centery - c_lbl.get_height() // 2))
+
+            # Auto countdown note + progress bar
+            auto_msg = f"Auto-launching in {int(remaining) + 1}s... (Press Enter to start immediately)"
+            auto_note = self.font_small.render(auto_msg, True, COLOR_ACCENT_CYAN)
+            self.canvas.blit(auto_note, (modal_rect.centerx - auto_note.get_width() // 2, 256))
+
+            bar_w = modal_rect.width - 50
+            bar_rect = pygame.Rect(modal_rect.x + 25, 272, bar_w, 4)
+            pygame.draw.rect(self.canvas, (30, 25, 45), bar_rect, border_radius=2)
+            fill_w = int(bar_w * (elapsed / timeout))
+            if fill_w > 0:
+                fill_rect = pygame.Rect(modal_rect.x + 25, 272, min(bar_w, fill_w), 4)
+                pygame.draw.rect(self.canvas, COLOR_ACCENT_CYAN, fill_rect, border_radius=2)
+
+            self.present()
+            self.clock.tick(30)
+
+        return True
+
     def trigger_action(self):
         items = self.get_current_items()
         idx = self.selected_indices[self.current_tab]
@@ -562,6 +698,11 @@ class GBALauncher:
         logger.info("Trigger action: tab=%d item=%s handler=%s", self.current_tab, item.get("title"), handler)
 
         if item["type"] == "game":
+            proceed = self.show_launch_confirmation(item)
+            if not proceed:
+                logger.info("Game launch aborted by user.")
+                return
+
             run_dir = get_run_dir()
             req_path = os.path.join(run_dir, "launch_request.json")
             req_data = {
@@ -604,6 +745,8 @@ class GBALauncher:
                 elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.JOYBUTTONDOWN):
                     in_modal = False
 
+            self.render_base()
+
             overlay = pygame.Surface((CANVAS_WIDTH, CANVAS_HEIGHT), pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 180))
             self.canvas.blit(overlay, (0, 0))
@@ -628,17 +771,17 @@ class GBALauncher:
                 f"ROMs: {len(self.games)} games found in /games",
                 f"Gamepads: {pygame.joystick.get_count()} connected",
                 f"Log File: latest.log active",
-                f"Press (B) or Click to Return"
+                f"Press [Esc], (B) or Click to Return"
             ]
 
             sy = 72
             for s in stats:
-                col = COLOR_ACCENT_CYAN if "Press" in s else COLOR_TEXT_LIGHT
+                col = COLOR_ACCENT_CYAN if "Press" in s else COLOR_TEXT_WHITE
                 s_surf = self.font_small.render(s, True, col)
                 self.canvas.blit(s_surf, (60, sy))
                 sy += 18
 
-            self.render()
+            self.present()
             self.clock.tick(30)
 
     def show_controller_tester(self):
@@ -660,6 +803,8 @@ class GBALauncher:
                     last_key = f"D-Pad: {event.value}"
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.pos[1] > 260:
                     in_modal = False
+
+            self.render_base()
 
             overlay = pygame.Surface((CANVAS_WIDTH, CANVAS_HEIGHT), pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 180))
@@ -689,12 +834,12 @@ class GBALauncher:
 
             sy = 72
             for l in info_lines:
-                col = COLOR_ACCENT_GOLD if "Last Detected" in l else COLOR_TEXT_LIGHT
+                col = COLOR_ACCENT_GOLD if "Last Detected" in l else COLOR_TEXT_WHITE
                 l_surf = self.font_small.render(l, True, col)
                 self.canvas.blit(l_surf, (60, sy))
                 sy += 18
 
-            self.render()
+            self.present()
             self.clock.tick(30)
 
     def cycle_display_scaling(self):
@@ -722,6 +867,7 @@ def main():
     parser.add_argument("--outcome", type=str, help="Previous session outcome class")
     parser.add_argument("--tab", type=int, default=0, help="Initial tab index")
     parser.add_argument("--windowed", action="store_true", help="Run in a window")
+    parser.add_argument("--appliance", action="store_true", help="Run in dedicated appliance mode")
     parser.add_argument("--screenshot", type=str, help="Save screenshot to file and exit")
     args = parser.parse_args()
 
@@ -730,7 +876,8 @@ def main():
         last_outcome=args.outcome,
         windowed=args.windowed,
         screenshot_path=args.screenshot,
-        initial_tab=args.tab
+        initial_tab=args.tab,
+        appliance_mode=args.appliance
     )
     launcher.run()
 
