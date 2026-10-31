@@ -134,3 +134,105 @@ def extract_gba_title(file_path: str) -> str:
     # Fallback to file base name without extension
     base = os.path.splitext(os.path.basename(file_path))[0]
     return base.replace("_", " ").replace("-", " ")
+
+DEFAULT_KEYBINDINGS = {
+    "keyUp": 1073741906,     # Up Arrow
+    "keyDown": 1073741905,   # Down Arrow
+    "keyLeft": 1073741904,   # Left Arrow
+    "keyRight": 1073741903,  # Right Arrow
+    "keySelect": 8,          # Backspace (GBA SELECT)
+    "keyA": 120,             # X key (GBA A)
+    "keyB": 122,             # Z key (GBA B)
+    "keyL": 97,              # A key (GBA L)
+    "keyR": 115,             # S key (GBA R)
+    "keyStart": 13           # Enter / Return (GBA START)
+}
+
+GBA_BUTTON_ORDER = [
+    ("keyUp", "D-PAD UP"),
+    ("keyDown", "D-PAD DOWN"),
+    ("keyLeft", "D-PAD LEFT"),
+    ("keyRight", "D-PAD RIGHT"),
+    ("keySelect", "SELECT"),
+    ("keyA", "A BUTTON"),
+    ("keyB", "B BUTTON"),
+    ("keyL", "L TRIGGER"),
+    ("keyR", "R TRIGGER"),
+    ("keyStart", "START")
+]
+
+def load_keybindings() -> dict:
+    """Loads active keybindings from config files, falling back to defaults."""
+    import configparser
+    bindings = dict(DEFAULT_KEYBINDINGS)
+    
+    # 1. Try JSON config in data_dir
+    json_path = os.path.join(get_data_dir(), "config", "keybindings.json")
+    if os.path.isfile(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for k, v in data.items():
+                    if k in bindings and isinstance(v, int):
+                        bindings[k] = v
+                return bindings
+        except Exception:
+            pass
+
+    # 2. Try mGBA config.ini
+    mgba_cfg = os.path.expanduser("~/.config/mgba/config.ini")
+    if os.path.isfile(mgba_cfg):
+        try:
+            cp = configparser.ConfigParser()
+            cp.optionxform = str
+            cp.read(mgba_cfg)
+            if "input.SDLK" in cp:
+                for k in bindings.keys():
+                    if k in cp["input.SDLK"]:
+                        bindings[k] = int(cp["input.SDLK"][k])
+                return bindings
+        except Exception:
+            pass
+
+    return bindings
+
+def save_keybindings(bindings: dict) -> None:
+    """Persists keybindings to both JSON config and mGBA config.ini."""
+    import configparser
+    # 1. Save JSON config in data_dir
+    config_dir = os.path.join(get_data_dir(), "config")
+    os.makedirs(config_dir, exist_ok=True)
+    json_path = os.path.join(config_dir, "keybindings.json")
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(bindings, f, indent=2)
+    except Exception:
+        pass
+
+    # 2. Save to user mGBA config.ini
+    paths = [
+        os.path.expanduser("~/.config/mgba/config.ini"),
+        "/home/suman/.config/mgba/config.ini"
+    ]
+    for p in paths:
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            cp = configparser.ConfigParser()
+            cp.optionxform = str
+            if os.path.isfile(p):
+                cp.read(p)
+            if "ports.sdl" not in cp:
+                cp["ports.sdl"] = {
+                    "fullscreen": "1",
+                    "lockAspectRatio": "1",
+                    "lockIntegerScaling": "0"
+                }
+            if "input.SDLK" not in cp:
+                cp["input.SDLK"] = {}
+            for k, v in bindings.items():
+                cp["input.SDLK"][k] = str(v)
+            with open(p, "w", encoding="utf-8") as f:
+                cp.write(f)
+        except Exception:
+            pass
+

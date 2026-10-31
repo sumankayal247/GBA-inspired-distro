@@ -144,6 +144,15 @@ class Library:
         """Returns standard settings options."""
         return [
             {
+                "id": "setting_controls",
+                "title": "Remap Keys",
+                "type": "settings",
+                "format": "KEY",
+                "description": "Customize keys for A, B, L, R, D-Pad, Start & Select",
+                "handler": "internal_settings_controls",
+                "args": []
+            },
+            {
                 "id": "setting_scale",
                 "title": "Display Scaling",
                 "type": "settings",

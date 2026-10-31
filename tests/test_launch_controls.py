@@ -19,9 +19,9 @@ class TestLaunchControls(unittest.TestCase):
         self.assertTrue(os.path.exists(cfg))
         with open(cfg, "r") as f:
             content = f.read()
-        self.assertIn("fullscreen=1", content)
-        self.assertIn("keyStart=13", content)
-        self.assertIn("keyA=120", content)
+        self.assertTrue("fullscreen = 1" in content or "fullscreen=1" in content)
+        self.assertTrue("keyStart = 13" in content or "keyStart=13" in content)
+        self.assertTrue("keyA = 120" in content or "keyA=120" in content)
 
     def test_launcher_screen_to_canvas(self):
         os.environ["SDL_VIDEODRIVER"] = "dummy"
@@ -35,6 +35,21 @@ class TestLaunchControls(unittest.TestCase):
     def test_appliance_mode_flag(self):
         launcher = GBALauncher(appliance_mode=True, screenshot_path="/tmp/test_sc.png")
         self.assertTrue(launcher.appliance_mode)
+
+    def test_remap_and_save_keybindings(self):
+        from common import load_keybindings, save_keybindings, DEFAULT_KEYBINDINGS
+        b = load_keybindings()
+        original_a = b["keyA"]
+        b["keyA"] = 32 # SPACE
+        save_keybindings(b)
+
+        reloaded = load_keybindings()
+        self.assertEqual(reloaded["keyA"], 32)
+
+        # Restore
+        b["keyA"] = original_a
+        save_keybindings(b)
+        self.assertEqual(load_keybindings()["keyA"], original_a)
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,7 +25,11 @@ from common import (
     get_data_dir,
     get_games_dir,
     setup_logging,
-    SYS_CONTRACT_VERSION
+    SYS_CONTRACT_VERSION,
+    load_keybindings,
+    save_keybindings,
+    DEFAULT_KEYBINDINGS,
+    GBA_BUTTON_ORDER
 )
 from library import Library
 
@@ -75,6 +79,7 @@ class GBALauncher:
         self.games = self.library.scan_games()
         self.apps = self.library.get_built_in_apps()
         self.settings = self.library.get_settings_entries()
+        self.keybindings = load_keybindings()
 
         # Tabs: 0: GAMES, 1: APPS, 2: SETTINGS
         self.tabs = ["GAMES", "APPS", "SETTINGS"]
@@ -425,6 +430,35 @@ class GBALauncher:
         cy = (my - offset_y) // scale
         return cx, cy
 
+    def format_key_name(self, keycode: int) -> str:
+        """Returns clean uppercase human-readable name for an SDL2/pygame keycode."""
+        special = {
+            13: "RETURN",
+            8: "BACKSPACE",
+            32: "SPACE",
+            9: "TAB",
+            27: "ESCAPE",
+            1073741906: "UP ARROW",
+            1073741905: "DOWN ARROW",
+            1073741904: "LEFT ARROW",
+            1073741903: "RIGHT ARROW",
+            1073742048: "L-CTRL",
+            1073742049: "L-SHIFT",
+            1073742050: "L-ALT",
+            1073742052: "R-CTRL",
+            1073742053: "R-SHIFT",
+            1073742054: "R-ALT"
+        }
+        if keycode in special:
+            return special[keycode]
+        try:
+            name = pygame.key.name(keycode).upper()
+            if len(name) == 1:
+                return f"{name} KEY"
+            return name
+        except Exception:
+            return f"KEY {keycode}"
+
     def draw_bottom_bar(self):
         """Draws the controller / keyboard hints and outcome banner."""
         pygame.draw.rect(self.canvas, (20, 16, 32), (0, 286, CANVAS_WIDTH, 34))
@@ -639,12 +673,18 @@ class GBALauncher:
             ctrl_title = self.font_small.render("CONTROLS QUICK REFERENCE", True, COLOR_ACCENT_GOLD)
             self.canvas.blit(ctrl_title, (ctrl_rect.x + 12, ctrl_rect.y + 8))
 
+            k_start = self.format_key_name(self.keybindings.get("keyStart", 13))
+            k_a = self.format_key_name(self.keybindings.get("keyA", 120))
+            k_b = self.format_key_name(self.keybindings.get("keyB", 122))
+            k_l = self.format_key_name(self.keybindings.get("keyL", 97))
+            k_r = self.format_key_name(self.keybindings.get("keyR", 115))
+
             controls = [
-                ("[Enter]", "START (Press Enter in game to start!)", COLOR_ACCENT_CYAN),
+                (f"[{k_start}]", "START (Press in game to start!)", COLOR_ACCENT_CYAN),
                 ("[Arrow Keys]", "D-Pad / Directional movement", COLOR_TEXT_WHITE),
-                ("[X] Key", "GBA (A) Button - Action / Jump", COLOR_TEXT_WHITE),
-                ("[Z] Key", "GBA (B) Button - Cancel / Dash", COLOR_TEXT_WHITE),
-                ("[A] / [S]", "GBA (L) / (R) Shoulder Triggers", COLOR_TEXT_WHITE),
+                (f"[{k_a}]", "GBA (A) Button - Action / Jump", COLOR_TEXT_WHITE),
+                (f"[{k_b}]", "GBA (B) Button - Cancel / Dash", COLOR_TEXT_WHITE),
+                (f"[{k_l}] / [{k_r}]", "GBA (L) / (R) Shoulder Triggers", COLOR_TEXT_WHITE),
                 ("[Escape]", "EXIT GAME -> Returns to this Menu!", COLOR_ACCENT_RED)
             ]
 
@@ -730,8 +770,180 @@ class GBALauncher:
         elif handler == "internal_controller_tester":
             self.show_controller_tester()
 
+        elif handler == "internal_settings_controls":
+            self.show_controls_config()
+
         elif handler == "internal_settings_scale":
             self.cycle_display_scaling()
+
+    def show_controls_config(self):
+        """Displays interactive keyboard controls remapping modal."""
+        logger.info("Opening Keyboard Controls Configuration modal...")
+        in_modal = True
+        sel_idx = 0
+        listening = False
+
+        while in_modal:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    if not self.appliance_mode:
+                        in_modal = False
+
+                elif event.type == pygame.KEYDOWN:
+                    if listening:
+                        # Assign pressed key to selected button
+                        if event.key == pygame.K_ESCAPE:
+                            logger.info("User cancelled key remapping for button.")
+                            listening = False
+                        else:
+                            btn_id, btn_label = GBA_BUTTON_ORDER[sel_idx]
+                            self.keybindings[btn_id] = event.key
+                            save_keybindings(self.keybindings)
+                            logger.info("Mapped button %s (%s) -> key %d (%s)", btn_id, btn_label, event.key, pygame.key.name(event.key))
+                            listening = False
+                    else:
+                        if event.key == pygame.K_UP:
+                            if sel_idx % 5 > 0:
+                                sel_idx -= 1
+                            else:
+                                sel_idx += 4
+                        elif event.key == pygame.K_DOWN:
+                            if sel_idx % 5 < 4:
+                                sel_idx += 1
+                            else:
+                                sel_idx -= 4
+                        elif event.key in (pygame.K_LEFT, pygame.K_RIGHT):
+                            sel_idx = (sel_idx + 5) % 10
+                        elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                            listening = True
+                        elif event.key == pygame.K_r:
+                            self.keybindings = dict(DEFAULT_KEYBINDINGS)
+                            save_keybindings(self.keybindings)
+                            logger.info("Reset keybindings to defaults.")
+                        elif event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                            in_modal = False
+
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    cx, cy = self.screen_to_canvas(*event.pos)
+                    clicked_item = None
+                    if 40 <= cx <= 235:
+                        row = (cy - 74) // 34
+                        if 0 <= row <= 4:
+                            clicked_item = row
+                    elif 245 <= cx <= 440:
+                        row = (cy - 74) // 34
+                        if 0 <= row <= 4:
+                            clicked_item = row + 5
+
+                    if clicked_item is not None:
+                        if sel_idx == clicked_item:
+                            listening = not listening
+                        else:
+                            sel_idx = clicked_item
+                            listening = False
+
+                    elif 40 <= cx <= 220 and 252 <= cy <= 280:
+                        self.keybindings = dict(DEFAULT_KEYBINDINGS)
+                        save_keybindings(self.keybindings)
+                        logger.info("Reset keybindings to defaults via click.")
+                        listening = False
+                    elif 260 <= cx <= 440 and 252 <= cy <= 280:
+                        in_modal = False
+
+            self.render_base()
+
+            # Translucent backdrop
+            overlay = pygame.Surface((CANVAS_WIDTH, CANVAS_HEIGHT), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 200))
+            self.canvas.blit(overlay, (0, 0))
+
+            modal_rect = pygame.Rect(25, 18, 430, 284)
+            pygame.draw.rect(self.canvas, COLOR_BG_PANEL, modal_rect, border_radius=8)
+            pygame.draw.rect(self.canvas, COLOR_ACCENT_GOLD, modal_rect, 2, border_radius=8)
+
+            title_surf = self.font_header.render("KEYBOARD CONTROLS CONFIGURATION", True, COLOR_ACCENT_GOLD)
+            self.canvas.blit(title_surf, (modal_rect.centerx - title_surf.get_width() // 2, 28))
+
+            if listening:
+                cur_label = GBA_BUTTON_ORDER[sel_idx][1]
+                sub_text = f"PRESS ANY KEY TO ASSIGN TO {cur_label} (ESC TO CANCEL)"
+                sub_col = COLOR_ACCENT_GOLD
+            else:
+                sub_text = "Select an action with Arrow/Mouse, press Enter to remap"
+                sub_col = COLOR_TEXT_MUTED
+
+            sub_surf = self.font_small.render(sub_text, True, sub_col)
+            self.canvas.blit(sub_surf, (modal_rect.centerx - sub_surf.get_width() // 2, 48))
+
+            pygame.draw.line(self.canvas, COLOR_BORDER, (modal_rect.x + 15, 64), (modal_rect.right - 15, 64), 1)
+
+            col1_items = GBA_BUTTON_ORDER[0:5]
+            col2_items = GBA_BUTTON_ORDER[5:10]
+
+            # Column 1
+            y = 74
+            for idx, (btn_id, btn_label) in enumerate(col1_items):
+                is_selected = (sel_idx == idx)
+                rect = pygame.Rect(40, y, 195, 30)
+                bg = (60, 50, 95) if is_selected else (26, 21, 40)
+                border_col = COLOR_ACCENT_GOLD if is_selected else COLOR_BORDER
+                pygame.draw.rect(self.canvas, bg, rect, border_radius=5)
+                pygame.draw.rect(self.canvas, border_col, rect, 1, border_radius=5)
+
+                if is_selected and listening:
+                    v_str = "[PRESS KEY...]"
+                    v_col = COLOR_ACCENT_GOLD
+                else:
+                    k_code = self.keybindings.get(btn_id, DEFAULT_KEYBINDINGS[btn_id])
+                    v_str = self.format_key_name(k_code)
+                    v_col = COLOR_ACCENT_GOLD if is_selected else COLOR_TEXT_MUTED
+
+                t_surf = self.font_small.render(btn_label, True, COLOR_ACCENT_CYAN if is_selected else COLOR_TEXT_WHITE)
+                v_surf = self.font_small.render(v_str, True, v_col)
+                self.canvas.blit(t_surf, (rect.x + 10, rect.centery - t_surf.get_height() // 2))
+                self.canvas.blit(v_surf, (rect.right - v_surf.get_width() - 10, rect.centery - v_surf.get_height() // 2))
+                y += 34
+
+            # Column 2
+            y = 74
+            for idx, (btn_id, btn_label) in enumerate(col2_items):
+                global_idx = idx + 5
+                is_selected = (sel_idx == global_idx)
+                rect = pygame.Rect(245, y, 195, 30)
+                bg = (60, 50, 95) if is_selected else (26, 21, 40)
+                border_col = COLOR_ACCENT_GOLD if is_selected else COLOR_BORDER
+                pygame.draw.rect(self.canvas, bg, rect, border_radius=5)
+                pygame.draw.rect(self.canvas, border_col, rect, 1, border_radius=5)
+
+                if is_selected and listening:
+                    v_str = "[PRESS KEY...]"
+                    v_col = COLOR_ACCENT_GOLD
+                else:
+                    k_code = self.keybindings.get(btn_id, DEFAULT_KEYBINDINGS[btn_id])
+                    v_str = self.format_key_name(k_code)
+                    v_col = COLOR_ACCENT_GOLD if is_selected else COLOR_TEXT_MUTED
+
+                t_surf = self.font_small.render(btn_label, True, COLOR_ACCENT_CYAN if is_selected else COLOR_TEXT_WHITE)
+                v_surf = self.font_small.render(v_str, True, v_col)
+                self.canvas.blit(t_surf, (rect.x + 10, rect.centery - t_surf.get_height() // 2))
+                self.canvas.blit(v_surf, (rect.right - v_surf.get_width() - 10, rect.centery - v_surf.get_height() // 2))
+                y += 34
+
+            # Bottom action buttons
+            btn_reset = pygame.Rect(40, 252, 180, 28)
+            pygame.draw.rect(self.canvas, (35, 25, 55), btn_reset, border_radius=4)
+            pygame.draw.rect(self.canvas, (80, 70, 110), btn_reset, 1, border_radius=4)
+            r_lbl = self.font_small.render("[R] Reset Defaults", True, COLOR_TEXT_MUTED)
+            self.canvas.blit(r_lbl, (btn_reset.centerx - r_lbl.get_width() // 2, btn_reset.centery - r_lbl.get_height() // 2))
+
+            btn_done = pygame.Rect(260, 252, 180, 28)
+            pygame.draw.rect(self.canvas, (50, 40, 85), btn_done, border_radius=4)
+            pygame.draw.rect(self.canvas, COLOR_ACCENT_GOLD, btn_done, 2, border_radius=4)
+            d_lbl = self.font_small.render("[Esc / Enter] Save & Return", True, COLOR_ACCENT_GOLD)
+            self.canvas.blit(d_lbl, (btn_done.centerx - d_lbl.get_width() // 2, btn_done.centery - d_lbl.get_height() // 2))
+
+            self.present()
+            self.clock.tick(30)
 
     def show_system_monitor(self):
         logger.info("Opening System Monitor modal...")
