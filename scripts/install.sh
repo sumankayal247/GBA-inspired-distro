@@ -77,29 +77,43 @@ if [ -f /etc/init.d/slimski ] && ! grep -q "gba_mode=1" /etc/init.d/slimski; the
     sed -i '/start)/a \    if grep -q "gba_mode=1" /proc/cmdline 2>/dev/null; then\n       log_daemon_msg "GBA OS appliance mode active: skipping display manager." "$NAME"\n       exit 0\n    fi' /etc/init.d/slimski
 fi
 
-# 4. Configure GRUB 40_custom
-GRUB_CUSTOM="/etc/grub.d/40_custom"
+# 4. Configure GRUB menu display override
+mkdir -p /etc/default/grub.d
+cat << "EOF_GRUB_D" > /etc/default/grub.d/99_gba.cfg
+# Force GRUB menu to ALWAYS show with a 10-second countdown
+GRUB_TIMEOUT_STYLE=menu
+GRUB_TIMEOUT=10
+GRUB_RECORDFAIL_TIMEOUT=10
+GRUB_GFXMODE=auto,keep
+GRUB_DISABLE_SUBMENU=n
+EOF_GRUB_D
 
-# Remove any previous GBA OS entry in 40_custom
-sed -i '/### BEGIN GBA OS ###/,/### END GBA OS ###/d' "$GRUB_CUSTOM"
-
-cat <<EOF >> "$GRUB_CUSTOM"
-### BEGIN GBA OS ###
-menuentry 'GBA OS (V1 Appliance Mode)' --class gba --class gnu-linux --class os {
+# 5. Configure GRUB 11_gba_os entry
+cat <<EOF > /etc/grub.d/11_gba_os
+#!/bin/sh
+exec tail -n +3 \$0
+# GBA OS Top-Level Entry (Placed directly after primary antiX entry)
+menuentry "GBA OS (V1 Appliance Mode)" --class gba --class gnu-linux --class os {
 	load_video
 	insmod gzio
 	insmod part_gpt
 	insmod ext2
 	search --no-floppy --fs-uuid --set=root $ROOT_UUID
-	echo 'Starting GBA OS Appliance...'
+	echo "Starting GBA OS Appliance..."
 	linux $KERNEL_PATH root=UUID=$ROOT_UUID ro quiet selinux=0 gba_mode=1
 	initrd $INITRD_PATH
 }
-### END GBA OS ###
 EOF
+chmod +x /etc/grub.d/11_gba_os
+
+# Clean any old entry in 40_custom
+if [ -f /etc/grub.d/40_custom ]; then
+    sed -i "/### BEGIN GBA OS ###/,/### END GBA OS ###/d" /etc/grub.d/40_custom
+fi
 
 echo "Updating GRUB configuration..."
 update-grub
+grub-set-default 0
 
 echo "=== 3. Creating Desktop Shortcut ==="
 cat <<EOF > /home/suman/Desktop/gba-os.desktop
