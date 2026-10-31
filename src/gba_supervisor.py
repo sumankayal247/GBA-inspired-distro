@@ -74,6 +74,10 @@ class Supervisor:
         launcher_script = os.path.join(self.base_dir, "src", "gba_launcher.py")
         if not os.path.exists(launcher_script):
             launcher_script = os.path.join(os.path.dirname(__file__), "gba_launcher.py")
+        if not os.path.exists(launcher_script):
+            launcher_script = os.path.join(os.path.dirname(__file__), "gba-launcher")
+        if not os.path.exists(launcher_script):
+            launcher_script = os.path.join(self.base_dir, "bin", "gba-launcher")
 
         cmd = [sys.executable, launcher_script]
         if self.last_entry_id:

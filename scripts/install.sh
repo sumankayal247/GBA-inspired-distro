@@ -56,26 +56,42 @@ if grep -q "gba_mode=1" /proc/cmdline 2>/dev/null; then
     export HOME=/home/suman
     export USER=suman
     export TERM=linux
-    export SDL_VIDEODRIVER=KMSDRM
-    export SDL_KMSDRM_DEVICE_INDEX=0
     export SYS_CONTRACT=1
     cd /home/suman
-    exec su - suman -c "export SDL_VIDEODRIVER=KMSDRM; export SDL_KMSDRM_DEVICE_INDEX=0; /opt/gba-distro/bin/gba-supervisor --appliance"
+
+    # Try KMSDRM directly first
+    if su - suman -c "export SDL_VIDEODRIVER=KMSDRM; export SDL_KMSDRM_DEVICE_INDEX=0; python3 -c \"import sys, pygame; pygame.display.init(); sys.exit(0)\"" >/dev/null 2>&1; then
+        echo "Starting GBA OS appliance via KMSDRM..."
+        exec su - suman -c "export SDL_VIDEODRIVER=KMSDRM; export SDL_KMSDRM_DEVICE_INDEX=0; /opt/gba-distro/bin/gba-supervisor --appliance"
+    else
+        echo "Starting dedicated GBA OS appliance session..."
+        exec su - suman -c "xinit /opt/gba-distro/bin/gba-supervisor --appliance -- :0 vt1 -nocursor -quiet"
+    fi
 else
     exec /sbin/getty --noclear 38400 "$@"
 fi
 EOF_TTY
 chmod +x /usr/local/bin/gba-tty1-wrapper
 
-# 2. Configure /etc/inittab for tty1 wrapper
+# 2. Configure /etc/inittab (SysVinit systems)
 if [ -f /etc/inittab ] && ! grep -q "gba-tty1-wrapper" /etc/inittab; then
     sed -i 's|^1:2345:respawn:/sbin/getty --noclear 38400 tty1|1:2345:respawn:/usr/local/bin/gba-tty1-wrapper tty1|' /etc/inittab
 fi
 
-# 3. Configure slimski to bypass display manager when in GBA mode
-if [ -f /etc/init.d/slimski ] && ! grep -q "gba_mode=1" /etc/init.d/slimski; then
-    sed -i '/start)/a \    if grep -q "gba_mode=1" /proc/cmdline 2>/dev/null; then\n       log_daemon_msg "GBA OS appliance mode active: skipping display manager." "$NAME"\n       exit 0\n    fi' /etc/init.d/slimski
+# 3. Configure runit services (antiX runit systems)
+if [ -f /etc/sv/slimski/run ] && ! grep -q "gba_mode=1" /etc/sv/slimski/run; then
+    sed -i '/set -e/a \\n# Disable slimski display manager if booting into GBA OS mode\nif grep -q "gba_mode=1" /proc/cmdline 2>/dev/null; then\n    exit 161\nfi' /etc/sv/slimski/run
 fi
+
+if [ -f /etc/sv/getty-tty1/run ] && ! grep -q "gba_mode=1" /etc/sv/getty-tty1/run; then
+    sed -i '1a \\n# GBA OS boot hook\nif grep -q "gba_mode=1" /proc/cmdline 2>/dev/null; then\n    exec /usr/local/bin/gba-tty1-wrapper tty1\nfi' /etc/sv/getty-tty1/run
+fi
+
+# Configure Xwrapper for unprivileged xinit fallback if needed
+cat << "EOF_XWRAPPER" > /etc/X11/Xwrapper.config
+allowed_users=anybody
+needs_root_rights=auto
+EOF_XWRAPPER
 
 # 4. Configure GRUB menu display override
 mkdir -p /etc/default/grub.d
