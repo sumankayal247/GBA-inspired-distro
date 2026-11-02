@@ -412,6 +412,14 @@ def main():
         mgba_bin = find_mgba_binary()
     except FileNotFoundError as exc:
         logger.error("%s", exc)
+        # Also on the console: whoever is holding the handheld should not have to
+        # read a log file to find out why nothing happened.
+        sys.stderr.write(
+            "\n  mGBA is not installed, so this game cannot start.\n\n"
+            "  Nothing is broken and your saves are untouched.\n"
+            "  Install it with:  sudo apt install mgba-sdl\n"
+            "  (or press Ctrl+Alt+T and run 'gba-selftest' for a full report)\n\n")
+        sys.stderr.flush()
         sys.exit(3)
 
     is_windowed = os.environ.get("GBA_WINDOWED", "0") == "1"

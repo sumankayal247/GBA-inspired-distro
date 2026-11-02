@@ -347,6 +347,48 @@ missing or broken.**
   and reset, and MUST require explicit confirmation before any destructive action.
 - **F3** [TEST: T-STORE-3, T-FAULT-1, T-FAULT-2, T-FAULT-3, T-FAULT-6] A failure of content, a
   handler, or a removable medium MUST NOT become a failure of the operating system.
+- **F4** [TEST: T-FALLBACK-1] A missing runtime dependency (pygame, mGBA, python3) MUST be reported
+  in words on the console and MUST lead to the recovery path, not to a crash loop or a black screen.
+  The launcher signals this with exit code 103; the supervisor MUST NOT retry it.
+- **F5** [TEST: T-FALLBACK-2] `gba_init.sh` MUST remain usable as PID 1 with no python3, no reboot
+  binary and no supervisor: it MUST fall back to `/proc/sysrq-trigger` and to a rescue shell that
+  never exits. `gba_mode=0` MUST disable the appliance and `gba_safe=1` MUST skip the graphical shell.
+
+---
+
+## 10b. Installation & Image Contract
+
+The installer is the only part of the system that may write outside `/data` and
+`/games`, so it carries its own rules. Each one has a test in
+`tests/test_installer.py`, `tests/test_setup.py` or `tests/test_safety.py`.
+
+- **IN1** [TEST: T-INSTALL-1] An installation MUST be planned, validated and confirmed before any
+  write. `validate_plan` MUST refuse: the running root or live medium, a mounted target, a target
+  partition containing an OS, a target below 8 GiB, a cross-disk EFI partition, an occupied mount
+  point, a missing source, and removable media without explicit consent.
+- **IN2** [TEST: T-INSTALL-2] Destructive whole-disk installation MUST require a typed phrase
+  (`ERASE <disk>`) in addition to any `--yes`; a partition install MUST NOT require it, because it
+  cannot destroy another operating system.
+- **IN2b** [TEST: T-INSTALL-2b] An EFI system partition that already exists MUST NOT be formatted;
+  an existing `EFI/BOOT` fallback loader MUST be copied aside before GRUB writes to it. Only an ESP
+  created by the installer itself (whole-disk mode) may be formatted.
+- **IN3** [TEST: T-INSTALL-3] The bootloader MUST be installed last, after the system has been
+  copied and verified, and every exit path (including failure) MUST unmount the target. UEFI firmware
+  MUST NOT be modified (`--no-nvram --removable`).
+- **IN4** [TEST: T-INSTALL-4] The guided setup (`gba_setup.py`) MUST recommend only targets that keep
+  the existing system bootable, MUST default to them, and MUST explain its exit state in words
+  ("nothing was changed", "your boot menu was not modified", …).
+- **IN5** [TEST: T-INSTALL-5] The on-system installer (`scripts/install.sh`) MUST be dry-run by
+  default, MUST back up every file it modifies, MUST regenerate and then verify the boot menu,
+  MUST restore the previous menu on any failure, and MUST NOT change the default boot target.
+- **IN6** [TEST: T-INSTALL-6] No shell script may format, partition or write a block device. All disk
+  writes MUST go through `src/gba_installer.py`, where IN1–IN3 are enforced.
+- **IN7** [TEST: T-INSTALL-7] The ISO build MUST fail loudly, listing every missing prerequisite, and
+  MUST write only inside its build directory. The produced image MUST boot on BIOS and UEFI and MUST
+  offer an install entry, a safe-graphics entry, a shell entry and a "boot the internal disk" entry.
+- **IN8** [TEST: T-INSTALL-8] `gba-selftest` MUST check interpreter, fonts, terminal, display
+  session, emulator, module imports, storage and configuration, and MUST exit 0 only when no check
+  fails (warnings are acceptable). It MUST NOT write outside its data directory.
 
 ---
 
@@ -446,6 +488,22 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 | T-FAULT-6 | Launcher binary corrupted. | Recovery path reached. | S7, F3 |
 | T-FAULT-7 | Launcher crashes repeatedly. | Recovery after N crashes in M seconds. | S7 |
 | T-FAULT-8 | Kill the supervisor with SIGKILL during a game. | PID 1 restarts it; the orphaned game is terminated; launcher returns. | S8 |
+
+### Installation, fallbacks and image
+
+| ID | Procedure | Pass criteria | Verifies |
+|---|---|---|---|
+| T-INSTALL-1 | Run `validate_plan` for each refusal case in IN1 (unit tests use faked devices). | Every case refuses with a readable reason; a clean plan passes. | IN1 |
+| T-INSTALL-2 | Run the guided setup, choose the whole disk, type the wrong phrase. | Refused, no command executed. With the exact phrase, partitioning starts. | IN2, IN4 |
+| T-INSTALL-2b | Install into an empty partition on a disk that already has an ESP with a foreign loader. | The ESP is not formatted; the foreign loader is copied to `EFI/BOOT.gba-backup-*`. | IN2b |
+| T-INSTALL-3 | Install to a partition, with `cp` and then `grub-install` forced to fail in turn. | No `grub-install` after a copy failure; `umount` always runs; exit codes 4 and 5 respectively. | IN3 |
+| T-INSTALL-4 | Boot the ISO, read the first screen, press Enter twice. | Two questions, safe default recommended, explicit confirmation, readable success/failure. | IN4 |
+| T-INSTALL-5 | `scripts/install.sh` with no arguments; then `--apply` on a scratch VM. | Dry-run changes nothing; apply backs up, verifies the entry, restores on failure. | IN5 |
+| T-INSTALL-6 | Grep the shell scripts for disk-writing commands. | None found outside `gba_installer.py`. | IN6 |
+| T-INSTALL-7 | `scripts/build_iso.sh --check` on a host without the tools; then a full build. | First run lists every missing tool and exits non-zero; second run produces a hybrid ISO. | IN7 |
+| T-INSTALL-8 | `gba-selftest` on a machine with and without mGBA/pygame. | Exit 0 with warnings when only optional parts are missing; exit 1 and a named check when something required is missing. | IN8 |
+| T-FALLBACK-1 | Import the launcher with pygame unavailable. | Exit 103, message naming the fix, no traceback. | F4 |
+| T-FALLBACK-2 | Boot with `gba_mode=0`, then with `gba_safe=1`, then without python3. | Shell, recovery console, and rescue shell respectively; never a black screen. | F5 |
 
 ### Audio, video, measurement
 

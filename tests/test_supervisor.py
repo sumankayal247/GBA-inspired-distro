@@ -176,6 +176,30 @@ class TestSupervisorContract(unittest.TestCase):
         self.assertEqual(attempts["recovery"], 1)
         self.assertEqual(self.sup.last_outcome, "error")
 
+    def test_missing_dependencies_go_straight_to_recovery(self):
+        """F3: a missing pygame/mGBA is fatal, not a crash loop."""
+        from common import EXIT_CODE_MISSING_DEPS
+
+        attempts = {"launcher": 0, "recovery": 0}
+
+        def fake_run_launcher():
+            attempts["launcher"] += 1
+            return EXIT_CODE_MISSING_DEPS, None
+
+        def fake_recovery():
+            attempts["recovery"] += 1
+            self.sup.is_running = False
+
+        self.sup.run_launcher = fake_run_launcher
+        self.sup.launch_recovery = fake_recovery
+        self.sup.kill_orphans = lambda: 0
+        self.sup.main_loop()
+
+        self.assertEqual(attempts["launcher"], 1,
+                         "a missing dependency must not be retried")
+        self.assertEqual(attempts["recovery"], 1)
+        self.assertEqual(self.sup.last_outcome, "missing-deps")
+
     def test_reboot_request_is_simulated_in_desktop_mode(self):
         """S6: desktop mode never reboots the developer's machine."""
         self.sup.run_launcher = lambda: (100, None)

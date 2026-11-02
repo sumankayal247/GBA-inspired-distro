@@ -10,3 +10,6 @@ __pycache__/
 /games/
 .env
 .venv/
+
+# ISO build output
+/build/

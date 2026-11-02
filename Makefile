@@ -1,4 +1,4 @@
-.PHONY: all help test deps run-desktop run-window screenshots lint clean install uninstall
+.PHONY: all help test deps run-desktop run-window screenshots lint clean install uninstall iso iso-check selftest safety
 
 PYTHON ?= python3
 SRC     = src/gba_launcher.py src/gba_supervisor.py src/gba_adapter_mgba.py \
@@ -15,6 +15,9 @@ help:
 	@echo "  make lint         Byte-compile + shell syntax checks"
 	@echo "  make run-window   Launch the shell in a window (desktop testing)"
 	@echo "  make screenshots  Regenerate the README screenshots"
+	@echo "  make iso          Build a bootable installation ISO (needs root + tools)"
+	@echo "  make iso-check    List what is missing for an ISO build"
+	@echo "  make selftest     Check this machine for everything GBA OS needs"
 	@echo "  make install      Install the appliance (requires sudo)"
 	@echo "  make uninstall    Remove the GRUB entry and system files"
 	@echo "  make clean        Remove caches and temporary files"
@@ -30,6 +33,8 @@ test:
 lint:
 	@$(PYTHON) -m py_compile $(SRC) && echo "python: OK"
 	@bash -n scripts/install.sh && echo "install.sh: OK"
+	@bash -n scripts/build_iso.sh && echo "build_iso.sh: OK"
+	@bash -n scripts/lib/common.sh && echo "lib/common.sh: OK"
 	@bash -n scripts/launch_desktop.sh && echo "launch_desktop.sh: OK"
 	@sh -n src/gba_init.sh && echo "gba_init.sh: OK"
 
@@ -41,6 +46,18 @@ screenshots:
 	$(PYTHON) src/gba_launcher.py --tab apps --demo --screenshot ui_preview_apps.png
 	$(PYTHON) src/gba_launcher.py --tab settings --demo --screenshot ui_preview_settings.png
 	$(PYTHON) src/gba_launcher.py --tab browser --demo --screenshot ui_preview_browser.png
+
+iso:
+	./scripts/build_iso.sh
+
+iso-check:
+	./scripts/build_iso.sh --check
+
+selftest:
+	$(PYTHON) src/gba_selftest.py
+
+safety: test
+	@$(PYTHON) -m unittest discover -s $(TESTS) -p "test_safety.py" -v
 
 install:
 	./scripts/install.sh

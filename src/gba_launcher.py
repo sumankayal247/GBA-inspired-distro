@@ -32,7 +32,19 @@ from typing import Any, Dict, List, Optional, Tuple
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import pygame
+# pygame is the one hard dependency of the shell. If it is missing the machine is
+# still perfectly usable, so say exactly what to install and exit with the
+# dedicated "missing dependencies" code (Rule F3) instead of a traceback.
+try:
+    import pygame
+except Exception as _pygame_error:  # pragma: no cover - broken installs only
+    sys.stderr.write(
+        "\n  GBA OS cannot start the graphical shell.\n"
+        f"  Reason: {_pygame_error}\n\n"
+        "  This computer is fine and nothing was modified.\n"
+        "  Fix it by installing python3-pygame (or python3 -m pip install pygame)\n"
+        "  and starting GBA OS again. The recovery console is still available.\n\n")
+    sys.exit(103)  # common.EXIT_CODE_MISSING_DEPS (imported further down)
 
 import config as settings_store
 from common import (

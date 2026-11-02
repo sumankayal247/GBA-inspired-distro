@@ -41,6 +41,7 @@ from common import (
     EXIT_CODE_LAUNCH_REQUEST,
     EXIT_CODE_REBOOT,
     EXIT_CODE_POWEROFF,
+    EXIT_CODE_MISSING_DEPS,
     EXIT_CODE_RECOVERY,
 )
 
@@ -467,6 +468,16 @@ class Supervisor:
                 break
 
             elif ret == EXIT_CODE_RECOVERY:
+                self.launch_recovery()
+
+            elif ret == EXIT_CODE_MISSING_DEPS:
+                # A required piece is missing on this machine. Retrying cannot
+                # help, and a crash loop would hide the message: recovery tells
+                # the user what to install, then returns to the menu.
+                logger.critical("Launcher reported missing runtime dependencies; "
+                                "entering recovery (Rule F3).")
+                self.last_outcome = "missing-deps"
+                self.save_outcome("missing-deps")
                 self.launch_recovery()
 
             elif ret == 0:

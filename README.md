@@ -2,7 +2,8 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Contract](https://img.shields.io/badge/Contract-Draft%202%20(V1)-purple.svg)](docs/CONTRACT.md)
-[![Tests](https://img.shields.io/badge/Tests-133%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/Tests-219%20passing-brightgreen.svg)](tests)
+[![Safe by default](https://img.shields.io/badge/install-safe%20by%20default-blue.svg)](docs/SAFETY.md)
 
 **GBA OS** is an appliance-style Linux operating system experience designed to turn any PC or laptop into a dedicated Game Boy Advance console.
 
@@ -36,6 +37,13 @@ Power On -> GRUB Menu -> GBA OS -> Game Library -> Play Game -> Return to Librar
 - **Pendrive import:** plug a stick in, get a prompt, import its ROMs on request — never silently.
 
 ---
+
+## 📚 Documentation
+
+- [docs/SAFETY.md](docs/SAFETY.md) — what can and cannot change on your machine.
+- [docs/CONTRACT.md](docs/CONTRACT.md) — the boot/storage/handler/failure contract (incl. the
+  installation contract, IN1–IN8).
+- [docs/DECISIONS.md](docs/DECISIONS.md) — why each rule exists.
 
 ## 📸 Screenshots
 
@@ -94,6 +102,41 @@ recovery console instead (contract rule S7).
 
 ## 🚀 Usage & Booting
 
+### 0. Install from a USB stick (the normal way)
+
+```bash
+make iso-check                    # lists anything missing to build the ISO
+sudo make iso                     # builds build/gba-os-<version>-amd64.iso
+```
+
+Write the image to a USB stick (**the stick is the only thing that is erased**):
+
+```bash
+sudo dd if=build/gba-os-<version>-amd64.iso of=/dev/sdX bs=4M status=progress oflag=sync
+```
+
+Boot the stick on the target PC and answer **two questions**:
+
+1. *Where should GBA OS be installed?* — press **Enter** to accept the recommended free
+   partition. Options that would destroy your existing system are marked and require the exact
+   phrase `ERASE /dev/sdX`.
+2. *Install GBA OS on /dev/sdX1, keeping your current system?* — press **Enter** again.
+
+Setup then formats that one partition, copies GBA OS, verifies it, and only then adds a boot menu
+entry. If anything fails it prints what state the machine is in — and in every failure before the
+boot menu is written, **your computer still starts its usual operating system**.
+
+**"Can this brick my PC?"** No — see [docs/SAFETY.md](docs/SAFETY.md) for the exact list of things
+that can change, the installer's nine refusal rules, and the fallback for every component. The short
+version:
+
+- the live stick writes only to RAM and to itself;
+- the installer refuses the disk it booted from, any mounted partition, any partition that contains
+  an operating system, anything under 8 GB, and removable media without explicit consent;
+- the bootloader is written last, verified, and never touches UEFI NVRAM or another OS's entry;
+- the on-PC installer (`scripts/install.sh`) is dry-run by default and restores the previous
+  `grub.cfg` if the regenerated one does not contain its own entry.
+
 ### 1. Booting via GRUB (Bare-Metal Console Appliance)
 During system boot, select:
 ```text
@@ -112,11 +155,28 @@ make run-window      # or ./scripts/launch_desktop.sh
 The windowed session runs the real supervisor → launcher → emulator chain, so what you test is what
 ships. Reboot/poweroff are simulated in this mode so your desktop is never touched.
 
-### 3. Installing on a Machine
+### 3. Installing on a running Linux machine
 
 ```bash
-sudo ./scripts/install.sh          # idempotent; safe to re-run after updates
-sudo ./scripts/install.sh --uninstall
+./scripts/install.sh                    # dry-run: prints every change, writes nothing
+sudo ./scripts/install.sh --apply       # do it (one confirmation)
+sudo ./scripts/install.sh --apply --uninstall
+sudo ./scripts/install.sh --apply --repair   # re-copy files, keep saves, restore boot entry
+```
+
+To install GBA OS onto a *disk* from an existing system, use the same guided setup the USB stick
+runs:
+
+```bash
+sudo gba-setup            # guided: pick a target, confirm, done
+sudo gba-setup --dry-run  # show the plan without writing
+```
+
+Check any machine before or after an install:
+
+```bash
+gba-selftest              # PASS/WARN/FAIL per component, with the fix for each FAIL
+gba-selftest --json       # same, for scripts
 ```
 
 The installer:
@@ -124,7 +184,9 @@ The installer:
 - copies the runtime into `/opt/gba-distro` and prepares `/data` + `/games`;
 - writes the shared keyboard profile to `/data/config/keybindings.json` and `~/.config/mgba`;
 - determines the root filesystem UUID and the newest installed kernel instead of hard-coding them;
-- hooks tty1 (SysVinit / runit) and registers a top-level `GBA OS (V1 Appliance Mode)` GRUB entry;
+- hooks tty1 (SysVinit / runit) and appends `GBA OS (console appliance)` plus a
+  `GBA OS (safe graphics / recovery)` GRUB entry without changing the default boot target;
+- backs up every system file it touches and rolls them back if a later step fails;
 - reports missing runtime packages (`python3`, `python3-pygame`, `mgba-sdl`) instead of failing at boot.
 
 ---
@@ -175,9 +237,11 @@ Ctrl/Alt) and duplicate assignments are rejected with an inline explanation.
 ## 🧪 Testing & Development
 
 ```bash
-make test     # 133 tests (headless, no display needed)
-make lint     # byte-compile Python + syntax-check the shell scripts
-make help     # list every target
+make test       # 219 tests (headless, no display needed)
+make lint       # byte-compile Python + syntax-check every shell script
+make selftest   # check *this* machine: interpreter, fonts, pty, display, mGBA, storage, config
+make iso-check  # what is missing to build a bootable ISO here
+make help       # list every target
 ```
 
 The suite covers the numbered contract rules directly — library identity and caching (L2, L3, L4, L6),
@@ -186,6 +250,12 @@ cleanup (S8), save durability and restoration (SV2–SV4), log rotation (ST5), i
 (I3), ROM import safety (ST7), the settings store and theme system, the ANSI terminal emulator, the
 browser's HTML extractor/layout/history, and shell behaviour (tabs, `Alt+Tab`, `Ctrl+Alt+T`, search,
 empty state, confirmation-gated launches).
+
+Installer safety has its own suites: `tests/test_installer.py` (every refusal rule, the
+copy → verify → bootloader order, dry runs, confirmation gating), `tests/test_setup.py` (which
+targets the guided setup offers and recommends, and what it does with a wrong answer), and
+`tests/test_safety.py` (shell syntax in the shell that will run it, "no script writes a disk", the
+GRUB entry invariants, the ISO builder's loud failure, and the missing-pygame fallback).
 
 Screenshots are generated from the real renderer using synthetic content:
 
@@ -206,7 +276,9 @@ make screenshots   # regenerates the four README images
 | Pendrive not detected | The filesystem must be mounted (any desktop does that automatically). Open **SETTINGS → Library → Import from USB** and press `R` to rescan. |
 | Terminal is unavailable | The shell needs a PTY; check that `/dev/pts` is mounted (`SHELL=/bin/sh src/gba_launcher.py` still works for a quick test). |
 | Xbox-style pad exits games | The SELECT+START, Guide, and `Esc` combinations are the system exit gestures — see the launch screen. |
-| Everything is broken | At the GRUB menu add `gba_mode=0` to the kernel line for a normal login prompt, or boot the appliance and use the recovery console (option 4 exports your saves first). |
+| Everything is broken | At the GRUB menu pick `GBA OS (safe graphics / recovery)`, or add `gba_mode=0` to the kernel line for a normal login prompt. The recovery console (option 4) exports your saves first. |
+| A component is missing | Run `gba-selftest`; every FAIL line names the package to install. |
+| Install failed half way | Your boot menu was not modified — the machine still starts its usual system. Re-run the setup with another target. |
 
 ---
 

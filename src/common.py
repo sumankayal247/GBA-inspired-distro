@@ -21,6 +21,10 @@ EXIT_CODE_LAUNCH_REQUEST = 10
 EXIT_CODE_REBOOT = 100
 EXIT_CODE_POWEROFF = 101
 EXIT_CODE_RECOVERY = 102
+# The launcher or a handler could not even start because a required component is
+# missing on this machine (pygame, mGBA, the binary itself). This is fatal, not
+# a crash loop: the supervisor goes straight to recovery (Rule F3).
+EXIT_CODE_MISSING_DEPS = 103
 
 # Log hygiene (Rule ST5): a runaway log must never be able to fill DATA.
 LOG_MAX_BYTES = 2 * 1024 * 1024

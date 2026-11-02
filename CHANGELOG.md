@@ -4,6 +4,61 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — bootable ISO, guided setup, and a hard safety review
+
+Everything in this section exists because of one question: *can booting this on a new PC brick it?*
+The answer is documented in [docs/SAFETY.md](docs/SAFETY.md), enforced in code, and covered by tests.
+
+### Added
+
+- **Bootable installation ISO** — `scripts/build_iso.sh` (`make iso`) builds a hybrid BIOS+UEFI
+  image with `debootstrap`, `mksquashfs` and `grub-mkrescue`. The medium boots to the guided setup
+  on `tty1`, and its menu offers *Install*, *Install (safe graphics)*, *Shell on this medium* and
+  *Boot from the internal disk instead*. `make iso-check` lists missing prerequisites; the builder
+  refuses to start without them instead of producing a broken image.
+- **Guided setup (`src/gba_setup.py`, `gba-setup`)** — two questions, safe default, recommended
+  target marked in the table, plain-text so it works with no pygame. Success and every failure mode
+  are described in words ("your boot menu was not modified, so this computer still starts its usual
+  operating system").
+- **Disk installer (`src/gba_installer.py`)** — plan → validate → confirm → apply. Nine refusal
+  rules (running disk, live medium, mounted target, partition containing an OS, <8 GiB, removable
+  media, cross-disk EFI, occupied mount point, missing source), typed phrases
+  `ERASE /dev/sdX` / `FORMAT /dev/sdX1`, `--dry-run`, `--plan`, `--json`, exit codes 0/2/3/4/5, and a
+  bootloader step that runs last, uses `--no-nvram --removable`, and never edits UEFI NVRAM.
+- **Self-test (`src/gba_selftest.py`, `gba-selftest`)** — interpreter, fonts, pty, display session,
+  mGBA, every module import, a real pygame blit on the dummy driver, storage space/writability and a
+  config round-trip. One line per check with a fix hint, `--json`, exit 1 only when something failed.
+- **`scripts/lib/common.sh`** — shared shell safety library: dry-run gating, confirmation helpers
+  (typed confirmation for irreversible actions), file backup with an `EXIT`-trap rollback, and live/
+  root device detection.
+- **`--repair`** for `scripts/install.sh`, and a `gba-setup` wrapper installed with the appliance.
+
+### Changed
+
+- `scripts/install.sh` is a full rewrite: dry-run by default, platform and init detection,
+  dependency preflight with an explicit override, backups of every file it modifies, `sh -n`
+  validation of the generated GRUB script, regenerate-then-verify of `grub.cfg` with byte-for-byte
+  restore on failure, and an uninstall that restores `/etc/inittab`.
+- Boot menu entries are now `GBA OS (console appliance)` and
+  `GBA OS (safe graphics / recovery)`; `GRUB_DEFAULT` is never modified.
+
+### Fixed / hardened
+
+- **Missing pygame** no longer produces a traceback: the launcher prints what to install and exits
+  `103`; the supervisor treats that as fatal and goes to recovery instead of counting crashes.
+- **Missing mGBA** now says so on the console (with the `apt install mgba-sdl` line) as well as in
+  the log; saves are untouched.
+- **`gba_init.sh`** honours `gba_mode=0` and `gba_safe=1`, detects a missing python3, reboots via
+  `/proc/sysrq-trigger` when the binary is gone, and falls back to a rescue shell that never exits —
+  a black screen with no keyboard response is no longer a reachable state.
+
+### Tests
+
+- 219 tests (was 133). New: `tests/test_installer.py` (33), `tests/test_setup.py` (21),
+  `tests/test_safety.py` (30). Documented limitation: the sandbox has no `xorriso`, no loop devices
+  and no root, so the ISO build is verified by `--check`, syntax checks and by reading the generated
+  configuration — not by booting real hardware.
+
 ## [Unreleased] — second feature pass (full-screen shell, tabs, terminal, browser, USB)
 
 A rework of the launcher around the feedback that the shell felt small, the colours were not
