@@ -4,6 +4,79 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — second feature pass (full-screen shell, tabs, terminal, browser, USB)
+
+A rework of the launcher around the feedback that the shell felt small, the colours were not
+Game-Boy-enough, and everything except the game library needed redoing.
+
+### Added
+
+- **TERMINAL tab** — a real `$SHELL -i` on a pseudo-terminal, rendered by a small ANSI screen
+  emulator (16/256-colour SGR, cursor movement, erase, 500 rows of scrollback) with full key
+  translation. `Ctrl+Alt+T` toggles it from any tab or dialog.
+- **BROWSER tab** — a deliberately light web reader: `urllib` fetch with a 2 MB document / 1 MB image
+  cap and an 8 s timeout, HTML → styled text layout, images, link cycling, history, and an inline URL
+  bar (`Ctrl+L`). `about:welcome` is the start page.
+- **Pendrive import** — `/proc/mounts` + `/sys/block` discovery (no `udisks`/`udev` dependency),
+  recursive ROM scan, and a progress dialog. Import only starts after an explicit confirmation;
+  identical files are skipped, clashing names get a `(n)` suffix, and every copy is size-verified.
+- **APPS tab** with six cartridge entries: System Monitor (live memory sparkline, storage, load,
+  uptime, driver), Input Diagnostics (visual pad, axes, active control map), Save Manager, USB Import,
+  Web Browser and Terminal.
+- **Settings rework** — six declarative pages (Display, Audio, Controls, Library, Storage & Saves,
+  System) plus Reboot and Power Off. Every row is a real control: choose scaling, theme, clock,
+  brightness, volume/mute, remap all ten buttons, reset bindings, switch grid/list, toggle USB
+  auto-detect and sub-folders, rescan, export saves, clean the library cache, read logs, view About.
+- **Theme system** — four palettes (indigo, violet, amber, mint) over shared GBA neutrals, a TTF type
+  ramp, and a proper cartridge renderer (notched shell, gradient plastic, grip ribs, magenta
+  "GAME BOY GBA" sticker, id chip, GBA seal, selection ring, `NEW` badge).
+- **Full-resolution display** — the shell composes at the window's native size and lays out in
+  design units, so it fills a laptop panel instead of showing a 480x320 window. `integer` mode
+  remains available as an opt-in 480x320 retro canvas.
+- **Global shortcuts** — `Alt+Tab` / `Alt+Shift+Tab` cycle main tabs, `Ctrl+Alt+T` opens the terminal,
+  `Ctrl+V` toggles cartridge/list view, `F1` help, `F12` screenshot to `DATA/screenshots/`.
+- **Launch screen information** — save status, size, play count, total time and the control map before
+  a session starts.
+
+### Changed
+
+- Launcher rewritten as a single event loop with an overlay stack, so modals and global shortcuts
+  coexist instead of competing.
+- Settings persist in `DATA/config/settings.json` (atomic writes, sanitised on load, legacy
+  `display.json` migrated on first read). `common.load_display_config()` now delegates to it.
+- The library tab is unchanged in behaviour (search, recency focus, atomic launch requests) but is
+  rendered from the new theme at native resolution.
+
+### Fixed
+
+- **Black screen when starting a game** — the handler now resolves the display session itself
+  (X11/Wayland/KMS-DRM/headless), drops a stale `DISPLAY`, refuses to inherit a DRM driver inside a
+  live desktop, passes explicit `-C fullscreen=…` alongside `-f`, and retries once in a window if
+  mGBA dies immediately. The shell also tears down pygame before exiting with code `10`, so the
+  adapter never inherits a half-released display context.
+- mGBA now reads the config the adapter actually writes: `XDG_CONFIG_HOME` is pointed at
+  `SYS_CONFIG_DIR` (`…/mgba/config.ini`), with a copy kept at the historically documented path.
+- Browser `<title>` was dropped together with `<head>`, so pages were titled by their URL.
+- Inline `<a>`/`<b>`/`<span>` runs no longer break paragraphs into separate lines.
+
+### Contract
+
+- **D1 amended** — native-resolution rendering is now required; a fixed logical canvas is optional.
+- **D4 extended** — the launcher must release the display, and handlers must not inherit an
+  unusable display environment.
+- **ST4 amended / ST7 added** — ROM import is the single sanctioned write path into GAMES, and it
+  must be confirmation-gated, non-overwriting and size-verified.
+- New decisions D-029 … D-036 cover scaling, theming, display handoff, the import rule, the PTY
+  terminal, the browser budget, the settings store and the five-tab navigation model.
+
+### Tests
+
+- Test suite grown from 60 to 133: new modules for the shell (tabs, shortcuts, overlays, launch
+  protocol), settings/theme/display environment, terminal emulation and PTY round-trip, browser
+  extraction/layout/history, and pendrive scan/import/watcher behaviour.
+
+---
+
 ## [Unreleased] — hardening & UX pass
 
 A broad quality pass over the shipped V1 tree: every subsystem was reviewed

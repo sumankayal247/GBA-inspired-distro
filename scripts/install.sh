@@ -59,6 +59,11 @@ mkdir -p /data/saves /data/library /data/logs /data/config /data/apps /games /ru
 
 install -m 0644 "$REPO_DIR/src/common.py"          "$INSTALL_DIR/src/common.py"
 install -m 0644 "$REPO_DIR/src/library.py"         "$INSTALL_DIR/src/library.py"
+install -m 0644 "$REPO_DIR/src/config.py"          "$INSTALL_DIR/src/config.py"
+install -m 0644 "$REPO_DIR/src/theme.py"           "$INSTALL_DIR/src/theme.py"
+install -m 0644 "$REPO_DIR/src/gba_terminal.py"    "$INSTALL_DIR/src/gba_terminal.py"
+install -m 0644 "$REPO_DIR/src/gba_browser.py"     "$INSTALL_DIR/src/gba_browser.py"
+install -m 0644 "$REPO_DIR/src/gba_usb.py"         "$INSTALL_DIR/src/gba_usb.py"
 install -m 0755 "$REPO_DIR/src/gba_supervisor.py"  "$INSTALL_DIR/bin/gba-supervisor"
 install -m 0755 "$REPO_DIR/src/gba_launcher.py"    "$INSTALL_DIR/bin/gba-launcher"
 install -m 0755 "$REPO_DIR/src/gba_recovery.py"    "$INSTALL_DIR/bin/gba-recovery.py"

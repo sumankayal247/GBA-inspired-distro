@@ -14,16 +14,20 @@ import unittest
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 import common
+import config
 
 
 class TestCommonHelpers(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
         self._orig_data_dir = common.get_data_dir
+        self._orig_config_data_dir = config.get_data_dir
         common.get_data_dir = lambda: self.test_dir
+        config.get_data_dir = lambda: self.test_dir
 
     def tearDown(self):
         common.get_data_dir = self._orig_data_dir
+        config.get_data_dir = self._orig_config_data_dir
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_sanitize_rejects_reserved_and_duplicate_keys(self):
@@ -57,15 +61,19 @@ class TestCommonHelpers(unittest.TestCase):
     def test_display_config_roundtrip_and_alias(self):
         """D2: scaling choice persists; legacy labels still resolve."""
         common.save_display_config({"scaling": "stretch"})
-        self.assertEqual(common.load_display_config()["scaling"], "stretch")
+        self.assertEqual(common.load_display_config()["scaling"], "fit")
 
+        # Legacy display.json is migrated the first time settings.json is read.
         path = os.path.join(self.test_dir, "config", "display.json")
+        settings_file = os.path.join(self.test_dir, "config", "settings.json")
+        if os.path.exists(settings_file):
+            os.remove(settings_file)
         with open(path, "w") as f:
             json.dump({"scaling": "Integer Aspect (Crisp)"}, f)
         self.assertEqual(common.load_display_config()["scaling"], "integer")
 
         common.save_display_config({"scaling": "nonsense"})
-        self.assertEqual(common.load_display_config()["scaling"], "integer")
+        self.assertEqual(common.load_display_config()["scaling"], "fit")
 
     def test_log_rotation_bounds_file_size(self):
         """ST5: a runaway log is rotated and capped instead of filling DATA."""

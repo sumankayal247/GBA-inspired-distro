@@ -114,12 +114,22 @@ GAMES   (optional)   user-visible content, readable from other operating systems
   cause data loss; the library MUST be rebuilt from content and saves.
 - **ST3** [REVIEW] Precious paths MUST NOT be removed or rewritten by any automatic process other
   than the component that owns them.
-- **ST4** [TEST: T-STORE-1] GAMES MUST be mounted read-only. The system MUST NOT write to
-  `/games/`, including beside a content file.
+- **ST4** [TEST: T-STORE-1] [AMENDED 2026-11-02, see D-032] GAMES MUST be mounted read-only
+  during normal operation. The system MUST NOT write to `/games/`, including beside a content
+  file. The single exception is a user-confirmed ROM import (ST7), which is the only write path
+  and MUST NOT create, modify or delete anything except new ROM files.
 - **ST5** [TEST: T-FAULT-4] Logs MUST be size-capped and rotated. A runaway log MUST NOT be able
   to fill DATA.
 - **ST6** [TEST: T-FAULT-5] DATA MUST reserve free space for system use so that logging and saving
   remain possible when users fill the volume.
+- **ST7** [TEST: T-LIBRARY-3] ROM import from removable media:
+  - discovery MUST NOT require `udisks`, `udevadm` or `lsblk`; mount state is read from
+    `/proc/mounts` and removability from `/sys/block`;
+  - nothing MUST be copied before the user explicitly confirms the import;
+  - an existing file MUST NOT be overwritten: identical files are skipped and a name clash is
+    copied under a `(n)` suffix;
+  - every copy MUST be verified by size and a partial copy MUST be removed;
+  - the destination MUST stay inside GAMES.
 
 ---
 
@@ -275,11 +285,17 @@ Parameters (provisional): N = 3, M = 30.
 
 ## 8. Display & Audio Contract
 
-- **D1** [REVIEW] The launcher MUST render to a fixed logical resolution and scale it to the display.
+- **D1** [REVIEW] [AMENDED 2026-11-02, see D-029] The launcher MUST use the whole display: it
+  renders at the display's native resolution and lays out in resolution-independent design units.
+  It MUST NOT letterbox itself with a fixed 480x320 window. An optional "integer" mode MAY compose
+  on a 480x320 canvas and upscale by a whole factor for a deliberately pixelated look.
 - **D2** [REVIEW] Scaling of emulated content SHOULD use integer factors with borders when the
   aspect ratio does not match.
 - **D3** [REVIEW] The launcher and the bundled emulator MUST NOT require an X11 or Wayland session.
-- **D4** [TEST: T-LAUNCH-1] The launcher MUST establish its own display state on start (see H2).
+- **D4** [TEST: T-LAUNCH-1] The launcher MUST establish its own display state on start (see H2)
+  and MUST release it before a handler starts. A handler MUST NOT inherit a display environment
+  that cannot present: a stale `DISPLAY` or a KMS/DRM driver inside a live desktop is a defect
+  (see D-031).
 - **D5** [TEST: T-AV-1] Audio MUST NOT underrun audibly during normal play.
 - **D6** [TEST: T-AV-2] The frame-pacing strategy (vsync vs audio-driven timing) MUST be documented in
   `DECISIONS.md` with measurements.
@@ -382,6 +398,7 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 | ID | Procedure | Pass criteria | Verifies |
 |---|---|---|---|
 | T-LIBRARY-1 | Add game A without any manual step; record its entry ID; rename the file; rescan. | Entry appears automatically; ID and save directory unchanged after the rename. | L2, L3 |
+| T-LIBRARY-3 | Plug in a stick with 10 ROMs, decline the prompt, re-plug, accept; import twice. | Nothing copied before confirmation; 10 files appear inside GAMES; the second import copies nothing; no partial files remain. | ST7 |
 | T-MANIFEST-1 | Create manifests omitting `network`, `input` and `display`; create one with `contract = 999`. | Omitted needs resolve to `false`, gamepad-only and direct; the unsupported manifest is rejected without crashing the launcher. | L7, L8 |
 
 ### Input

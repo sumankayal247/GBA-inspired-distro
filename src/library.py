@@ -165,14 +165,14 @@ class Library:
 
 
     def get_built_in_apps(self) -> List[Dict[str, Any]]:
-        """Returns standard built-in appliance apps."""
+        """Returns standard built-in appliances, presented as cartridges."""
         return [
             {
                 "id": "app_system_monitor",
                 "title": "System Monitor",
                 "type": "app",
                 "format": "SYS",
-                "description": "Appliance memory, CPU and disk diagnostics",
+                "description": "Live memory, storage and CPU telemetry",
                 "handler": "internal_system_monitor",
                 "args": []
             },
@@ -193,57 +193,111 @@ class Library:
                 "description": "Inspect and remove per-game save data",
                 "handler": "internal_save_manager",
                 "args": []
-            }
+            },
+            {
+                "id": "app_usb_import",
+                "title": "USB Import",
+                "type": "app",
+                "format": "USB",
+                "description": "Copy ROMs from a pendrive into the library",
+                "handler": "internal_usb_import",
+                "args": []
+            },
+            {
+                "id": "app_browser",
+                "title": "Web Browser",
+                "type": "app",
+                "format": "NET",
+                "description": "Lightweight text and image browser",
+                "handler": "internal_browser",
+                "args": []
+            },
+            {
+                "id": "app_terminal",
+                "title": "Terminal",
+                "type": "app",
+                "format": "SH",
+                "description": "A real shell on the machine",
+                "handler": "internal_terminal",
+                "args": []
+            },
         ]
 
     def get_settings_entries(self) -> List[Dict[str, Any]]:
-        """Returns standard settings options."""
+        """Returns settings sections; each opens a real, configurable page."""
         return [
             {
+                "id": "setting_display",
+                "title": "Display",
+                "type": "settings",
+                "format": "DSP",
+                "description": "Scaling, theme, clock and brightness",
+                "handler": "internal_settings_display",
+                "args": []
+            },
+            {
+                "id": "setting_audio",
+                "title": "Audio",
+                "type": "settings",
+                "format": "SND",
+                "description": "Master volume and mute",
+                "handler": "internal_settings_audio",
+                "args": []
+            },
+            {
                 "id": "setting_controls",
-                "title": "Remap Keys",
+                "title": "Controls",
                 "type": "settings",
                 "format": "KEY",
-                "description": "Customize keys for A, B, L, R, D-Pad, Start & Select",
+                "description": "Remap every GBA button and check a gamepad",
                 "handler": "internal_settings_controls",
                 "args": []
             },
             {
-                "id": "setting_scale",
-                "title": "Display Scaling",
+                "id": "setting_library",
+                "title": "Library",
                 "type": "settings",
-                "format": "CFG",
-                "description": "Switch between Integer Aspect and Full Scale",
-                "handler": "internal_settings_scale",
+                "format": "LIB",
+                "description": "View mode, USB auto-import and rescanning",
+                "handler": "internal_settings_library",
                 "args": []
             },
             {
-                "id": "setting_rescan",
-                "title": "Rescan Library",
+                "id": "setting_storage",
+                "title": "Storage & Saves",
                 "type": "settings",
-                "format": "LIB",
-                "description": "Re-index /games and refresh playable titles",
-                "handler": "internal_rescan_library",
+                "format": "SAV",
+                "description": "Save backups, export archives and free space",
+                "handler": "internal_settings_storage",
+                "args": []
+            },
+            {
+                "id": "setting_system",
+                "title": "System",
+                "type": "settings",
+                "format": "SYS",
+                "description": "Logs, recovery tools and contract details",
+                "handler": "internal_settings_system",
                 "args": []
             },
             {
                 "id": "setting_reboot",
-                "title": "Reboot to GRUB Menu",
+                "title": "Reboot",
                 "type": "settings",
-                "format": "SYS",
-                "description": "Cleanly restart PC and return to boot selection",
+                "format": "PWR",
+                "description": "Restart and return to the GRUB menu",
                 "handler": "internal_reboot",
                 "args": []
             },
             {
                 "id": "setting_poweroff",
-                "title": "Shutdown System",
+                "title": "Power Off",
                 "type": "settings",
-                "format": "SYS",
-                "description": "Flush saves and power off the machine",
+                "format": "PWR",
+                "description": "Flush saves and shut the machine down",
                 "handler": "internal_poweroff",
                 "args": []
-            }
+            },
         ]
 
 

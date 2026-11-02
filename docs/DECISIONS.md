@@ -306,3 +306,117 @@ substring.
 terminated. Both are cheap, but both are dangerous if implemented loosely: rotating in the wrong
 place truncates a live session's log, and substring matching can signal unrelated processes belonging
 to the user.
+
+---
+
+## D-029 The shell draws at native resolution; D1 is amended
+
+**Decision.** The launcher composes its frame on a surface that is exactly the window size and lays
+everything out in "design units" against a 320-unit reference height (`ui_scale = height / 320`).
+`scaling=integer` becomes an opt-in retro mode that composes on 480x320 and upscales by a whole
+factor. D1 in the contract is amended accordingly.
+
+**Why.** The original 480x320 canvas was scaled up to the display, which produced a small, blurry
+window in the middle of a laptop panel and wasted the screen the user actually has. Drawing at native
+resolution costs nothing per frame with pygame's blits and makes every glyph crisp; expressing the
+layout in design units keeps the same composition on a 480x320 handheld panel and on a 1440p laptop,
+so no separate layout code is needed. Fonts are TTF and sized in the same units for the same reason.
+
+---
+
+## D-030 A four-palette theme system instead of hard-coded colours
+
+**Decision.** `theme.py` defines one shared set of neutrals plus four accent palettes (`indigo`,
+`violet`, `amber`, `mint`), and every surface, primitive and font goes through a `Theme` object. The
+choice persists in `DATA/config/settings.json`.
+
+**Why.** "Not getting a GBA colour vibe" is a real design defect: the previous UI used ad-hoc greys
+and a single blue accent. A palette table makes the identity explicit (indigo shell, magenta logo,
+amber power LED) and lets a user switch the mood without touching code. Keeping the neutrals shared
+means the four themes cannot drift apart in contrast.
+
+---
+
+## D-031 Handlers receive a resolved display environment, not the inherited one
+
+**Decision.** `config.prepare_child_environment()` classifies the session (`x11`, `wayland`,
+`console`, `headless`) by looking at `DISPLAY`/`WAYLAND_DISPLAY` *and whether their sockets exist*,
+then pins `SDL_VIDEODRIVER` accordingly, drops a stale `DISPLAY`, and forces a dummy audio driver
+when no sound device is present. The adapter uses it for mGBA and also passes `-f` plus explicit
+`-C fullscreen=...` overrides, and retries once windowed if mGBA dies in under five seconds with an
+error inside a desktop session.
+
+**Why.** "Launching a game shows a full black screen" is an environment bug, not an emulator bug:
+SDL happily grabs a KMS/DRM master it cannot present when a desktop owns the GPU, and a dead
+`DISPLAY` silently routes rendering nowhere. Resolving the session instead of inheriting it fixes
+the common causes; the retry keeps a machine with an unusual graphics stack playable instead of
+bouncing the user straight back to the library. This is also why the shell tears down pygame before
+exiting with code 10: the handler must not inherit a half-torn-down display context (D4).
+
+---
+
+## D-032 ROM import is the single sanctioned write path into GAMES
+
+**Decision.** A new `docs/CONTRACT.md` rule, ST7, allows the shell to write ROM files into GAMES, but
+only after an explicit confirmation, only by creating new files, and never by overwriting: identical
+files are skipped, name clashes get a `(n)` suffix, and partial copies are removed. ST4 is amended to
+name this as its only exception.
+
+**Why.** The appliance model treats GAMES as user-owned and read-only to the system. Importing from a
+pendrive is a direct user request to change its contents, so it has to be ring-fenced: a rule that
+says "never write" and an implementation that writes quietly would be worse than either. The
+confirmation step is deliberate product behaviour, not a nicety.
+
+---
+
+## D-033 The terminal is a real PTY, not a command runner
+
+**Decision.** The TERMINAL tab runs `$SHELL -i` on a pseudo-terminal in its own session. Output is
+parsed by a small ANSI screen emulator (SGR colours, cursor movement, erase, scrollback capped at
+500 rows) and input is translated from pygame key events to terminal byte sequences.
+
+**Why.** A terminal that only executes one command at a time is not a terminal: no `cd`, no `top`, no
+prompts, no colour. A PTY gives all of it for the price of ~500 lines of stdlib code, keeps the tab
+useful for debugging on a machine with no X11, and means the shell never parses command lines itself.
+`Ctrl+Alt+T` toggles the tab from anywhere, including from a modal.
+
+---
+
+## D-034 The browser is a text renderer with a hard budget
+
+**Decision.** `gba_browser.py` fetches with `urllib`, caps documents at 2 MB and images at 1 MB with
+an 8-second timeout, extracts headings/paragraphs/lists/quotes/pre/links/images from HTML with
+`html.parser`, and lays text out itself with the theme fonts. No JavaScript, no CSS layout, no
+external dependencies. Unreadable pages degrade to their text rather than rendering badly.
+
+**Why.** The user asked for a "very light-weight browser", and on an appliance the failure mode of a
+real engine is a memory-hungry, network-exposed process that breaks the boot-to-play budget. A
+reader-shaped browser is honest about what it is: it makes documentation, wikis and text sites
+usable, it is auditable in one file, and it cannot be a vector for scripted content.
+
+---
+
+## D-035 Settings are declarative pages over one JSON store
+
+**Decision.** Every settings row is a dictionary (`toggle`, `choice`, `slider`, `action`, `info`)
+bound to a getter and a setter; the page renderer is generic. All values live in
+`DATA/config/settings.json`, written atomically, with `config/display.json` migrated on first read.
+
+**Why.** The previous settings screens were lists that mostly printed information; making every row a
+real control with a declared type means the UI cannot drift from what is persisted, new settings cost
+one row, and the store is inspectable by a user with a text editor. Migration exists because losing a
+scaling preference on upgrade is a small but real regression.
+
+---
+
+## D-036 Main navigation is five tabs with global shortcuts
+
+**Decision.** GAMES, APPS, BROWSER, TERMINAL and SETTINGS are peer tabs. `Alt+Tab` /
+`Alt+Shift+Tab` cycle them, `Ctrl+Alt+T` toggles the terminal from any screen or modal, and mouse
+clicks hit the same tab rectangles the renderer paints. Library entries (games, apps, settings
+sections) are all drawn as cartridges, with a list view available.
+
+**Why.** Apps and settings used to be hidden behind modals reachable only from the library, which
+made a working shell feel like a demo. Peer tabs give the shell a stable mental model, and the two
+global shortcuts are the ones a user coming from a desktop will try first. Cartridges everywhere is
+the visual answer to "games and apps should look like game cartridges".

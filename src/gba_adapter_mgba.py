@@ -23,12 +23,14 @@ import subprocess
 import struct
 import select
 import threading
+import time
 
 # Ensure local src directory is on sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common import setup_logging, load_keybindings, load_display_config, DEFAULT_KEYBINDINGS
+from config import display_session, prepare_child_environment
 
 logger = setup_logging("gba.adapter")
 
@@ -99,11 +101,24 @@ def _write_mgba_config(config_file: str, windowed: bool = False) -> None:
         keyStart=bindings.get("keyStart", DEFAULT_KEYBINDINGS["keyStart"]),
         keySelect=bindings.get("keySelect", DEFAULT_KEYBINDINGS["keySelect"]),
     )
-    os.makedirs(os.path.dirname(config_file), exist_ok=True)
+    os.makedirs(os.path.dirname(config_file) or ".", exist_ok=True)
     tmp = config_file + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)
     os.replace(tmp, config_file)
+
+
+def mgba_config_path(config_dir: str = None) -> str:
+    """
+    Where mGBA will actually look for its config.
+
+    mGBA resolves `$XDG_CONFIG_HOME/mgba/config.ini`. We point XDG_CONFIG_HOME
+    at SYS_CONFIG_DIR so the handler stays inside its sandbox (H5) and can be
+    certain the file it writes is the file mGBA reads.
+    """
+    if config_dir:
+        return os.path.join(config_dir, "mgba", "config.ini")
+    return os.path.join(os.path.expanduser("~"), ".config", "mgba", "config.ini")
 
 
 def ensure_mgba_config(config_dir: str = None) -> None:
@@ -113,20 +128,19 @@ def ensure_mgba_config(config_dir: str = None) -> None:
     When `config_dir` (SYS_CONFIG_DIR) is given the config stays inside the
     handler's own directory (H5); otherwise the user profile is used.
     """
-    home_dir = os.path.expanduser("~")
     if config_dir:
-        config_file = os.path.join(config_dir, "config.ini")
-    else:
-        config_file = os.path.join(home_dir, ".config", "mgba", "config.ini")
+        os.environ["XDG_CONFIG_HOME"] = config_dir
+    config_file = mgba_config_path(config_dir)
 
     try:
         _write_mgba_config(config_file, windowed=os.environ.get("GBA_WINDOWED") == "1")
+        # Keep a copy at the historically documented location so existing
+        # installs, docs and tests that read SYS_CONFIG_DIR/config.ini agree
+        # with what mGBA actually loads.
         if config_dir:
-            # mGBA only looks in the user's profile; keep both in sync.
-            _write_mgba_config(
-                os.path.join(home_dir, ".config", "mgba", "config.ini"),
-                windowed=os.environ.get("GBA_WINDOWED") == "1",
-            )
+            legacy = os.path.join(config_dir, "config.ini")
+            if os.path.abspath(legacy) != os.path.abspath(config_file):
+                _write_mgba_config(legacy, windowed=os.environ.get("GBA_WINDOWED") == "1")
         logger.info("mGBA config prepared at %s", config_file)
     except Exception as e:
         logger.warning("Could not initialize mGBA config: %s", e)
@@ -298,12 +312,22 @@ class InputMonitor(threading.Thread):
 
 def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
                        windowed: bool, display_scaling: str) -> list:
-    """Builds the mGBA argv with save routing (SV1) and scaling (D2)."""
+    """
+    Builds the mGBA argv with save routing (SV1), scaling (D2) and explicit
+    video settings.
+
+    The video settings are passed as `-C` overrides rather than only through
+    config.ini: mGBA reads its config from `$XDG_CONFIG_HOME/mgba/config.ini`,
+    and if that file is not where we think it is, defaulting to a window is
+    harmless while defaulting to the *wrong* fullscreen backend is what leaves
+    the user staring at a black screen.
+    """
     cmd = [
         mgba_bin,
         "-C", f"savegamePath={save_dir}",
         "-C", f"savestatePath={save_dir}",
         "-C", f"screenshotPath={save_dir}",
+        "-C", f"fullscreen={0 if windowed else 1}",
     ]
     if windowed:
         cmd.extend(["-3"])
@@ -313,6 +337,49 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
         cmd.extend(["-C", f"lockIntegerScaling={1 if display_scaling == 'integer' else 0}"])
     cmd.append(content_path)
     return cmd
+
+
+def _run_mgba(cmd: list, env: dict) -> int:
+    """Runs mGBA, streaming its log, and returns the exit status."""
+    bindings = load_keybindings()
+    try:
+        child = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                 env=env)
+    except Exception as exc:
+        logger.error("Failed to launch mGBA: %s", exc)
+        return 3
+
+    monitor = InputMonitor(child, escape_keys={KEY_ESC, bindings.get("keySelect", 8)})
+    monitor.start()
+
+    def handle_signal(sig, frame):
+        logger.info("Adapter received signal %d, forwarding to child %d", sig, child.pid)
+        try:
+            child.send_signal(sig)
+        except ProcessLookupError:
+            pass
+
+    previous = {}
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        previous[sig] = signal.signal(sig, handle_signal)
+
+    try:
+        if child.stdout:
+            for line in iter(child.stdout.readline, ""):
+                cleaned = line.strip()
+                if cleaned:
+                    logger.info("[mgba] %s", cleaned)
+            child.stdout.close()
+        ret = child.wait()
+    finally:
+        monitor.stop()
+        for sig, handler in previous.items():
+            try:
+                signal.signal(sig, handler)
+            except Exception:
+                pass
+    return ret
 
 
 def main():
@@ -347,51 +414,36 @@ def main():
         logger.error("%s", exc)
         sys.exit(3)
 
-    # If running inside an X11 session, do not force the KMS/DRM driver.
-    if "DISPLAY" in os.environ and os.environ.get("SDL_VIDEODRIVER") == "KMSDRM":
-        logger.info("Unsetting SDL_VIDEODRIVER=KMSDRM inside an X11 session")
-        del os.environ["SDL_VIDEODRIVER"]
-
     is_windowed = os.environ.get("GBA_WINDOWED", "0") == "1"
-    display_scaling = os.environ.get("SYS_DISPLAY_SCALING") or load_display_config().get("scaling", "integer")
+    display_scaling = os.environ.get("SYS_DISPLAY_SCALING") or \
+        load_display_config().get("scaling", "integer")
+
+    # A child that inherits a dead $DISPLAY or a KMS/DRM driver inside a live
+    # desktop renders into nowhere: that is the "game starts to a black screen"
+    # bug. Resolve the session and hand mGBA a coherent environment (D4).
+    env = prepare_child_environment()
+    logger.info("Display session=%s driver=%s windowed=%s scaling=%s",
+                display_session(), env.get("SDL_VIDEODRIVER", "auto"),
+                is_windowed, display_scaling)
 
     cmd = build_mgba_command(mgba_bin, content_path, save_dir, is_windowed, display_scaling)
     logger.info("Executing mGBA: %s", " ".join(cmd))
 
-    if config_dir:
-        os.environ.setdefault("XDG_CONFIG_HOME", os.path.dirname(config_dir))
+    started = time.monotonic()
+    ret = _run_mgba(cmd, env)
+    elapsed = time.monotonic() - started
+    logger.info("Child mGBA exited with code %d after %.1fs", ret, elapsed)
 
-    try:
-        child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, bufsize=1)
-    except Exception as exc:
-        logger.error("Failed to launch mGBA: %s", exc)
-        sys.exit(3)
-
-    bindings = load_keybindings()
-    monitor = InputMonitor(child, escape_keys={KEY_ESC, bindings.get("keySelect", 8)})
-    monitor.start()
-
-    def handle_signal(sig, frame):
-        logger.info("Adapter received signal %d, forwarding to child %d", sig, child.pid)
-        try:
-            child.send_signal(sig)
-        except ProcessLookupError:
-            pass
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-
-    if child.stdout:
-        for line in iter(child.stdout.readline, ""):
-            cleaned = line.strip()
-            if cleaned:
-                logger.info("[mgba] %s", cleaned)
-        child.stdout.close()
-
-    ret = child.wait()
-    monitor.stop()
-    logger.info("Child mGBA exited with code %d", ret)
+    # Self-heal: a fast, non-zero exit inside a desktop session usually means
+    # the requested SDL backend could not create a window. Retry once windowed
+    # without our driver pin instead of bouncing the user to the library.
+    if ret != 0 and not is_windowed and elapsed < 5.0 and display_session() in ("x11", "wayland"):
+        logger.warning("mGBA failed early; retrying once in a window without SDL video pinning")
+        retry_env = dict(os.environ)
+        retry_env.pop("SDL_VIDEODRIVER", None)
+        retry_cmd = build_mgba_command(mgba_bin, content_path, save_dir, True, display_scaling)
+        logger.info("Retrying: %s", " ".join(retry_cmd))
+        ret = _run_mgba(retry_cmd, retry_env)
 
     # Durability: fsync save files and their directory, then keep a backup.
     sync_directory(save_dir)

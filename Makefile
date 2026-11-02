@@ -2,7 +2,8 @@
 
 PYTHON ?= python3
 SRC     = src/gba_launcher.py src/gba_supervisor.py src/gba_adapter_mgba.py \
-          src/gba_recovery.py src/common.py src/library.py
+          src/gba_recovery.py src/common.py src/library.py src/config.py \
+          src/theme.py src/gba_terminal.py src/gba_browser.py src/gba_usb.py
 TESTS   = tests
 
 all: test
@@ -36,9 +37,10 @@ run-window run-desktop:
 	./scripts/launch_desktop.sh
 
 screenshots:
-	$(PYTHON) src/gba_launcher.py --tab 0 --demo --screenshot ui_preview_games.png
-	$(PYTHON) src/gba_launcher.py --tab 1 --demo --screenshot ui_preview_apps.png
-	$(PYTHON) src/gba_launcher.py --tab 2 --demo --screenshot ui_preview_settings.png
+	$(PYTHON) src/gba_launcher.py --tab games --demo --screenshot ui_preview_games.png
+	$(PYTHON) src/gba_launcher.py --tab apps --demo --screenshot ui_preview_apps.png
+	$(PYTHON) src/gba_launcher.py --tab settings --demo --screenshot ui_preview_settings.png
+	$(PYTHON) src/gba_launcher.py --tab browser --demo --screenshot ui_preview_browser.png
 
 install:
 	./scripts/install.sh

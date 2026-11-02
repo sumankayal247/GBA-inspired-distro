@@ -554,52 +554,42 @@ def file_age_seconds(path: str) -> Optional[float]:
 
 
 # --- Display preferences ----------------------------------------------------
-# Stored in DATA so the choice survives reboots. The supervisor forwards it to
-# handlers as SYS_DISPLAY_SCALING so emulators and the shell agree (Rule D2/I3).
+# These helpers remain for compatibility; the canonical store is config.py.
 
-DISPLAY_SCALING_MODES = ["integer", "stretch"]
+DISPLAY_SCALING_MODES = ["fit", "integer"]
 _LEGACY_SCALING_ALIASES = {
     "Integer Aspect (Crisp)": "integer",
-    "Fullscreen Stretched": "stretch",
+    "Fullscreen Stretched": "fit",
+    "stretch": "fit",
 }
 
 
 def display_scaling_label(mode: str) -> str:
+    mode = _LEGACY_SCALING_ALIASES.get(mode, mode)
     return {
-        "integer": "Integer Aspect (Crisp)",
-        "stretch": "Fullscreen Stretched",
+        "fit": "Fill screen",
+        "integer": "Integer scale (crisp)",
     }.get(mode, mode)
 
 
 def load_display_config() -> dict:
-    config = {"scaling": "integer"}
-    path = os.path.join(get_data_dir(), "config", "display.json")
-    if os.path.isfile(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                scaling = data.get("scaling", "integer")
-                scaling = _LEGACY_SCALING_ALIASES.get(scaling, scaling)
-                if scaling in DISPLAY_SCALING_MODES:
-                    config["scaling"] = scaling
-        except Exception:
-            pass
-    return config
+    try:
+        import config as _config
+        return {"scaling": _config.load_settings().get("scaling", "fit")}
+    except Exception:
+        return {"scaling": "fit"}
 
 
 def save_display_config(config: dict) -> None:
-    path = os.path.join(get_data_dir(), "config", "display.json")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    scaling = config.get("scaling", "integer")
-    scaling = _LEGACY_SCALING_ALIASES.get(scaling, scaling)
-    if scaling not in DISPLAY_SCALING_MODES:
-        scaling = "integer"
-    tmp = path + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"scaling": scaling}, f, indent=2)
-        os.replace(tmp, path)
+        import config as _config
+        settings = _config.load_settings()
+        scaling = _LEGACY_SCALING_ALIASES.get(config.get("scaling", "fit"),
+                                              config.get("scaling", "fit"))
+        if scaling not in DISPLAY_SCALING_MODES:
+            scaling = "fit"
+        settings["scaling"] = scaling
+        _config.save_settings(settings)
     except Exception:
         pass
 
