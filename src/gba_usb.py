@@ -19,8 +19,13 @@ ROM_EXTENSIONS = (".gba", ".gbc", ".gb")
 # Mount points that typically hold user media on appliance and desktop images.
 MEDIA_ROOTS = ("/media", "/run/media", "/mnt", "/var/media")
 
-_SKIP_DIRS = {"lost+found", "System Volume Information", "$RECYCLE.BIN",
-              ".Trash", ".Trash-1000", "node_modules", ".git"}
+_SKIP_DIRS = {
+    "lost+found", "System Volume Information", "$RECYCLE.BIN",
+    ".Trash", ".Trash-1000", "node_modules", ".git", ".github",
+    "venv", ".venv", "env", ".env", "__pycache__", "cache", ".cache",
+    "site-packages", "dist-packages", "models", "torch", "lib", "bin",
+    "include", "share", "proc", "sys", "dev"
+}
 
 
 class Volume:
@@ -44,21 +49,27 @@ class Volume:
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<Volume {self.label} {self.mountpoint} removable={self.removable}>"
 
-    def scan_roms(self, max_files: int = 2000) -> List[Tuple[str, int]]:
+    def scan_roms(self, max_files: int = 2000, max_depth: int = 5) -> List[Tuple[str, int]]:
         """Returns [(absolute_path, size_bytes)] of ROM files on the volume."""
         if self._roms is not None:
             return self._roms
 
         found: List[Tuple[str, int]] = []
-        root = self.mountpoint
+        root = os.path.realpath(self.mountpoint)
         if not os.path.isdir(root):
             self._roms = found
             return found
+
+        root_depth = root.rstrip(os.sep).count(os.sep)
 
         def onerror(_exc):
             return
 
         for directory, dirs, files in os.walk(root, onerror=onerror):
+            cur_depth = directory.rstrip(os.sep).count(os.sep) - root_depth
+            if cur_depth >= max_depth:
+                dirs[:] = []
+                continue
             dirs[:] = sorted(d for d in dirs
                              if d not in _SKIP_DIRS and not d.startswith("."))
             for name in sorted(files):

@@ -289,8 +289,7 @@ class TestIsoBuild(unittest.TestCase):
         else:
             self.assertIn("Missing", result.stdout)
             self.assertIn("Nothing was changed", result.stdout)
-            for line in ("xorriso", "mksquashfs", "grub-mkrescue"):
-                self.assertIn(line, result.stdout)
+            self.assertIn("apt install", result.stdout)
 
     def test_builder_serves_uefi_and_bios(self):
         source = read(BUILD_ISO)

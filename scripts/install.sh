@@ -22,6 +22,7 @@
 # ==============================================================================
 
 set -Eeuo pipefail
+export PATH="$PATH:/usr/games:/usr/local/games"
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/common.sh
@@ -526,7 +527,7 @@ EOF_GRUB_D
 
     cat > "$GRUB_ENTRY" << EOF
 #!/bin/sh
-exec tail -n +3 \$0
+cat << 'EOF_GBA_GRUB'
 # GBA OS appliance entries. Appended, never replacing the existing OS entries.
 menuentry "GBA OS (console appliance)" --class gba --class gnu-linux --class os {
 	load_video
@@ -553,6 +554,7 @@ menuentry "GBA OS (safe graphics / recovery)" --class gba --class gnu-linux --cl
 	linux $kernel root=UUID=$root_uuid ro quiet gba_mode=1 nomodeset gba_safe=1
 	${initrd:+initrd $initrd}
 }
+EOF_GBA_GRUB
 EOF
     chmod 0755 "$GRUB_ENTRY"
 
