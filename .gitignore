@@ -4,3 +4,9 @@ __pycache__/
 *.swp
 *~
 .DS_Store
+
+# Local runtime state created when the shell runs from a checkout
+/data/
+/games/
+.env
+.venv/

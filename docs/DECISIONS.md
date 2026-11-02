@@ -241,3 +241,68 @@ from sharing a writable parent directory, so the isolation boundary is real once
 - `GAME_PLAN.md` is not modified until this contract has been reviewed against it. The reconciliation
   happens in one deliberate commit afterward.
 - Rationale belongs here. `CONTRACT.md` stays purely normative and implementation-agnostic.
+
+---
+
+## D-024 Library search is keyboard-only, and lives in the shell
+
+**Decision.** Incremental search is part of the launcher, not a separate screen, and it is driven by
+plain typing rather than a chord. A gamepad has no text entry, so pads navigate and search is a
+keyboard or USB-keyboard affordance.
+
+**Why.** A console appliance with a growing library needs a way to jump to a title without scrolling.
+Streaming the filter into the existing list keeps one interaction model (navigate → confirm) and one
+piece of layout code.
+
+**Consequence.** Typing must never double as navigation, so the shell implements its own held-key
+repeat for arrow keys instead of enabling global key repeat.
+
+---
+
+## D-025 Play history is launcher state, not save data
+
+**Decision.** Launch counts, last-played timestamps and cumulative play time live in
+`DATA/config/history.json`, written by the launcher. The supervisor still never reads or writes save
+data (S5), and it does not parse history either.
+
+**Why.** Focusing the last-played entry is the single most requested console behaviour, but it must
+not create a second, competing model of "what is a save". Config is disposable-with-consequences:
+losing it costs a recency hint, not a save.
+
+---
+
+## D-026 Saves get a pre-session backup, not a save-state protocol
+
+**Decision.** The adapter copies `.sav`/`.srm` files to `<name>.bak` before mGBA starts and restores
+the backup when the live file is missing or zero-length afterwards, in addition to fsyncing file and
+directory on exit (SV2). Backups are refreshed only when the file size changed.
+
+**Why.** SV4 requires a recoverable prior state after a hard power loss. A pre-session mirror is the
+cheapest mechanism that survives mGBA being killed mid-write, and it composes with the emulator's own
+save handling instead of replacing it. It is explicitly *not* a savestate feature.
+
+---
+
+## D-027 Display scaling is a user preference that both shell and handler obey
+
+**Decision.** `DATA/config/display.json` holds `scaling: integer|stretch`. The supervisor exports it
+as `SYS_DISPLAY_SCALING`; the adapter maps it to mGBA's `lockIntegerScaling` and the shell maps it to
+its own presentation. The setting previously existed only as a modal label.
+
+**Why.** D2 asks for integer scaling with borders when the aspect ratio does not match. Making the
+choice persistent and shared avoids the common failure where the menu says one thing and the
+emulator does another.
+
+---
+
+## D-028 The shell owns log hygiene; the supervisor owns orphan cleanup
+
+**Decision.** Log rotation (2 MB, 5 archives) and pruning of old boot logs happen in `common.py` and
+are invoked by whichever component opens the log and by the supervisor at boot. Orphan cleanup
+matches `argv[0]`/script basename against a fixed executable list, never against a command-line
+substring.
+
+**Why.** ST5 requires logs to be unable to fill DATA, and S8 requires stale foreground sessions to be
+terminated. Both are cheap, but both are dangerous if implemented loosely: rotating in the wrong
+place truncates a live session's log, and substring matching can signal unrelated processes belonging
+to the user.
