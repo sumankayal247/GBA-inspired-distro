@@ -114,12 +114,22 @@ GAMES   (optional)   user-visible content, readable from other operating systems
   cause data loss; the library MUST be rebuilt from content and saves.
 - **ST3** [REVIEW] Precious paths MUST NOT be removed or rewritten by any automatic process other
   than the component that owns them.
-- **ST4** [TEST: T-STORE-1] GAMES MUST be mounted read-only. The system MUST NOT write to
-  `/games/`, including beside a content file.
+- **ST4** [TEST: T-STORE-1] [AMENDED 2026-11-02, see D-032] GAMES MUST be mounted read-only
+  during normal operation. The system MUST NOT write to `/games/`, including beside a content
+  file. The single exception is a user-confirmed ROM import (ST7), which is the only write path
+  and MUST NOT create, modify or delete anything except new ROM files.
 - **ST5** [TEST: T-FAULT-4] Logs MUST be size-capped and rotated. A runaway log MUST NOT be able
   to fill DATA.
 - **ST6** [TEST: T-FAULT-5] DATA MUST reserve free space for system use so that logging and saving
   remain possible when users fill the volume.
+- **ST7** [TEST: T-LIBRARY-3] ROM import from removable media:
+  - discovery MUST NOT require `udisks`, `udevadm` or `lsblk`; mount state is read from
+    `/proc/mounts` and removability from `/sys/block`;
+  - nothing MUST be copied before the user explicitly confirms the import;
+  - an existing file MUST NOT be overwritten: identical files are skipped and a name clash is
+    copied under a `(n)` suffix;
+  - every copy MUST be verified by size and a partial copy MUST be removed;
+  - the destination MUST stay inside GAMES.
 
 ---
 
@@ -275,12 +285,24 @@ Parameters (provisional): N = 3, M = 30.
 
 ## 8. Display & Audio Contract
 
-- **D1** [REVIEW] The launcher MUST render to a fixed logical resolution and scale it to the display.
+- **D1** [REVIEW] [AMENDED 2026-11-02, see D-029] The launcher MUST use the whole display: it
+  renders at the display's native resolution and lays out in resolution-independent design units.
+  It MUST NOT letterbox itself with a fixed 480x320 window. An optional "integer" mode MAY compose
+  on a 480x320 canvas and upscale by a whole factor for a deliberately pixelated look.
 - **D2** [REVIEW] Scaling of emulated content SHOULD use integer factors with borders when the
   aspect ratio does not match.
 - **D3** [REVIEW] The launcher and the bundled emulator MUST NOT require an X11 or Wayland session.
-- **D4** [TEST: T-LAUNCH-1] The launcher MUST establish its own display state on start (see H2).
+- **D4** [TEST: T-LAUNCH-1] The launcher MUST establish its own display state on start (see H2)
+  and MUST release it before a handler starts. A handler MUST NOT inherit a display environment
+  that cannot present: a stale `DISPLAY` or a KMS/DRM driver inside a live desktop is a defect
+  (see D-031).
 - **D5** [TEST: T-AV-1] Audio MUST NOT underrun audibly during normal play.
+- **D7** [TEST: T-DISPLAY-1] When a full-screen session exits non-zero within five seconds, the
+  adapter MUST retry once through a fallback ladder: windowed with no driver pinning under
+  x11/wayland, and the next `/dev/dri/card*` on a bare console. A clean exit, a long session, and a
+  headless machine MUST NOT be retried.
+- **D8** [TEST: T-DISPLAY-2] On a bare console the adapter MUST pin `SDL_VIDEO_KMSDRM_DEVICE` to a
+  specific card rather than letting SDL choose among several GPUs.
 - **D6** [TEST: T-AV-2] The frame-pacing strategy (vsync vs audio-driven timing) MUST be documented in
   `DECISIONS.md` with measurements.
 
@@ -331,6 +353,48 @@ missing or broken.**
   and reset, and MUST require explicit confirmation before any destructive action.
 - **F3** [TEST: T-STORE-3, T-FAULT-1, T-FAULT-2, T-FAULT-3, T-FAULT-6] A failure of content, a
   handler, or a removable medium MUST NOT become a failure of the operating system.
+- **F4** [TEST: T-FALLBACK-1] A missing runtime dependency (pygame, mGBA, python3) MUST be reported
+  in words on the console and MUST lead to the recovery path, not to a crash loop or a black screen.
+  The launcher signals this with exit code 103; the supervisor MUST NOT retry it.
+- **F5** [TEST: T-FALLBACK-2] `gba_init.sh` MUST remain usable as PID 1 with no python3, no reboot
+  binary and no supervisor: it MUST fall back to `/proc/sysrq-trigger` and to a rescue shell that
+  never exits. `gba_mode=0` MUST disable the appliance and `gba_safe=1` MUST skip the graphical shell.
+
+---
+
+## 10b. Installation & Image Contract
+
+The installer is the only part of the system that may write outside `/data` and
+`/games`, so it carries its own rules. Each one has a test in
+`tests/test_installer.py`, `tests/test_setup.py` or `tests/test_safety.py`.
+
+- **IN1** [TEST: T-INSTALL-1] An installation MUST be planned, validated and confirmed before any
+  write. `validate_plan` MUST refuse: the running root or live medium, a mounted target, a target
+  partition containing an OS, a target below 8 GiB, a cross-disk EFI partition, an occupied mount
+  point, a missing source, and removable media without explicit consent.
+- **IN2** [TEST: T-INSTALL-2] Destructive whole-disk installation MUST require a typed phrase
+  (`ERASE <disk>`) in addition to any `--yes`; a partition install MUST NOT require it, because it
+  cannot destroy another operating system.
+- **IN2b** [TEST: T-INSTALL-2b] An EFI system partition that already exists MUST NOT be formatted;
+  an existing `EFI/BOOT` fallback loader MUST be copied aside before GRUB writes to it. Only an ESP
+  created by the installer itself (whole-disk mode) may be formatted.
+- **IN3** [TEST: T-INSTALL-3] The bootloader MUST be installed last, after the system has been
+  copied and verified, and every exit path (including failure) MUST unmount the target. UEFI firmware
+  MUST NOT be modified (`--no-nvram --removable`).
+- **IN4** [TEST: T-INSTALL-4] The guided setup (`gba_setup.py`) MUST recommend only targets that keep
+  the existing system bootable, MUST default to them, and MUST explain its exit state in words
+  ("nothing was changed", "your boot menu was not modified", …).
+- **IN5** [TEST: T-INSTALL-5] The on-system installer (`scripts/install.sh`) MUST be dry-run by
+  default, MUST back up every file it modifies, MUST regenerate and then verify the boot menu,
+  MUST restore the previous menu on any failure, and MUST NOT change the default boot target.
+- **IN6** [TEST: T-INSTALL-6] No shell script may format, partition or write a block device. All disk
+  writes MUST go through `src/gba_installer.py`, where IN1–IN3 are enforced.
+- **IN7** [TEST: T-INSTALL-7] The ISO build MUST fail loudly, listing every missing prerequisite, and
+  MUST write only inside its build directory. The produced image MUST boot on BIOS and UEFI and MUST
+  offer an install entry, a safe-graphics entry, a shell entry and a "boot the internal disk" entry.
+- **IN8** [TEST: T-INSTALL-8] `gba-selftest` MUST check interpreter, fonts, terminal, display
+  session, emulator, module imports, storage and configuration, and MUST exit 0 only when no check
+  fails (warnings are acceptable). It MUST NOT write outside its data directory.
 
 ---
 
@@ -382,6 +446,7 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 | ID | Procedure | Pass criteria | Verifies |
 |---|---|---|---|
 | T-LIBRARY-1 | Add game A without any manual step; record its entry ID; rename the file; rescan. | Entry appears automatically; ID and save directory unchanged after the rename. | L2, L3 |
+| T-LIBRARY-3 | Plug in a stick with 10 ROMs, decline the prompt, re-plug, accept; import twice. | Nothing copied before confirmation; 10 files appear inside GAMES; the second import copies nothing; no partial files remain. | ST7 |
 | T-MANIFEST-1 | Create manifests omitting `network`, `input` and `display`; create one with `contract = 999`. | Omitted needs resolve to `false`, gamepad-only and direct; the unsupported manifest is rejected without crashing the launcher. | L7, L8 |
 
 ### Input
@@ -429,6 +494,24 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 | T-FAULT-6 | Launcher binary corrupted. | Recovery path reached. | S7, F3 |
 | T-FAULT-7 | Launcher crashes repeatedly. | Recovery after N crashes in M seconds. | S7 |
 | T-FAULT-8 | Kill the supervisor with SIGKILL during a game. | PID 1 restarts it; the orphaned game is terminated; launcher returns. | S8 |
+
+### Installation, fallbacks and image
+
+| ID | Procedure | Pass criteria | Verifies |
+|---|---|---|---|
+| T-INSTALL-1 | Run `validate_plan` for each refusal case in IN1 (unit tests use faked devices). | Every case refuses with a readable reason; a clean plan passes. | IN1 |
+| T-INSTALL-2 | Run the guided setup, choose the whole disk, type the wrong phrase. | Refused, no command executed. With the exact phrase, partitioning starts. | IN2, IN4 |
+| T-INSTALL-2b | Install into an empty partition on a disk that already has an ESP with a foreign loader. | The ESP is not formatted; the foreign loader is copied to `EFI/BOOT.gba-backup-*`. | IN2b |
+| T-INSTALL-3 | Install to a partition, with `cp` and then `grub-install` forced to fail in turn. | No `grub-install` after a copy failure; `umount` always runs; exit codes 4 and 5 respectively. | IN3 |
+| T-INSTALL-4 | Boot the ISO, read the first screen, press Enter twice. | Two questions, safe default recommended, explicit confirmation, readable success/failure. | IN4 |
+| T-INSTALL-5 | `scripts/install.sh` with no arguments; then `--apply` on a scratch VM. | Dry-run changes nothing; apply backs up, verifies the entry, restores on failure. | IN5 |
+| T-INSTALL-6 | Grep the shell scripts for disk-writing commands. | None found outside `gba_installer.py`. | IN6 |
+| T-INSTALL-7 | `scripts/build_iso.sh --check` on a host without the tools; then a full build. | First run lists every missing tool and exits non-zero; second run produces a hybrid ISO. | IN7 |
+| T-INSTALL-8 | `gba-selftest` on a machine with and without mGBA/pygame. | Exit 0 with warnings when only optional parts are missing; exit 1 and a named check when something required is missing. | IN8 |
+| T-DISPLAY-1 | Force mGBA to exit 1 immediately: once under X11, once on a bare console with two DRM cards. | First retries windowed; second retries the other card; a clean exit and a 30 s session are not retried. | D7 |
+| T-DISPLAY-2 | Boot the appliance on a hybrid-GPU laptop. | `SDL_VIDEO_KMSDRM_DEVICE` is set explicitly; no black screen from an output-less card. | D8 |
+| T-FALLBACK-1 | Import the launcher with pygame unavailable. | Exit 103, message naming the fix, no traceback. | F4 |
+| T-FALLBACK-2 | Boot with `gba_mode=0`, then with `gba_safe=1`, then without python3. | Shell, recovery console, and rescue shell respectively; never a black screen. | F5 |
 
 ### Audio, video, measurement
 
