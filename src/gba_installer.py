@@ -449,7 +449,14 @@ def validate_plan(plan: InstallPlan, runner: CommandRunner, disks: Sequence[Disk
     else:
         raise SafetyRefusal(f"unknown source kind '{plan.source_kind}'")
 
-    # 6. EFI partition, when one is named.
+    # 6. The tools the chosen path needs must exist, or we would fail half way.
+    if plan.bootloader != "none" and not runner.has("grub-install"):
+        raise SafetyRefusal(
+            "grub-install is missing, so a boot menu entry could not be written. "
+            "Install grub2-common (and grub-pc-bin or grub-efi-amd64-bin) first. "
+            "Nothing was changed.")
+
+    # 7. EFI partition, when one is named.
     if plan.efi:
         efi_real = real_device(plan.efi)
         if not os.path.exists(efi_real) or not _is_block_device(efi_real):

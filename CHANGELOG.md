@@ -54,7 +54,7 @@ The answer is documented in [docs/SAFETY.md](docs/SAFETY.md), enforced in code, 
 
 ### Tests
 
-- 219 tests (was 133). New: `tests/test_installer.py` (33), `tests/test_setup.py` (21),
+- 221 tests (was 133). New: `tests/test_installer.py` (35), `tests/test_setup.py` (21),
   `tests/test_safety.py` (30). Documented limitation: the sandbox has no `xorriso`, no loop devices
   and no root, so the ISO build is verified by `--check`, syntax checks and by reading the generated
   configuration — not by booting real hardware.

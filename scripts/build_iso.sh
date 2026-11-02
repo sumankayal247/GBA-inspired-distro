@@ -111,10 +111,24 @@ gb_step "Creating the base system in $ROOTFS_DIR"
 debootstrap \
     --variant=minbase \
     --arch=amd64 \
-    --include=systemd,systemd-sysv,udev,kmod,live-boot,live-config,grub2-common,grub-pc-bin,grub-efi-amd64-bin,efibootmgr,parted,sgdisk,e2fsprogs,dosfstools,squashfs-tools,python3,python3-pygame,fonts-dejavu-core,alsa-utils,console-setup \
+    --include=systemd,systemd-sysv,udev,kmod,live-boot,live-config,linux-image-amd64,grub2-common,grub-pc-bin,grub-efi-amd64-bin,efibootmgr,parted,sgdisk,e2fsprogs,dosfstools,squashfs-tools,python3,python3-pygame,fonts-dejavu-core,alsa-utils,util-linux \
     bookworm "$ROOTFS_DIR" "${GBA_ISO_MIRROR:-http://deb.debian.org/debian}"
 
+# apt and python inside the chroot need working /dev, /proc and DNS.
+gb_step "Preparing the chroot"
+for mountpoint in dev proc sys; do
+    mount --bind "/$mountpoint" "$ROOTFS_DIR/$mountpoint" 2>/dev/null || true
+done
+cleanup_chroot() {
+    for mountpoint in sys proc dev; do
+        umount "$ROOTFS_DIR/$mountpoint" 2>/dev/null || true
+    done
+}
+trap cleanup_chroot EXIT INT TERM
+[ -f /etc/resolv.conf ] && cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
+
 gb_step "Installing the emulator (optional package)"
+chroot "$ROOTFS_DIR" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1 || true
 if ! chroot "$ROOTFS_DIR" /usr/bin/env DEBIAN_FRONTEND=noninteractive \
         apt-get install -y --no-install-recommends mgba-sdl >/dev/null 2>&1; then
     gb_warn "mgba-sdl is not available from this mirror."
@@ -196,11 +210,16 @@ rm -rf "$ROOTFS_DIR/var/cache/apt/archives/"*.deb "$ROOTFS_DIR/tmp/"* 2>/dev/nul
 mkdir -p "$ROOTFS_DIR/var/cache/apt/archives/partial" "$ROOTFS_DIR/tmp"
 chmod 1777 "$ROOTFS_DIR/tmp"
 
+cleanup_chroot
+trap - EXIT INT TERM
+
 # ------------------------------------------------------------- squashfs ------
 gb_step "Compressing the live filesystem (this is the slow part)"
 install -d "$ISODIR/live"
+# /boot is included on purpose: the installed system needs its own kernel and
+# initrd, and setup installs the image by extracting this squashfs.
 mksquashfs "$ROOTFS_DIR" "$ISODIR/live/filesystem.squashfs" \
-    -noappend -comp xz -e boot -wildcards -quiet
+    -noappend -comp xz -quiet
 
 KERNEL="$(ls "$ROOTFS_DIR"/boot/vmlinuz-* 2>/dev/null | head -n1 || true)"
 INITRD="$(ls "$ROOTFS_DIR"/boot/initrd.img-* 2>/dev/null | head -n1 || true)"
@@ -241,9 +260,7 @@ menuentry "Boot from the internal disk instead" {
 EOF_GRUB
 
 gb_step "Building the hybrid BIOS+UEFI image"
-grub-mkrescue -o "$OUT_DIR/$ISO_NAME" "$ISODIR" \
-    --volid "$VOLUME_ID" \
-    -- -volid "$VOLUME_ID"
+grub-mkrescue -o "$OUT_DIR/$ISO_NAME" "$ISODIR" -- -volid "$VOLUME_ID"
 
 gb_step "Recording checksums"
 ( cd "$OUT_DIR" && sha256sum "$ISO_NAME" > "$ISO_NAME.sha256" )

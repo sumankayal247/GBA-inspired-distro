@@ -266,7 +266,7 @@ def run(stream_in=None, stream_out=None, runner=None, dry_run: bool = False,
             "\n  No free space was found for GBA OS.\n\n"
             "  This is not a problem with your computer. GBA OS needs either an\n"
             "  empty partition of at least 8 GB or a spare disk. Free some space\n"
-            "  (or plug in a second disk), then run 'gba-install' again.\n\n"
+            "  (or plug in a second disk), then run 'gba-setup' again.\n\n"
             "  Your system was not modified.\n")
         return installer.EXIT_REFUSED
 

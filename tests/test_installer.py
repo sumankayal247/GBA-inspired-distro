@@ -200,6 +200,22 @@ class TestSafetyRefusals(InstallerTestCase):
             self.validate(plan)
         self.assertIn("same disk", str(ctx.exception))
 
+    def test_refuses_when_the_boot_loader_tool_is_missing(self):
+        class NoGrub(FakeRunner):
+            def has(self, program):
+                return program != "grub-install"
+
+        with self.assertRaises(gi.SafetyRefusal) as ctx:
+            gi.validate_plan(self.plan(), NoGrub(), self.disks)
+        self.assertIn("grub-install", str(ctx.exception))
+
+    def test_missing_boot_loader_is_fine_when_none_is_requested(self):
+        class NoGrub(FakeRunner):
+            def has(self, program):
+                return program != "grub-install"
+
+        gi.validate_plan(self.plan(bootloader="none"), NoGrub(), self.disks)
+
     def test_accepts_a_clean_plan(self):
         self.validate(self.plan())  # must not raise
 
