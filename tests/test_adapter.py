@@ -11,6 +11,7 @@ import shutil
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 import common
 from gba_adapter_mgba import (
+    retry_strategy,
     sync_directory,
     backup_saves,
     restore_backup_if_needed,
@@ -18,6 +19,40 @@ from gba_adapter_mgba import (
     find_mgba_binary,
     InputMonitor,
 )
+
+
+class TestVideoRetry(unittest.TestCase):
+    """The 'black screen then back to the library' fallback ladder."""
+
+    def test_desktop_retries_windowed(self):
+        self.assertEqual(retry_strategy("x11", 1, 0.4, False, {}), ("windowed", None))
+        self.assertEqual(retry_strategy("wayland", 1, 0.4, False, {}), ("windowed", None))
+
+    def test_console_retries_another_drm_card(self):
+        import config
+        real_glob = config.glob.glob
+        config.glob.glob = lambda p: (["/dev/dri/card0", "/dev/dri/card1"]
+                                      if "card" in p else real_glob(p))
+        try:
+            self.assertEqual(
+                retry_strategy("console", 1, 0.4, False,
+                               {"SDL_VIDEO_KMSDRM_DEVICE": "/dev/dri/card0"}),
+                ("card", "/dev/dri/card1"))
+        finally:
+            config.glob.glob = real_glob
+
+    def test_a_clean_exit_is_never_retried(self):
+        self.assertIsNone(retry_strategy("x11", 0, 0.1, False, {}))
+        self.assertIsNone(retry_strategy("console", 0, 0.1, False, {}))
+
+    def test_a_long_session_is_not_a_video_failure(self):
+        self.assertIsNone(retry_strategy("x11", 1, 30.0, False, {}))
+
+    def test_windowed_runs_are_not_retried(self):
+        self.assertIsNone(retry_strategy("x11", 1, 0.2, True, {}))
+
+    def test_headless_has_no_retry(self):
+        self.assertIsNone(retry_strategy("headless", 1, 0.2, False, {}))
 
 
 class TestAdapterContract(unittest.TestCase):

@@ -24,13 +24,14 @@ import struct
 import select
 import threading
 import time
+from typing import Optional
 
 # Ensure local src directory is on sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common import setup_logging, load_keybindings, load_display_config, DEFAULT_KEYBINDINGS
-from config import display_session, prepare_child_environment
+from config import display_session, other_drm_devices, prepare_child_environment
 
 logger = setup_logging("gba.adapter")
 
@@ -339,6 +340,31 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
     return cmd
 
 
+def retry_strategy(session: str, ret: int, elapsed: float, windowed: bool,
+                   env: dict) -> Optional[tuple]:
+    """
+    What to try when mGBA died immediately, or None to accept the result.
+
+    A "black screen then back to the library" is almost always a video backend
+    that could not present. The fallback depends on where we are running:
+
+    * desktop (x11/wayland): retry once windowed with no driver pinning, so SDL
+      negotiates for itself;
+    * bare console: the first DRM card may drive no output, so try the others.
+
+    Returns ("windowed", None) or ("card", "/dev/dri/cardN").
+    """
+    if ret == 0 or windowed or elapsed >= 5.0:
+        return None
+    if session in ("x11", "wayland"):
+        return ("windowed", None)
+    if session == "console":
+        cards = other_drm_devices(env.get("SDL_VIDEO_KMSDRM_DEVICE", ""))
+        if cards:
+            return ("card", cards[0])
+    return None
+
+
 def _run_mgba(cmd: list, env: dict) -> int:
     """Runs mGBA, streaming its log, and returns the exit status."""
     bindings = load_keybindings()
@@ -445,13 +471,20 @@ def main():
     # Self-heal: a fast, non-zero exit inside a desktop session usually means
     # the requested SDL backend could not create a window. Retry once windowed
     # without our driver pin instead of bouncing the user to the library.
-    if ret != 0 and not is_windowed and elapsed < 5.0 and display_session() in ("x11", "wayland"):
+    strategy = retry_strategy(display_session(), ret, elapsed, is_windowed, env)
+    if strategy and strategy[0] == "windowed":
         logger.warning("mGBA failed early; retrying once in a window without SDL video pinning")
         retry_env = dict(os.environ)
         retry_env.pop("SDL_VIDEODRIVER", None)
         retry_cmd = build_mgba_command(mgba_bin, content_path, save_dir, True, display_scaling)
         logger.info("Retrying: %s", " ".join(retry_cmd))
         ret = _run_mgba(retry_cmd, retry_env)
+    elif strategy and strategy[0] == "card":
+        retry_env = dict(env)
+        retry_env["SDL_VIDEO_KMSDRM_DEVICE"] = strategy[1]
+        logger.warning("mGBA failed early on %s; retrying on %s",
+                       env.get("SDL_VIDEO_KMSDRM_DEVICE") or "default", strategy[1])
+        ret = _run_mgba(cmd, retry_env)
 
     # Durability: fsync save files and their directory, then keep a backup.
     sync_directory(save_dir)

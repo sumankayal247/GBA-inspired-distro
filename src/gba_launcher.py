@@ -1858,7 +1858,8 @@ class GBALauncher:
             if self.terminal_session.error:
                 self.toast(f"Terminal unavailable: {self.terminal_session.error}", TOAST_ERROR)
         if self.terminal_view is None:
-            self.terminal_view = TerminalView(self.terminal_screen, self.theme, 8)
+            self.terminal_view = TerminalView(self.terminal_screen, self.theme, 8,
+                                              "starting shell…")
 
     def _terminal_event(self, event) -> None:
         self.ensure_terminal()
@@ -2851,7 +2852,8 @@ class GBALauncher:
                            content.bottom - header.bottom - theme.px(3))
         view = self.terminal_view
         if view is None:
-            self.terminal_view = view = TerminalView(self.terminal_screen, theme, 8)
+            self.terminal_view = view = TerminalView(self.terminal_screen, theme, 8,
+                                                    "starting shell…")
         cols, rows, _, _ = 0, 0, 0, 0
         cw, ch, cols, rows = view.metrics(body)
         if (cols, rows) != self._terminal_grid:

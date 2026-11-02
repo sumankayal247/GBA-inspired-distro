@@ -48,13 +48,19 @@ The answer is documented in [docs/SAFETY.md](docs/SAFETY.md), enforced in code, 
   `103`; the supervisor treats that as fatal and goes to recovery instead of counting crashes.
 - **Missing mGBA** now says so on the console (with the `apt install mgba-sdl` line) as well as in
   the log; saves are untouched.
+- **Black screen on game start** — the fallback ladder is now explicit and testable: a session that
+  dies non-zero within five seconds is retried once (windowed, unpinned, under x11/wayland; the next
+  DRM card on a bare console), and `SDL_VIDEO_KMSDRM_DEVICE` is pinned on console boots so a hybrid
+  GPU's output-less card cannot swallow the picture.
+- **TERMINAL tab** shows "starting shell…" until the shell prints its first byte, so opening it
+  never looks like an empty black rectangle.
 - **`gba_init.sh`** honours `gba_mode=0` and `gba_safe=1`, detects a missing python3, reboots via
   `/proc/sysrq-trigger` when the binary is gone, and falls back to a rescue shell that never exits —
   a black screen with no keyboard response is no longer a reachable state.
 
 ### Tests
 
-- 221 tests (was 133). New: `tests/test_installer.py` (35), `tests/test_setup.py` (21),
+- 229 tests (was 133). New: `tests/test_installer.py` (35), `tests/test_setup.py` (21),
   `tests/test_safety.py` (30). Documented limitation: the sandbox has no `xorriso`, no loop devices
   and no root, so the ISO build is verified by `--check`, syntax checks and by reading the generated
   configuration — not by booting real hardware.

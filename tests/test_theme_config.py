@@ -128,6 +128,31 @@ class TestDisplayEnvironment(ConfigTestCase):
         env = config.prepare_child_environment({"DISPLAY": ":4041", "PATH": "/bin"})
         self.assertNotIn("DISPLAY", env)
 
+    def test_console_pins_the_first_drm_card(self):
+        """Two GPUs must not leave SDL on a card with no outputs."""
+        fake_cards = ["/dev/dri/card1", "/dev/dri/card0"]
+        real_glob = config.glob.glob
+        config.glob.glob = lambda pattern: (fake_cards if "card" in pattern
+                                            else real_glob(pattern))
+        try:
+            env = config.prepare_child_environment({"PATH": "/bin"})
+            self.assertEqual(env["SDL_VIDEODRIVER"], "kmsdrm")
+            self.assertEqual(env["SDL_VIDEO_KMSDRM_DEVICE"], "/dev/dri/card0")
+        finally:
+            config.glob.glob = real_glob
+
+    def test_other_drm_devices_excludes_the_one_in_use(self):
+        real_glob = config.glob.glob
+        config.glob.glob = lambda pattern: (["/dev/dri/card0", "/dev/dri/card1"]
+                                            if "card" in pattern else real_glob(pattern))
+        try:
+            self.assertEqual(config.other_drm_devices("/dev/dri/card0"),
+                             ["/dev/dri/card1"])
+            self.assertEqual(config.other_drm_devices(""), ["/dev/dri/card0",
+                                                            "/dev/dri/card1"])
+        finally:
+            config.glob.glob = real_glob
+
     def test_headless_uses_dummy_drivers(self):
         if os.environ.get("DISPLAY"):
             self.skipTest("run under X11")

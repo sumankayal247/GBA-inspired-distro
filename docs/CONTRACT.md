@@ -297,6 +297,12 @@ Parameters (provisional): N = 3, M = 30.
   that cannot present: a stale `DISPLAY` or a KMS/DRM driver inside a live desktop is a defect
   (see D-031).
 - **D5** [TEST: T-AV-1] Audio MUST NOT underrun audibly during normal play.
+- **D7** [TEST: T-DISPLAY-1] When a full-screen session exits non-zero within five seconds, the
+  adapter MUST retry once through a fallback ladder: windowed with no driver pinning under
+  x11/wayland, and the next `/dev/dri/card*` on a bare console. A clean exit, a long session, and a
+  headless machine MUST NOT be retried.
+- **D8** [TEST: T-DISPLAY-2] On a bare console the adapter MUST pin `SDL_VIDEO_KMSDRM_DEVICE` to a
+  specific card rather than letting SDL choose among several GPUs.
 - **D6** [TEST: T-AV-2] The frame-pacing strategy (vsync vs audio-driven timing) MUST be documented in
   `DECISIONS.md` with measurements.
 
@@ -502,6 +508,8 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 | T-INSTALL-6 | Grep the shell scripts for disk-writing commands. | None found outside `gba_installer.py`. | IN6 |
 | T-INSTALL-7 | `scripts/build_iso.sh --check` on a host without the tools; then a full build. | First run lists every missing tool and exits non-zero; second run produces a hybrid ISO. | IN7 |
 | T-INSTALL-8 | `gba-selftest` on a machine with and without mGBA/pygame. | Exit 0 with warnings when only optional parts are missing; exit 1 and a named check when something required is missing. | IN8 |
+| T-DISPLAY-1 | Force mGBA to exit 1 immediately: once under X11, once on a bare console with two DRM cards. | First retries windowed; second retries the other card; a clean exit and a 30 s session are not retried. | D7 |
+| T-DISPLAY-2 | Boot the appliance on a hybrid-GPU laptop. | `SDL_VIDEO_KMSDRM_DEVICE` is set explicitly; no black screen from an output-less card. | D8 |
 | T-FALLBACK-1 | Import the launcher with pygame unavailable. | Exit 103, message naming the fix, no traceback. | F4 |
 | T-FALLBACK-2 | Boot with `gba_mode=0`, then with `gba_safe=1`, then without python3. | Shell, recovery console, and rescue shell respectively; never a black screen. | F5 |
 

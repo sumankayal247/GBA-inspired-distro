@@ -553,3 +553,18 @@ installed system boots with `gba_mode=1`.
 step the installed machine would offer to install itself on every boot — the single most confusing
 thing an OS can do. The unit conflicts with `getty@tty1` and the wrapper falls back to `agetty` when
 `gba_mode` is absent, so a user who edits the kernel line still gets a login prompt.
+
+---
+
+## D-047 A black screen is a video-backend bug, so the backend gets a ladder
+
+**Decision.** The adapter classifies a session that died non-zero in under five seconds as a video
+failure and retries once: windowed with no `SDL_VIDEODRIVER` pinning under x11/wayland, and the next
+`/dev/dri/card*` on a bare console (with `SDL_VIDEO_KMSDRM_DEVICE` pinned to the first card up front).
+
+**Why.** The launcher hands the display to mGBA on every console, appliance or desktop, and a single
+wrong guess used to mean "the game opens and immediately drops you back to the library". Which guess
+is wrong is not knowable in advance — a stale `DISPLAY`, a DRM master already held, a hybrid GPU
+whose first card drives no output — so the fix is to try the plausible alternatives once, cheaply,
+and only when the failure looks like a video failure (fast exit, not a clean one, not a long session,
+not headless).

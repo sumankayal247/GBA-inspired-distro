@@ -243,6 +243,13 @@ def prepare_child_environment(base: Optional[Dict[str, str]] = None,
         env.pop("SDL_VIDEO_KMSDRM_DEVICE", None)
     elif session == "console":
         env["SDL_VIDEODRIVER"] = force_video or "kmsdrm"
+        # Two GPUs (hybrid laptops, discrete cards) make SDL pick whichever it
+        # finds first, which may be a card with no outputs: a black screen with
+        # a perfectly healthy machine. Pin the first card explicitly.
+        if not env.get("SDL_VIDEO_KMSDRM_DEVICE"):
+            cards = sorted(glob.glob("/dev/dri/card*"))
+            if cards:
+                env["SDL_VIDEO_KMSDRM_DEVICE"] = cards[0]
     else:
         # No display at all: SDL must not try to open one, or every child
         # (and the emulator) dies with a black screen.
@@ -352,3 +359,9 @@ def storage_info(path: str) -> Optional[Dict[str, float]]:
         }
     except Exception:
         return None
+
+
+def other_drm_devices(exclude: str = "") -> List[str]:
+    """The remaining DRM cards, for retrying when the first one presents nothing."""
+    cards = sorted(glob.glob("/dev/dri/card*"))
+    return [card for card in cards if card != exclude]

@@ -136,7 +136,7 @@ reports pass / warn / fail per row, with the exact fix for each failure.
 ## 7. How the claims are tested
 
 ```
-make test          # 221 tests: unit, contract, safety
+make test          # 229 tests: unit, contract, safety
 make lint          # python compile + sh/bash syntax of every script
 make iso-check     # what is missing to build an ISO on this machine
 make selftest      # does *this* machine have everything GBA OS needs

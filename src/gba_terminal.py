@@ -483,11 +483,15 @@ def key_to_bytes(event) -> bytes:
 class TerminalView:
     """Renders a `TerminalScreen` into a rect and paints the cursor."""
 
-    def __init__(self, screen: TerminalScreen, theme, size_units: float = 9):
+    def __init__(self, screen: TerminalScreen, theme, size_units: float = 9,
+                 placeholder: str = ""):
         self.screen = screen
         self.theme = theme
         self.size_units = size_units
         self.scroll_offset = 0
+        # Shown only while the shell has not printed anything yet, so opening
+        # the tab never looks like a broken black rectangle.
+        self.placeholder = placeholder
 
     def metrics(self, rect: pygame.Rect) -> Tuple[int, int, int, int]:
         cw, ch = self.theme.char_cell(self.size_units)
@@ -527,6 +531,14 @@ class TerminalView:
                 run_text += char
             if run_text.strip():
                 surface.blit(font.render(run_text, True, run_color), (run_x, y))
+
+        if self.placeholder:
+            has_text = any(char.strip() for row in self.screen.lines()
+                           for char, _fg, _bold in row)
+            if not has_text:
+                hint = theme.font("body").render(self.placeholder, True, c.text_dim)
+                surface.blit(hint, (origin_x + theme.px(2),
+                                    origin_y + theme.px(2)))
 
         if focused and cursor_on and self.screen.cursor_visible:
             cx = origin_x + self.screen.cursor_col * cw
