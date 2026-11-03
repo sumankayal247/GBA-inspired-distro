@@ -922,7 +922,7 @@ class UsbManagerOverlay(Overlay):
 
 
 class UsbPromptOverlay(Overlay):
-    """Raised automatically when a new stick with ROMs appears."""
+    """Raised automatically when a stick with new (unimported) ROMs appears."""
 
     def __init__(self, volume):
         super().__init__()
@@ -966,9 +966,14 @@ class UsbPromptOverlay(Overlay):
         theme = shell.theme
         c = theme.colors
         rect = self.rect(shell)
-        count = self.volume.rom_count()
-        total = sum(size for _, size in self.volume.scan_roms())
-        message = (f"{self.volume.label} has {count} Game Boy ROM"
+        # Report the NEW content the watcher analysed, not everything on the
+        # drive: a stick with 1130 imported ROMs and 5 new ones offers 5.
+        # Unanalysed volumes (discovery only) fall back to the full listing.
+        items = (self.volume.new_roms if self.volume.new_roms is not None
+                 else self.volume.scan_roms())
+        count = len(items)
+        total = sum(size for _, size in items)
+        message = (f"{self.volume.label} has {count} new Game Boy ROM"
                    f"{'s' if count != 1 else ''} ({human_size(total)}).")
         font = theme.font("body")
         for index, line in enumerate(wrap_text(font, message, rect.width - theme.px(24), 2)):
@@ -1292,7 +1297,8 @@ class GBALauncher:
         self.usb_watcher: Optional[VolumeWatcher] = None
         if self.settings.get("usb_autoscan") and not screenshot_path:
             try:
-                self.usb_watcher = VolumeWatcher()
+                self.usb_watcher = VolumeWatcher(
+                    known_ids_provider=self._known_library_ids)
                 self.usb_watcher.start()
             except Exception as exc:
                 logger.warning("USB watcher unavailable: %s", exc)
@@ -1515,6 +1521,34 @@ class GBALauncher:
             return
         self.selected[self.current_tab] = max(0, min(len(items) - 1, self.selected[self.current_tab]))
 
+    def _known_library_ids(self) -> set:
+        """
+        Content ids the library already knows — the durable "already
+        imported" set the USB watcher measures new sticks against. Read from
+        the on-disk library cache, so it survives game returns, launcher
+        restarts and reboots (the launcher process is restarted by the
+        supervisor after every game session).
+        """
+        try:
+            return self.library.known_content_ids()
+        except Exception as exc:
+            logger.warning("Library identity unavailable for USB scan: %s", exc)
+            return set()
+
+    def usb_source_index(self):
+        """
+        The watcher's shared content-id index for removable media, or None
+        when no watcher is running (imports then hash sources directly —
+        still correct, just uncached).
+        """
+        getter = getattr(self.usb_watcher, "get_source_index", None)
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except Exception:
+            return None
+
     def _poll_usb(self) -> None:
         if not self.usb_watcher:
             return
@@ -1523,10 +1557,13 @@ class GBALauncher:
         if any(isinstance(o, (UsbPromptOverlay, UsbProgressOverlay)) for o in self.overlays):
             return
         for volume in self.usb_watcher.take_pending():
-            if volume.rom_count() <= 0:
+            new_count = volume.new_rom_count()
+            if new_count <= 0:
+                # Everything on this stick is already registered in the
+                # library: discovery alone must never re-prompt.
                 continue
-            logger.info("Removable media detected: %s (%d ROMs)",
-                        volume.mountpoint, volume.rom_count())
+            logger.info("Removable media detected: %s (%d new of %d ROMs)",
+                        volume.mountpoint, new_count, volume.rom_count())
             self.push_overlay(UsbPromptOverlay(volume))
             break
 
@@ -1552,9 +1589,17 @@ class GBALauncher:
 
         def worker():
             try:
+                known_ids = self.library.known_content_ids()
+                index = self.usb_source_index() if known_ids else None
                 result = import_roms(volume, get_games_dir(),
                                      subfolder=self.settings.get("usb_copy_subfolders", True),
-                                     progress=progress.progress)
+                                     progress=progress.progress,
+                                     known_ids=known_ids, index=index)
+                if result.registered:
+                    # Record the imported ids in the library cache right now:
+                    # the "already imported" state becomes durable without
+                    # waiting for the rescan to re-hash every copy.
+                    self.library.register_content(result.registered)
                 progress.finish(result)
                 logger.info("USB import: %s", result.summary())
                 self.rescan_library(quiet=True)
@@ -2085,7 +2130,8 @@ class GBALauncher:
     def configure_usb_watcher(self) -> None:
         enabled = self.settings.get("usb_autoscan", True)
         if enabled and self.usb_watcher is None:
-            self.usb_watcher = VolumeWatcher()
+            self.usb_watcher = VolumeWatcher(
+                known_ids_provider=self._known_library_ids)
             self.usb_watcher.start()
         elif not enabled and self.usb_watcher is not None:
             self.usb_watcher.stop()

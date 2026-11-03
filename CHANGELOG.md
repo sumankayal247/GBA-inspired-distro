@@ -4,6 +4,76 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — import identity and display geometry fixes
+
+Two runtime bugs fixed with the smallest changes that solve them; no subsystem was redesigned
+(supervisor, handlers, saves, library identity, installer, browser, terminal, settings, the five-tab
+UI and the USB import flow all keep their architecture — see D-048 and D-049).
+
+### Fixed
+
+- **"1130 games detected" re-appeared after every game and every reboot** — the USB prompt was
+  gated on discovery alone (`rom_count() > 0`) plus an in-memory `seen` set, and the supervisor
+  restarts the launcher process after every game session, so a still-plugged stick was "new" again
+  every time. Nothing ever compared stick content against imported content. Now the watcher
+  measures *new content*: every ROM's content hash (Rule L2 — the library's existing identity, no
+  second system) is checked against `Library.known_content_ids()`, which is backed by the on-disk
+  library cache and therefore survives game returns, launcher restarts, reboots and rescans. The
+  prompt reads "N new Game Boy ROMs" and stays silent at N=0; a renamed copy of an imported ROM is
+  recognised as already imported. No "prompt was shown" flag exists — the durable state *is* the
+  library's content identity. Re-imports are idempotent (content skip, then the existing
+  name+size skip), and repeated scans never duplicate entries.
+  - `src/gba_usb.py`: `SourceIndex` (persistent `DATA/library/usb_sources.json` cache keyed by
+    relative path + size + mtime, so a stick is fully hashed at most once per machine),
+    `find_new_roms()`, `Volume.new_roms`/`new_rom_count()`, `VolumeWatcher(known_ids_provider=…)`
+    with all walking/hashing moved off the lock and off the UI thread, `refresh()` now re-arms
+    detection instead of hashing synchronously, `import_roms(known_ids=…, index=…)` skips
+    registered content and reports `result.registered`.
+  - `src/library.py`: `known_content_ids()`, `register_content()` (imported files are registered
+    durably the moment the copy lands), a cache lock, and mid-scan cache flushes every 16 freshly
+    hashed files — the scanner is a daemon thread that dies when the launcher exits into a game,
+    and without the flush that session's identity work was lost.
+  - `src/gba_launcher.py`: watcher wired to the library identity at both construction sites,
+    `_poll_usb` prompts only for volumes with new content, the prompt overlay counts only new ROMs
+    (with a discovery fallback), and the import worker registers copied content before rescanning.
+- **GBA games rendered as a tiny 240×160 rectangle centred on the screen (GBC 160×144)** — mGBA's
+  `-f` maps to `SDL_WINDOW_FULLSCREEN_DESKTOP`, but SDL2's X11 backend implements that *purely* as a
+  `_NET_WM_STATE_FULLSCREEN` window-manager request, and the appliance session (`xinit … -- :0 vt1`)
+  runs without a WM: the request is silently dropped and the window keeps its birth size — mGBA's
+  default viewport, native resolution ×1. mGBA's one-shot post-start `SDL_SetWindowSize` is a no-op
+  under the FULLSCREEN flag (verified in SDL2 `SDL_video.c`), so nothing ever corrected it. The
+  adapter now detects the physical mode read-only via `/sys/class/drm` (never acquiring the
+  display — D4/D-031 hold) and passes `-C width=… -C height=…`, so the window is born screen-sized
+  with or without a WM; mGBA's own `lockAspectRatio=1`/`lockIntegerScaling` viewport then centres
+  the largest correctly-proportioned image (GBA 3:2, GBC 10:9 — integer 4× = 960×640 or fit
+  1152×768 on a 1366×768 panel; no crop, no stretch). When no mode can be read the fallback is
+  `-4` (4× native) instead of the useless 1× window. Verified against mgba-sdl 0.9.3/0.10.1/0.10.3
+  and master (identical GL viewport math; `-C` overrides win over `config.ini`).
+- **GBC sessions stuttering** — mgba-sdl enables rewind recording by default: a full core snapshot
+  every emulated frame into a 600-second buffer, serialized on the emulation thread. The appliance
+  exposes no rewind control, so this was pure per-frame overhead on modest hardware. The adapter
+  now passes `-C rewindEnable=0` and writes `rewindEnable=0` into the managed `config.ini`
+  (`[ports.sdl]`, whose lookup precedence was verified in mGBA's `config.c`). Pacing
+  (`audioSync`/`videoSync`/`fpsTarget`) is untouched; the adapter additionally logs the detected
+  screen mode, session and driver per launch so any residual machine-specific lag is diagnosable
+  from `/data/logs`.
+
+### Added
+
+- `config.display_mode_size()` — read-only display-mode detection: connected DRM connectors,
+  internal panel (eDP/LVDS/DSI/DPI) preferred, `SDL_VIDEO_KMSDRM_DEVICE` pin honoured, `xrandr`
+  fallback under X11, `None` when genuinely unknown.
+
+### Tests
+
+- 32 new tests (261 total, all green): the full import lifecycle (first-boot prompt → import →
+  silence across simulated restarts/reboots → rescan idempotence → one added ROM prompts "1 new" →
+  re-import copies only the new file, no duplicates), renamed-ROM recognition, `SourceIndex`
+  persistence and re-hash avoidance, incremental library cache flushes, `register_content`
+  durability, display-mode parsing (panel preference, disconnected/garbage inputs, card pinning),
+  the new mGBA command geometry, `rewindEnable=0`, and shell-level prompt gating/wiring.
+
+
 ## [Unreleased] — bootable ISO, guided setup, and a hard safety review
 
 Everything in this section exists because of one question: *can booting this on a new PC brick it?*

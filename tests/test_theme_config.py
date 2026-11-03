@@ -194,5 +194,65 @@ class TestTheme(ConfigTestCase):
                          "Super Long Game Title Here", "GB", "deadbeef")
 
 
+class TestDisplayModeSize(ConfigTestCase):
+    """
+    Reading the physical display mode from DRM sysfs (never acquiring the
+    display itself) so the emulator window can be born screen-sized.
+    """
+
+    def make_drm(self, spec):
+        root = os.path.join(self.test_dir, "drm")
+        for name, (status, modes) in spec.items():
+            connector_dir = os.path.join(root, name)
+            os.makedirs(connector_dir, exist_ok=True)
+            if status is not None:
+                with open(os.path.join(connector_dir, "status"), "w") as f:
+                    f.write(status + "\n")
+            if modes is not None:
+                with open(os.path.join(connector_dir, "modes"), "w") as f:
+                    f.write("".join(m + "\n" for m in modes))
+        return root
+
+    def test_internal_panel_wins_over_external_output(self):
+        root = self.make_drm({
+            "card0-HDMI-A-1": ("connected", ["3840x2160", "1920x1080"]),
+            "card0-eDP-1": ("connected", ["1366x768", "1024x768"]),
+        })
+        self.assertEqual(config.display_mode_size({}, drm_root=root), (1366, 768))
+
+    def test_first_mode_line_is_the_preferred_mode(self):
+        root = self.make_drm({"card0-LVDS-1": ("connected", ["1920x1080", "1366x768"])})
+        self.assertEqual(config.display_mode_size({}, drm_root=root), (1920, 1080))
+
+    def test_disconnected_and_missing_connectors_are_skipped(self):
+        root = self.make_drm({
+            "card0-HDMI-A-1": ("connected", ["1920x1080"]),
+            "card0-DP-1": ("disconnected", ["3840x2160"]),
+            "card0-VGA-1": (None, None),
+        })
+        self.assertEqual(config.display_mode_size({}, drm_root=root), (1920, 1080))
+
+    def test_pinned_kmsdrm_card_filters_connectors(self):
+        root = self.make_drm({
+            "card0-eDP-1": ("connected", ["1366x768"]),
+            "card1-DP-1": ("connected", ["1920x1080"]),
+        })
+        env = {"SDL_VIDEO_KMSDRM_DEVICE": "/dev/dri/card1"}
+        self.assertEqual(config.display_mode_size(env, drm_root=root), (1920, 1080))
+
+    def test_garbage_modes_and_absent_sysfs_yield_none(self):
+        root = self.make_drm({"card0-eDP-1": ("connected", ["banana", "0x0", "1920x1080i"])})
+        self.assertIsNone(config.display_mode_size({}, drm_root=root))
+        missing = os.path.join(self.test_dir, "no-such-drm")
+        self.assertIsNone(config.display_mode_size({}, drm_root=missing))
+
+    def test_larger_output_wins_among_external_connectors(self):
+        root = self.make_drm({
+            "card0-HDMI-A-1": ("connected", ["1920x1080"]),
+            "card0-DP-1": ("connected", ["3840x2160"]),
+        })
+        self.assertEqual(config.display_mode_size({}, drm_root=root), (3840, 2160))
+
+
 if __name__ == "__main__":
     unittest.main()

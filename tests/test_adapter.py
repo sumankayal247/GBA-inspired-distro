@@ -177,5 +177,66 @@ class TestAdapterContract(unittest.TestCase):
         self.assertFalse(monitor.is_alive())
 
 
+class TestDisplayGeometry(unittest.TestCase):
+    """
+    The tiny-window bug: on the appliance's WM-less X session, SDL2's X11
+    backend only resizes for FULLSCREEN_DESKTOP via the window manager, so
+    mGBA must be told the screen size explicitly (or fall back to a sane
+    integer multiple instead of 1x native).
+    """
+
+    def setUp(self):
+        self.save_dir = os.path.join(tempfile.mkdtemp(), "saves")
+        os.makedirs(self.save_dir, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(os.path.dirname(self.save_dir), ignore_errors=True)
+
+    def cmd(self, **kwargs):
+        args = {"windowed": False, "display_scaling": "fit", "display_size": None}
+        args.update(kwargs)
+        return build_mgba_command("/usr/bin/mgba", "/games/x.gba", self.save_dir,
+                                  args["windowed"], args["display_scaling"],
+                                  args["display_size"])
+
+    def test_known_display_size_reaches_mgba_as_window_geometry(self):
+        cmd = self.cmd(display_size=(1366, 768), display_scaling="integer")
+        joined = " ".join(cmd)
+        self.assertIn("-f", cmd)
+        self.assertIn("width=1366", joined)
+        self.assertIn("height=768", joined)
+        self.assertIn("lockAspectRatio=1", joined)
+        self.assertIn("lockIntegerScaling=1", joined)
+        self.assertEqual(cmd[-1], "/games/x.gba")  # ROM must stay last
+
+    def test_fit_scaling_keeps_aspect_lock_without_integer_lock(self):
+        joined = " ".join(self.cmd(display_size=(1920, 1080)))
+        self.assertIn("lockAspectRatio=1", joined)
+        self.assertIn("lockIntegerScaling=0", joined)
+        self.assertIn("width=1920", joined)
+
+    def test_unknown_display_falls_back_to_4x_not_1x(self):
+        cmd = self.cmd()
+        self.assertIn("-4", cmd)
+        self.assertNotIn("width=", " ".join(cmd))
+        self.assertNotIn("-1", cmd)
+
+    def test_windowed_command_ignores_display_geometry(self):
+        cmd = self.cmd(windowed=True, display_size=(1366, 768))
+        self.assertIn("-3", cmd)
+        self.assertNotIn("-f", cmd)
+        self.assertNotIn("width=1366", " ".join(cmd))
+
+    def test_rewind_recording_is_disabled_everywhere(self):
+        for kwargs in ({"windowed": False}, {"windowed": True},
+                       {"windowed": False, "display_size": (1366, 768)}):
+            joined = " ".join(self.cmd(**kwargs))
+            self.assertIn("rewindEnable=0", joined)
+
+    def test_config_template_disables_rewind(self):
+        import gba_adapter_mgba
+        self.assertIn("rewindEnable=0", gba_adapter_mgba.MIGBA_CONFIG_TEMPLATE)
+
+
 if __name__ == "__main__":
     unittest.main()

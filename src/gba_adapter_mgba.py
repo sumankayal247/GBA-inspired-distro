@@ -31,7 +31,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common import setup_logging, load_keybindings, load_display_config, DEFAULT_KEYBINDINGS
-from config import display_session, other_drm_devices, prepare_child_environment
+from config import (
+    display_mode_size,
+    display_session,
+    other_drm_devices,
+    prepare_child_environment,
+)
 
 logger = setup_logging("gba.adapter")
 
@@ -51,6 +56,7 @@ MIGBA_CONFIG_TEMPLATE = """[ports.sdl]
 fullscreen={fullscreen}
 lockAspectRatio={aspect}
 lockIntegerScaling={integer}
+rewindEnable=0
 
 [input.SDLK]
 keyUp={keyUp}
@@ -312,7 +318,8 @@ class InputMonitor(threading.Thread):
 
 
 def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
-                       windowed: bool, display_scaling: str) -> list:
+                       windowed: bool, display_scaling: str,
+                       display_size: Optional[tuple] = None) -> list:
     """
     Builds the mGBA argv with save routing (SV1), scaling (D2) and explicit
     video settings.
@@ -322,6 +329,17 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
     and if that file is not where we think it is, defaulting to a window is
     harmless while defaulting to the *wrong* fullscreen backend is what leaves
     the user staring at a black screen.
+
+    For fullscreen the window is explicitly sized to the physical display
+    (`-C width= -C height=`) when its mode is known. SDL2's X11 backend
+    implements FULLSCREEN_DESKTOP purely as a window-manager request, and the
+    appliance X session runs without a WM, so mGBA's default geometry (native
+    240x160 / 160x144 scaled once) would remain a tiny centred window on a
+    much larger screen. Screen-sized geometry fills the display with or
+    without a WM, and mGBA's lockAspectRatio/lockIntegerScaling viewport then
+    centres the largest correctly-proportioned image inside it (no crop, no
+    stretch). When the mode cannot be determined, `-4` requests 4x native
+    (960x640) instead of the useless 1x window.
     """
     cmd = [
         mgba_bin,
@@ -329,6 +347,12 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
         "-C", f"savestatePath={save_dir}",
         "-C", f"screenshotPath={save_dir}",
         "-C", f"fullscreen={0 if windowed else 1}",
+        # mgba-sdl enables rewind recording by default: a full core snapshot
+        # every emulated frame plus a 600-second buffer, serialized on the
+        # emulation thread. The appliance exposes no rewind control, so this
+        # per-frame cost is pure overhead on modest hardware and a prime
+        # suspect for stutter (most visible in the GB/GBC frame loop).
+        "-C", "rewindEnable=0",
     ]
     if windowed:
         cmd.extend(["-3"])
@@ -336,6 +360,11 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
         cmd.append("-f")
         cmd.extend(["-C", "lockAspectRatio=1"])
         cmd.extend(["-C", f"lockIntegerScaling={1 if display_scaling == 'integer' else 0}"])
+        if display_size and int(display_size[0]) > 0 and int(display_size[1]) > 0:
+            cmd.extend(["-C", f"width={int(display_size[0])}"])
+            cmd.extend(["-C", f"height={int(display_size[1])}"])
+        else:
+            cmd.append("-4")
     cmd.append(content_path)
     return cmd
 
@@ -456,11 +485,14 @@ def main():
     # desktop renders into nowhere: that is the "game starts to a black screen"
     # bug. Resolve the session and hand mGBA a coherent environment (D4).
     env = prepare_child_environment()
-    logger.info("Display session=%s driver=%s windowed=%s scaling=%s",
+    screen = display_mode_size(env)
+    logger.info("Display session=%s driver=%s windowed=%s scaling=%s screen=%s",
                 display_session(), env.get("SDL_VIDEODRIVER", "auto"),
-                is_windowed, display_scaling)
+                is_windowed, display_scaling,
+                f"{screen[0]}x{screen[1]}" if screen else "unknown")
 
-    cmd = build_mgba_command(mgba_bin, content_path, save_dir, is_windowed, display_scaling)
+    cmd = build_mgba_command(mgba_bin, content_path, save_dir, is_windowed,
+                             display_scaling, screen)
     logger.info("Executing mGBA: %s", " ".join(cmd))
 
     started = time.monotonic()

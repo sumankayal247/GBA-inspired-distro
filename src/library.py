@@ -22,6 +22,13 @@ ALLOWED_EXTENSIONS = {".gba", ".gbc", ".gb"}
 # Directories that never contain user content and are expensive to walk.
 SKIP_DIRS = {"lost+found", ".Trash-1000", "$RECYCLE.BIN", "System Volume Information"}
 
+# During a scan the cache is flushed to disk after every N newly hashed files.
+# The scanner is a daemon thread: when the user opens a game the launcher
+# exits immediately and the thread dies with it, so anything hashed since the
+# last flush would be lost and the same ROMs would look "new" to the USB
+# importer on the next boot. Flushing mid-scan makes that window small.
+CACHE_SAVE_INTERVAL = 16
+
 
 class Library:
     def __init__(self, games_dir: Optional[str] = None, data_dir: Optional[str] = None):
@@ -31,6 +38,11 @@ class Library:
         self.cache_file = os.path.join(self.cache_dir, "cache.json")
         os.makedirs(self.cache_dir, exist_ok=True)
         self._cache = self._load_cache()
+        # Guards `_cache` mutations: the scanner thread, `register_content`
+        # (USB import worker) and `known_content_ids` (USB watcher thread)
+        # all touch it concurrently. Reads of single keys stay lock-free
+        # (GIL-atomic dict gets); snapshots take the lock.
+        self._cache_lock = threading.Lock()
         self.last_scan_seconds = 0.0
 
     def _load_cache(self) -> Dict[str, Any]:
@@ -69,6 +81,7 @@ class Library:
             return entries
 
         cache_updated = not os.path.exists(self.cache_file)
+        newly_hashed = 0
 
         for root, dirs, files in os.walk(self.games_dir, onerror=lambda e: None):
             # Deterministic walk order + skip system junk folders.
@@ -101,22 +114,17 @@ class Library:
                     else:
                         entry_id = compute_content_id(full_path)
                         title = extract_gba_title(full_path)
-                        entry = {
-                            "id": entry_id,
-                            "title": title,
-                            "filename": file,
-                            "type": "game",
-                            "format": ext[1:].upper(),
-                            "content_path": full_path,
-                            "size_bytes": size,
-                            "handler": "mgba-adapter",
-                            "args": []
-                        }
-                        self._cache[cache_key] = {
-                            "size": size,
-                            "mtime": mtime,
-                            "entry": entry
-                        }
+                        entry = self._make_entry(full_path, file, ext, size,
+                                                 entry_id, title)
+                        newly_hashed += 1
+                        with self._cache_lock:
+                            self._cache[cache_key] = {
+                                "size": size,
+                                "mtime": mtime,
+                                "entry": entry
+                            }
+                            if newly_hashed % CACHE_SAVE_INTERVAL == 0:
+                                self._save_cache()
                         cache_updated = True
 
                     entries.append(entry)
@@ -124,20 +132,93 @@ class Library:
                     logger.error("Error processing ROM %s: %s", full_path, e)
 
         # Purge deleted files from cache
-        current_keys = set(self._cache.keys())
-        for key in list(current_keys):
-            if not os.path.exists(key):
-                del self._cache[key]
-                cache_updated = True
+        with self._cache_lock:
+            for key in list(self._cache.keys()):
+                if not os.path.exists(key):
+                    del self._cache[key]
+                    cache_updated = True
 
-        if cache_updated:
-            self._save_cache()
+            if cache_updated:
+                self._save_cache()
 
         self.last_scan_seconds = time.monotonic() - started
         # Stable, case-insensitive ordering: the same library looks the same
         # every boot regardless of filesystem order (Rule L3).
         entries.sort(key=lambda e: (e.get("title", "").lower(), e.get("filename", "").lower()))
         return entries
+
+    @staticmethod
+    def _make_entry(full_path: str, filename: str, ext: str, size: int,
+                    entry_id: str, title: str) -> Dict[str, Any]:
+        """Builds one library entry (shared by scan and register_content)."""
+        return {
+            "id": entry_id,
+            "title": title,
+            "filename": filename,
+            "type": "game",
+            "format": ext[1:].upper(),
+            "content_path": full_path,
+            "size_bytes": size,
+            "handler": "mgba-adapter",
+            "args": []
+        }
+
+    def known_content_ids(self) -> set:
+        """
+        Content ids (Rule L2) of everything the library already knows.
+
+        This is the durable "already imported" set the USB importer must be
+        measured against: the same ROM yields the same id regardless of
+        filename or location, and the ids live in the on-disk cache, so the
+        knowledge survives game returns, launcher restarts and reboots.
+        """
+        with self._cache_lock:
+            records = list(self._cache.values())
+        ids = set()
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            entry = record.get("entry")
+            if isinstance(entry, dict) and entry.get("id"):
+                ids.add(entry["id"])
+        return ids
+
+    def register_content(self, imported) -> int:
+        """
+        Seeds cache entries for freshly imported files whose content ids the
+        importer already computed, so imported content is recognised
+        immediately (before any rescan finishes) and the next rescan is a
+        cache hit instead of a re-hash of every copy.
+
+        `imported` is a sequence of (destination_path, content_id) pairs.
+        Returns the number of entries registered.
+        """
+        added = 0
+        for path, content_id in imported:
+            if not content_id:
+                continue
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            ext = os.path.splitext(path)[1].lower()
+            if stat.st_size == 0 or ext not in ALLOWED_EXTENSIONS:
+                continue
+            entry = self._make_entry(path, os.path.basename(path), ext,
+                                     stat.st_size, content_id,
+                                     extract_gba_title(path))
+            with self._cache_lock:
+                self._cache[path] = {
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "entry": entry,
+                }
+            added += 1
+        if added:
+            with self._cache_lock:
+                self._save_cache()
+            logger.info("Registered %d imported file(s) in the library cache", added)
+        return added
 
     def count_content_files(self) -> int:
         """Cheap extension-only count used by the empty state hint."""

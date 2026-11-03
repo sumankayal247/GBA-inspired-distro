@@ -412,6 +412,90 @@ class TestOverlaysAndUsb(ShellTestCase):
         copied = os.path.join(self.games_dir, "STICK", "Imported.gba")
         self.assertTrue(os.path.exists(copied))
 
+    def test_prompt_skips_volumes_without_new_content(self):
+        from gba_usb import Volume
+        launcher = self.make_launcher()
+        volume = Volume("/dev/sdb1", "/media/user/STICK", "STICK", True)
+        volume._roms = [("/media/user/STICK/a.gba", 1024)]
+        volume.new_roms = []            # analysed: nothing new to import
+
+        class Watcher:
+            def __init__(self):
+                self.pending = [volume]
+
+            def take_pending(self):
+                items, self.pending = self.pending, []
+                return items
+
+        launcher.usb_watcher = Watcher()
+        launcher._poll_usb()
+        self.assertEqual(launcher.overlays, [])
+
+    def test_prompt_overlay_counts_only_new_content(self):
+        from gba_usb import Volume
+        launcher = self.make_launcher()
+        volume = Volume("/dev/sdb1", "/media/user/STICK", "STICK", True)
+        volume._roms = [("/media/user/STICK/old%03d.gba" % i, 1024)
+                        for i in range(100)]
+        volume.new_roms = [("/media/user/STICK/new.gba", 2048)]
+        self.assertEqual(volume.new_rom_count(), 1)
+        overlay = gba_launcher.UsbPromptOverlay(volume)
+        launcher.push_overlay(overlay)
+        overlay.draw(launcher)          # must render "1 new Game Boy ROM"
+
+    def test_watcher_is_wired_to_library_identity(self):
+        captured = {}
+
+        class RecordingWatcher(_FakeWatcher):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                captured.update(kwargs)
+
+        launcher = self.make_launcher()
+        original = gba_launcher.VolumeWatcher
+        gba_launcher.VolumeWatcher = RecordingWatcher
+        try:
+            self.settings["usb_autoscan"] = True
+            launcher.settings["usb_autoscan"] = True
+            launcher.configure_usb_watcher()
+        finally:
+            gba_launcher.VolumeWatcher = original
+        self.assertIn("known_ids_provider", captured)
+        ids = captured["known_ids_provider"]()
+        self.assertIsInstance(ids, set)
+        launcher.usb_watcher = None
+
+    def test_import_registers_new_content_with_the_library(self):
+        from gba_usb import Volume
+        import time
+        launcher = self.make_launcher(demo=False)
+        # A pre-existing library entry makes the known-id set non-empty,
+        # which is what activates content-identity checks during import.
+        with open(os.path.join(self.games_dir, "existing.gba"), "wb") as f:
+            f.write(b"\x00" * 0xA0 + b"EXISTING\x00\x00\x00\x00" + b"\x00" * 128)
+        launcher.library = library.Library()
+        launcher.library.scan_games()
+        self.assertEqual(len(launcher.library.known_content_ids()), 1)
+
+        source_dir = os.path.join(self.test_dir, "usb2")
+        os.makedirs(source_dir, exist_ok=True)
+        source = os.path.join(source_dir, "Registered.gba")
+        with open(source, "wb") as f:
+            f.write(b"\x00" * 0xA0 + b"REGISTERED\x00\x00" + b"\x00" * 128)
+        volume = Volume("/dev/sdb1", source_dir, "STICK2", True)
+
+        launcher.start_usb_import(None, volume)
+        for _ in range(200):
+            if launcher.overlays and getattr(launcher.overlays[-1], "done", False):
+                break
+            time.sleep(0.02)
+        copied = os.path.join(self.games_dir, "STICK2", "Registered.gba")
+        self.assertTrue(os.path.exists(copied))
+        # The imported content id is durably registered — a fresh Library
+        # reading the same cache knows it without any rescan.
+        self.assertIn(common.compute_content_id(copied),
+                      library.Library().known_content_ids())
+
     def test_overlays_draw_without_raising(self):
         launcher = self.make_launcher()
         overlays = [

@@ -282,6 +282,94 @@ def configure_sdl_audio() -> str:
     return os.environ.get("SDL_AUDIODRIVER", "")
 
 
+# --- physical display geometry ----------------------------------------------
+
+# Connector types that are built-in panels: on a laptop/handheld appliance the
+# internal screen is the one the emulator window must be measured against.
+INTERNAL_CONNECTORS = ("eDP", "LVDS", "DSI", "DPI")
+
+
+def _parse_mode_line(line: str) -> Optional[Tuple[int, int]]:
+    """'1366x768' -> (1366, 768). Rejects interlaced, garbage and absurd values."""
+    parts = line.split()
+    if not parts:
+        return None
+    width, sep, height = parts[0].partition("x")
+    if not sep or not width.isdigit() or not height.isdigit():
+        return None
+    w, h = int(width), int(height)
+    if 320 <= w <= 8192 and 200 <= h <= 8192:
+        return (w, h)
+    return None
+
+
+def display_mode_size(env: Optional[Dict[str, str]] = None,
+                      drm_root: str = "/sys/class/drm") -> Optional[Tuple[int, int]]:
+    """
+    The physical display resolution as (w, h), or None when unknown.
+
+    This reads `/sys/class/drm/<card>-<connector>/{status,modes}` and never
+    opens the display itself — the handler must not take a DRM master or an
+    X connection that the emulator needs next (D-031/D4). The first mode line
+    of a connected connector is its preferred (native) mode. Internal panels
+    win over external outputs, and only the card named by a pinned
+    `SDL_VIDEO_KMSDRM_DEVICE` is considered when one is set (D8). Falls back
+    to xrandr's current mode under X11 when DRM sysfs says nothing.
+    """
+    env = os.environ if env is None else env
+    pinned = os.path.basename(env.get("SDL_VIDEO_KMSDRM_DEVICE", "") or "")
+    best: Optional[Tuple[int, int, Tuple[int, int]]] = None
+    try:
+        names = sorted(os.listdir(drm_root))
+    except OSError:
+        names = []
+    for name in names:
+        card, _, connector = name.partition("-")
+        if not connector or (pinned and card != pinned):
+            continue
+        base = os.path.join(drm_root, name)
+        try:
+            with open(os.path.join(base, "status"), "r", encoding="utf-8") as f:
+                if f.read().strip() != "connected":
+                    continue
+            with open(os.path.join(base, "modes"), "r", encoding="utf-8") as f:
+                mode = _parse_mode_line(f.readline())
+        except OSError:
+            continue
+        if not mode:
+            continue
+        # Prefer the internal panel; among equals prefer the larger mode.
+        rank = 0 if connector.startswith(INTERNAL_CONNECTORS) else 1
+        candidate = (rank, -(mode[0] * mode[1]), mode)
+        if best is None or candidate < best:
+            best = candidate
+    if best:
+        return best[2]
+    if env.get("DISPLAY"):
+        return _xrandr_mode_size()
+    return None
+
+
+def _xrandr_mode_size() -> Optional[Tuple[int, int]]:
+    """The current ('*'-marked) mode according to xrandr; fallback only."""
+    xrandr = shutil.which("xrandr")
+    if not xrandr:
+        return None
+    try:
+        out = subprocess.run([xrandr], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=4.0,
+                             check=False).stdout.decode("utf-8", "ignore")
+    except Exception:
+        return None
+    for line in out.splitlines():
+        if "*" not in line:
+            continue
+        mode = _parse_mode_line(line.strip())
+        if mode:
+            return mode
+    return None
+
+
 # --- audio volume -----------------------------------------------------------
 
 def _run(cmd: List[str], timeout: float = 4.0) -> bool:
