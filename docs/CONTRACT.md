@@ -116,8 +116,8 @@ GAMES   (optional)   user-visible content, readable from other operating systems
   than the component that owns them.
 - **ST4** [TEST: T-STORE-1] [AMENDED 2026-11-02, see D-032] GAMES MUST be mounted read-only
   during normal operation. The system MUST NOT write to `/games/`, including beside a content
-  file. The single exception is a user-confirmed ROM import (ST7), which is the only write path
-  and MUST NOT create, modify or delete anything except new ROM files.
+  file. The single exception is a user-confirmed ROM import (ST7, ST8), which is the only write
+  path and MUST NOT create, modify or delete anything except new ROM files.
 - **ST5** [TEST: T-FAULT-4] Logs MUST be size-capped and rotated. A runaway log MUST NOT be able
   to fill DATA.
 - **ST6** [TEST: T-FAULT-5] DATA MUST reserve free space for system use so that logging and saving
@@ -130,6 +130,17 @@ GAMES   (optional)   user-visible content, readable from other operating systems
     copied under a `(n)` suffix;
   - every copy MUST be verified by size and a partial copy MUST be removed;
   - the destination MUST stay inside GAMES.
+- **ST8** [TEST: T-LIBRARY-4] Android phones in File Transfer (MTP) mode MUST be supported as
+  import sources without being treated as block/removable disks:
+  - discovery MUST use MTP/USB-interface and FUSE-mount information, never `/sys/block`
+    removability, partitioning or a `/dev/sdX` mount;
+  - accessible phone storages MUST be scanned for the same `.gba`, `.gbc` and `.gb` extensions
+    as ST7, with normal block-device USB detection unaffected;
+  - MTP imports MUST reuse ST7's confirmation, size verification, destination, `L2` content-ID
+    and library-registration paths, so content already known by ID is neither offered as new nor
+    copied again;
+  - a missing MTP/FUSE backend, locked screen or charging-only USB mode MUST degrade to no MTP
+    source without affecting pendrive import or boot.
 
 ---
 
@@ -447,6 +458,7 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 |---|---|---|---|
 | T-LIBRARY-1 | Add game A without any manual step; record its entry ID; rename the file; rescan. | Entry appears automatically; ID and save directory unchanged after the rename. | L2, L3 |
 | T-LIBRARY-3 | Plug in a stick with 10 ROMs, decline the prompt, re-plug, accept; import twice. | Nothing copied before confirmation; 10 files appear inside GAMES; the second import copies nothing; no partial files remain. | ST7 |
+| T-LIBRARY-4 | Unlock an Android phone in File Transfer/MTP mode containing the same 10 ROMs plus two new ones; accept the prompt, then re-import. | The phone appears as one or more MTP storages, not a removable disk; only two new files are offered/copied; normal USB detection still works; no partial files remain. | ST8 |
 | T-MANIFEST-1 | Create manifests omitting `network`, `input` and `display`; create one with `contract = 999`. | Omitted needs resolve to `false`, gamepad-only and direct; the unsupported manifest is rejected without crashing the launcher. | L7, L8 |
 
 ### Input

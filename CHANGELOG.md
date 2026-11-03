@@ -4,6 +4,54 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — Android phone (MTP) import
+
+An Android phone in **File Transfer (MTP)** mode is now a first-class ROM import source. It is
+discovered as an MTP/FUSE device, never as a `/dev/sdX` removable disk, and then flows through the
+same prompt, content-ID, verified-copy and library-registration pipeline as a pendrive.
+
+### Added
+
+- **MTP detection and storage enumeration** in `src/gba_usb.py`: `jmtpfs -l`, `mtp-detect`,
+  `gio mount -l`, USB MTP interface descriptors under `/sys/bus/usb/devices`, and `mtp://`/GVfs FUSE
+  entries in `/proc/mounts`. Devices are mounted with `jmtpfs -device=<bus>,<dev>` when no desktop
+  session has already mounted them; unlocked internal storage and SD cards appear as separate
+  `MtpVolume` import sources.
+- **`.gba`/`.gbc`/`.gb` scanning** of accessible phone storages with Android media/app directories
+  skipped. `MtpVolume` carries `transport="mtp"`, `removable=False`, a non-block device URI and its
+  own `SourceIndex` namespace; it otherwise reuses `Volume.scan_roms`, `find_new_roms`,
+  `import_roms`, `VolumeWatcher`, `Library.known_content_ids()` and `Library.register_content()`.
+  ROMs already known by content ID are neither offered as new nor copied again, including when the
+  same ROM was imported earlier from a pendrive under a different filename.
+- **UI and diagnostics:** `USB / MTP IMPORT`, an `ANDROID MTP` source badge, dedicated phone prompt,
+  unlock/file-transfer guidance, a non-blocking `R` rescan, an optional `gba-selftest` MTP check, and
+  owner-only FUSE cleanup. Missing MTP tools produce a warning, never a boot failure.
+- **`src/gba_mtp.py`**: a small MTP-focused API facade over the shared `gba_usb` implementation.
+- **15 hardware-free tests** (`tests/test_mtp.py`) for libmtp/sysfs/GVfs parsers, FUSE mount tables,
+  auto-mounting by USB address, generic `/dev/fuse` mount lines, missing FUSE mtimes, nested ROM
+  scans, source-index namespacing, content-ID deduplication, mixed USB+MTP watcher queues, and
+  idempotent imports. Suite: 370 tests.
+
+### Changed
+
+- `scripts/build_iso.sh` ships `jmtpfs` and `mtp-tools`; `scripts/install.sh`, the Makefile and
+  `gba-selftest` install/lint/import the MTP facade, and the installer prints an optional dependency
+  warning. `docs/CONTRACT.md` adds **ST8/T-LIBRARY-4**, `docs/DECISIONS.md` adds **D-051**, and
+  README/SAFETY document the phone workflow and fallback.
+- `parse_mounts()`/`list_mounted_volumes()` ignore `/dev/fuse` so a phone cannot enter the
+  block-device path; their `/proc/mounts`/`/sys/block` behavior for real USB storage is unchanged.
+  `import_roms()` now falls
+  back from `copy2` to `copyfile` when a FUSE backend rejects metadata copying, while keeping the
+  size-verification and partial-file cleanup rules.
+
+### Real-hardware-only verification
+
+Physical Android unlock/MTP negotiation, vendor quirks, large FUSE reads, SD-card layouts and
+`fusermount` behavior need appliance verification. The headless suite simulates sysfs, libmtp
+commands, GVfs paths and FUSE roots; it never claims a real device.
+
+---
+
 ## [Unreleased] — in-game cheats, nine save states, fast-forward, favorites
 
 Everything below is additive to the existing supervisor → launcher → mgba-adapter architecture.

@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Contract](https://img.shields.io/badge/Contract-Draft%202%20(V1)-purple.svg)](docs/CONTRACT.md)
-[![Tests](https://img.shields.io/badge/Tests-355%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/Tests-370%20passing-brightgreen.svg)](tests)
 [![Safe by default](https://img.shields.io/badge/install-safe%20by%20default-blue.svg)](docs/SAFETY.md)
 
 **GBA OS** is an appliance-style Linux operating system experience designed to turn any PC or laptop into a dedicated Game Boy Advance console.
@@ -34,7 +34,8 @@ Power On -> GRUB Menu -> GBA OS -> Game Library -> Play Game -> Return to Librar
 - **Five tabs:** GAMES · APPS · BROWSER · TERMINAL · SETTINGS.
 - **Terminal and browser built in:** a real PTY shell and a deliberately minimal web reader. Useful
   for fixing a machine with no desktop, and both are stdlib-only.
-- **Pendrive import:** plug a stick in, get a prompt, import its ROMs on request — never silently.
+- **Pendrive and Android MTP import:** plug in a stick, or unlock a phone in File Transfer mode,
+  get a prompt, and import its ROMs on request — never silently.
 
 ---
 
@@ -77,7 +78,8 @@ The shell itself is deliberately small and single-purpose per module:
 | `src/config.py` | `settings.json` store, SDL/audio/backlight helpers, display-session resolution |
 | `src/gba_terminal.py` | PTY session, ANSI screen emulator, key translation, terminal view |
 | `src/gba_browser.py` | HTTP fetch, HTML extraction, text layout, history, URL bar |
-| `src/gba_usb.py` | `/proc/mounts` discovery, ROM scan, verified import, background watcher |
+| `src/gba_usb.py` | `/proc/mounts` block discovery, Android MTP/FUSE sources, ROM scan, content-ID cache, verified import, background watcher |
+| `src/gba_mtp.py` | small MTP API facade over the shared `gba_usb` implementation |
 | `src/game_data.py` | per-content-id cheats, nine save-state slots, favorites, game deletion |
 | `src/gba_ingame.py` | shortcut router, fast-forward cycle, overlay models, session state (no GUI dependency) |
 | `src/gba_ingame_ui.py` | pygame/Theme overlay renderer used *inside the mGBA handler* |
@@ -190,7 +192,8 @@ The installer:
 - hooks tty1 (SysVinit / runit) and appends `GBA OS (console appliance)` plus a
   `GBA OS (safe graphics / recovery)` GRUB entry without changing the default boot target;
 - backs up every system file it touches and rolls them back if a later step fails;
-- reports missing runtime packages (`python3`, `python3-pygame`, `mgba-sdl`) instead of failing at boot.
+- reports missing runtime packages (`python3`, `python3-pygame`, `mgba-sdl`) instead of failing at boot,
+  and warns (without failing) when the optional `jmtpfs`/GVfs Android MTP backend is absent.
 
 ---
 
@@ -288,6 +291,13 @@ is duplicated.
   are skipped, name clashes get a `(n)` suffix) and every copy is size-verified. Files land in
   `/games/<drive label>/` unless you turn sub-folders off. Mount detection reads `/proc/mounts` and
   `/sys/block`, so it needs no `udisks`/`udev`.
+- **Android phone import (MTP):** unlock the phone and select **File Transfer / MTP**. The shell
+  detects the USB MTP interface and exposes its internal storage/SD card through `jmtpfs` (or an
+  existing GVfs `mtp://` mount). It is shown as `ANDROID MTP`, never as a removable disk. The same
+  extension filter, confirmation prompt, content-ID deduplication, size verification and `(n)` clash
+  rule apply. Install `sudo apt install jmtpfs mtp-tools` on a system image built without them;
+  normal USB sticks work without MTP support. A locked screen or charging-only mode simply yields no
+  phone source.
 - **Settings:** `DATA/config/settings.json` is the single store (scaling, theme, clock, view mode,
   volume, USB behaviour, launch confirmation). `keybindings.json` and `history.json` live beside it;
   a legacy `display.json` is migrated automatically on first run.
@@ -297,7 +307,7 @@ is duplicated.
 ## 🧪 Testing & Development
 
 ```bash
-make test       # 355 tests (headless, no display needed)
+make test       # 370 tests (headless, no display needed)
 make lint       # byte-compile Python + syntax-check every shell script
 make selftest   # check *this* machine: interpreter, fonts, pty, display, mGBA, storage, config
 make iso-check  # what is missing to build a bootable ISO here
@@ -307,7 +317,7 @@ make help       # list every target
 The suite covers the numbered contract rules directly — library identity and caching (L2, L3, L4, L6),
 handler environment isolation (H1), outcome classification (H10), crash-loop handling (S6, S7), orphan
 cleanup (S8), save durability and restoration (SV2–SV4), log rotation (ST5), input-profile validation
-(I3), ROM import safety (ST7), the settings store and theme system, the ANSI terminal emulator, the
+(I3), ROM import safety (ST7, ST8), the settings store and theme system, the ANSI terminal emulator, the
 browser's HTML extractor/layout/history, and shell behaviour (tabs, `Alt+Tab`, `Ctrl+Alt+T`, search,
 empty state, confirmation-gated launches).
 
@@ -333,7 +343,8 @@ make screenshots   # regenerates the four README images
 | Shell starts but no games | Copy ROMs into `/games/`, then **SETTINGS → Library → Rescan library**. |
 | Game starts to a black screen | The adapter now resolves the display session itself (a stale `DISPLAY` or a KMS/DRM driver inside a live desktop is the usual cause) and retries once in a window. Check `/data/logs/latest.log` for `Display session=...` and `[mgba]` lines. |
 | Game exits immediately | Check `/data/logs/latest.log` for `[handler]` lines; verify `mgba` is installed (`which mgba`). |
-| Pendrive not detected | The filesystem must be mounted (any desktop does that automatically). Open **SETTINGS → Library → Import from USB** and press `R` to rescan. |
+| Pendrive not detected | The filesystem must be mounted (any desktop does that automatically). Open **SETTINGS → Library → Import from USB / MTP** and press `R` to rescan. |
+| Android phone not detected | Unlock it, choose **File Transfer / MTP** (not charging only), and press `R` in the import screen. Install `sudo apt install jmtpfs mtp-tools` if `gba-selftest` reports no MTP backend. GVfs `mtp://` mounts are reused automatically. |
 | Terminal is unavailable | The shell needs a PTY; check that `/dev/pts` is mounted (`SHELL=/bin/sh src/gba_launcher.py` still works for a quick test). |
 | Xbox-style pad exits games | The SELECT+START, Guide, and `Esc` combinations are the system exit gestures — see the launch screen. |
 | Everything is broken | At the GRUB menu pick `GBA OS (safe graphics / recovery)`, or add `gba_mode=0` to the kernel line for a normal login prompt. The recovery console (option 4) exports your saves first. |

@@ -173,6 +173,13 @@ check_dependencies() {
         && missing+=("python3-pygame")
     command -v mgba >/dev/null 2>&1 || missing+=("mgba-sdl")
 
+    # Optional: Android phones in File Transfer/MTP mode are not block disks.
+    # Normal USB stick import and game launching work without this package.
+    if ! command -v jmtpfs >/dev/null 2>&1 && ! command -v gio >/dev/null 2>&1; then
+        gb_warn "Android MTP import needs jmtpfs (or GVfs): sudo apt install jmtpfs mtp-tools"
+        gb_warn "USB pendrive import is unaffected."
+    fi
+
     if [ ${#missing[@]} -gt 0 ]; then
         gb_warn "Missing packages: ${missing[*]}"
         gb_warn "Install them first (the appliance can still be installed, but games"
@@ -227,7 +234,7 @@ install_files() {
 
     local mod
     for mod in common.py library.py config.py theme.py gba_terminal.py gba_browser.py gba_usb.py \
-               game_data.py gba_ingame.py gba_ingame_ui.py; do
+               gba_mtp.py game_data.py gba_ingame.py gba_ingame_ui.py; do
         [ -f "$REPO_DIR/src/$mod" ] || gb_die "missing source file: src/$mod"
         gb_run install -m 0644 "$REPO_DIR/src/$mod" "$INSTALL_DIR/src/$mod"
     done

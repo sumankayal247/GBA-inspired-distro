@@ -75,7 +75,8 @@ import game_data
 from gba_browser import Browser
 from gba_ingame import button_from_key, button_from_joy_button, buttons_from_hat
 from gba_terminal import TerminalScreen, TerminalSession, TerminalView, key_to_bytes
-from gba_usb import VolumeWatcher, import_roms, list_mounted_volumes
+from gba_usb import (MtpManager, VolumeWatcher, import_roms, list_import_sources,
+                     list_mounted_volumes, list_mtp_volumes)
 from library import Library
 from theme import THEME_ORDER, Theme
 
@@ -1171,18 +1172,31 @@ class GameManagementOverlay(Overlay):
 
 
 class UsbManagerOverlay(Overlay):
-    """Manual import surface: lists mounted volumes and imports on request."""
+    """Manual import surface: lists block volumes and Android MTP storages."""
 
-    def __init__(self):
+    def __init__(self, shell=None, volumes=None):
         super().__init__()
-        self.title = "USB IMPORT"
-        self.width = 360.0
+        self.shell = shell
+        self.title = "USB / MTP IMPORT"
+        self.width = 380.0
         self.height = 230.0
         self.accent = "info"
-        self.subtitle = "plug in a drive · A import · Esc close"
-        self.volumes = list_mounted_volumes()
+        self.subtitle = "drive or phone · A import · R rescan · Esc close"
+        if volumes is not None:
+            self.volumes = list(volumes)
+        elif shell is not None and callable(getattr(shell, "import_sources", None)):
+            self.volumes = shell.import_sources()
+        else:
+            # No shell/watcher: never auto-mount on a bare constructor.
+            self.volumes = list_mounted_volumes() + list_mtp_volumes(
+                auto_mount=False, command_exists=lambda _name: False)
         self.index = 0
         self.message = ""
+
+    def set_volumes(self, volumes, message: str = "") -> None:
+        self.volumes = list(volumes)
+        self.index = min(self.index, max(0, len(self.volumes) - 1))
+        self.message = message
 
     def handle(self, event, shell) -> None:
         if event.type == pygame.QUIT:
@@ -1197,8 +1211,12 @@ class UsbManagerOverlay(Overlay):
             elif event.key == pygame.K_DOWN and self.volumes:
                 self.index = min(len(self.volumes) - 1, self.index + 1)
             elif event.key == pygame.K_r:
-                self.volumes = list_mounted_volumes()
-                self.message = f"{len(self.volumes)} volume(s) found"
+                self.message = "Scanning USB and Android MTP sources..."
+                if shell is not None and hasattr(shell, "refresh_import_sources"):
+                    shell.refresh_import_sources(self)
+                else:
+                    self.volumes = list_import_sources(auto_mtp_mount=False)
+                    self.message = f"{len(self.volumes)} source(s) found"
             elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_z, pygame.K_SPACE):
                 if self.volumes:
                     shell.start_usb_import(self, self.volumes[self.index])
@@ -1216,11 +1234,11 @@ class UsbManagerOverlay(Overlay):
         width = rect.width / theme.scale
 
         if not self.volumes:
-            theme.text(shell.surface, "No removable media detected", (x0 + 4, y0 + 6), "body", c.text)
+            theme.text(shell.surface, "No import sources detected", (x0 + 4, y0 + 6), "body", c.text)
             notes = [
-                "Plug a pendrive in and press R to rescan.",
-                "The drive must be mounted (your desktop",
-                "usually does this automatically).",
+                "Plug in a pendrive, or unlock an Android",
+                "phone and choose File Transfer (MTP).",
+                "Press R to rescan; MTP needs jmtpfs/GVfs.",
             ]
             y = y0 + 22
             for note in notes:
@@ -1235,18 +1253,20 @@ class UsbManagerOverlay(Overlay):
                 pygame.draw.rect(shell.surface, c.card_sel, row, border_radius=theme.px(4))
                 pygame.draw.rect(shell.surface, c.info, row, width=1, border_radius=theme.px(4))
             count = volume.rom_count()
-            theme.label(shell.surface, truncate(theme.font("body_bold"), volume.label, theme.px(width - 60)),
+            theme.label(shell.surface, truncate(theme.font("body_bold"), volume.label, theme.px(width - 92)),
                         (x0 + 4, y0 + index * 22 + 3), c.text, key="body_bold")
-            theme.label(shell.surface, f"{count} ROM{'s' if count != 1 else ''} · "
-                                       f"{human_size(volume.free)} free",
+            free = human_size(volume.free) if volume.free else "MTP"
+            theme.label(shell.surface, f"{count} ROM{'s' if count != 1 else ''} · {free}",
                         (x0 + 4, y0 + index * 22 + 12), c.text_muted)
-            theme.label(shell.surface, "REMOVABLE" if volume.removable else "MOUNTED",
+            badge = getattr(volume, "kind_label", "REMOVABLE" if volume.removable else "MOUNTED")
+            theme.label(shell.surface, badge,
                         (x0 + width - 4, y0 + index * 22 + 3),
-                        c.success if volume.removable else c.text_dim, align="right")
+                        c.highlight if getattr(volume, "is_mtp", False)
+                        else c.success if volume.removable else c.text_dim, align="right")
 
         if self.message:
             theme.label(shell.surface, self.message, (x0 + 4, y0 + 8 * 22 + 4), c.highlight)
-        theme.label(shell.surface, "[A] import ROMs from selected drive", (x0 + 4, y0 + 8 * 22 + 14),
+        theme.label(shell.surface, "[A] import ROMs from selected source", (x0 + 4, y0 + 8 * 22 + 14),
                     c.info)
 
 
@@ -1256,7 +1276,8 @@ class UsbPromptOverlay(Overlay):
     def __init__(self, volume):
         super().__init__()
         self.volume = volume
-        self.title = "PENDRIVE DETECTED"
+        self.title = ("ANDROID MTP DETECTED" if getattr(volume, "is_mtp", False)
+                      else "PENDRIVE DETECTED")
         self.accent = "info"
         self.width = 320.0
         self.height = 150.0
@@ -1624,8 +1645,9 @@ class GBALauncher:
         self._init_theme()
         self.apply_volume_setting()
 
-        # USB watcher (background; prompts are raised from update())
+        # USB/MTP watcher (background; prompts are raised from update())
         self.usb_watcher: Optional[VolumeWatcher] = None
+        self._manual_mtp_manager: Optional[MtpManager] = None
         if self.settings.get("usb_autoscan") and not screenshot_path:
             try:
                 self.usb_watcher = VolumeWatcher(
@@ -1918,6 +1940,106 @@ class GBALauncher:
         except Exception:
             return None
 
+    def import_sources(self) -> List[Any]:
+        """
+        Sources for the manual import overlay, without mounting on the UI thread.
+
+        The watcher already polls MTP in the background; use its last snapshot
+        when available. Otherwise only already-mounted FUSE paths are listed.
+        """
+        watcher = self.usb_watcher
+        if watcher is not None and watcher.volumes:
+            return list(watcher.volumes)
+        try:
+            block = list_mounted_volumes()
+        except Exception as exc:
+            logger.warning("Could not list block import sources: %s", exc)
+            block = []
+        manager = getattr(watcher, "mtp_manager", None) if watcher is not None else None
+        cached = getattr(manager, "cached_volumes", None)
+        if callable(cached):
+            try:
+                mtp = list(cached())
+            except Exception:
+                mtp = []
+        else:
+            try:
+                # No command execution here: auto-mount is an explicit R action.
+                mtp = list_mtp_volumes(auto_mount=False,
+                                       command_exists=lambda _name: False)
+            except Exception as exc:
+                logger.warning("Could not list mounted MTP sources: %s", exc)
+                mtp = []
+        seen = {v.key for v in block}
+        paths = {os.path.realpath(v.mountpoint) for v in block}
+        for volume in mtp:
+            path = os.path.realpath(volume.mountpoint)
+            if volume.key in seen or path in paths:
+                continue
+            block.append(volume)
+            seen.add(volume.key)
+            paths.add(path)
+        return block
+
+    @staticmethod
+    def _cached_mtp_volumes(manager) -> List[Any]:
+        getter = getattr(manager, "cached_volumes", None)
+        if callable(getter):
+            try:
+                return list(getter())
+            except Exception:
+                pass
+        return []
+
+    @staticmethod
+    def _mtp_status(manager) -> str:
+        getter = getattr(manager, "status", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                pass
+        return ""
+
+    def refresh_import_sources(self, overlay=None) -> None:
+        """
+        Explicit R/rescan. MTP mounting and libmtp probing run on a worker so
+        an unlocked-but-slow phone cannot freeze the shell (Rule L4).
+        """
+        import threading
+
+        manager = None
+        if self.usb_watcher is not None:
+            watcher_refresh = getattr(self.usb_watcher, "refresh", None)
+            if callable(watcher_refresh):
+                watcher_refresh()
+            getter = getattr(self.usb_watcher, "get_mtp_manager", None)
+            manager = getter() if callable(getter) else getattr(
+                self.usb_watcher, "mtp_manager", None)
+        if manager is None:
+            if self._manual_mtp_manager is None:
+                self._manual_mtp_manager = MtpManager(auto_mount=True)
+            else:
+                self._manual_mtp_manager.refresh()
+            manager = self._manual_mtp_manager
+
+        def worker():
+            try:
+                volumes = list_import_sources(mtp_manager=manager,
+                                              auto_mtp_mount=True)
+            except Exception as exc:
+                logger.warning("Manual MTP rescan failed: %s", exc)
+                volumes = list_mounted_volumes() + self._cached_mtp_volumes(manager)
+            hint = self._mtp_status(manager)
+            message = f"{len(volumes)} source(s) found"
+            if not volumes and hint:
+                message = hint
+            setter = getattr(overlay, "set_volumes", None)
+            if callable(setter):
+                setter(volumes, message)
+
+        threading.Thread(target=worker, daemon=True, name="gba-import-source-scan").start()
+
     def _poll_usb(self) -> None:
         if not self.usb_watcher:
             return
@@ -1931,7 +2053,8 @@ class GBALauncher:
                 # Everything on this stick is already registered in the
                 # library: discovery alone must never re-prompt.
                 continue
-            logger.info("Removable media detected: %s (%d new of %d ROMs)",
+            logger.info("Import source detected: %s %s (%d new of %d ROMs)",
+                        "MTP" if getattr(volume, "is_mtp", False) else "USB",
                         volume.mountpoint, new_count, volume.rom_count())
             self.push_overlay(UsbPromptOverlay(volume))
             break
@@ -1939,7 +2062,8 @@ class GBALauncher:
     def usb_status_text(self) -> str:
         if self.usb_watcher and self.usb_watcher.volumes:
             volume = self.usb_watcher.volumes[0]
-            return f"{volume.label} ({volume.rom_count()} ROMs)"
+            prefix = "MTP" if getattr(volume, "is_mtp", False) else "USB"
+            return f"{prefix} {volume.label} ({volume.rom_count()} ROMs)"
         return "none"
 
     def usb_destination(self, volume) -> str:
@@ -2404,7 +2528,7 @@ class GBALauncher:
             "internal_system_monitor": lambda: self.push_overlay(MonitorOverlay()),
             "internal_controller_tester": lambda: self.push_overlay(InputDiagOverlay(self)),
             "internal_save_manager": lambda: self.push_overlay(SaveManagerOverlay()),
-            "internal_usb_import": lambda: self.push_overlay(UsbManagerOverlay()),
+            "internal_usb_import": lambda: self.push_overlay(UsbManagerOverlay(self)),
             "internal_browser": lambda: self.goto_tab(TAB_BROWSER),
             "internal_terminal": lambda: self.goto_tab(TAB_TERMINAL),
             "internal_settings_display": lambda: self.open_settings_page("display"),
@@ -2629,8 +2753,8 @@ class GBALauncher:
              "key": "view_mode", "get": lambda: s["view_mode"],
              "set": lambda v: self.set_setting("view_mode", v),
              "label_for": lambda v: v.title()},
-            {"type": "toggle", "label": "USB auto-detect",
-             "hint": "Offer to import ROMs when a pendrive appears.",
+            {"type": "toggle", "label": "USB / MTP auto-detect",
+             "hint": "Offer to import ROMs from a pendrive or Android phone.",
              "key": "usb_autoscan", "get": lambda: s["usb_autoscan"],
              "set": lambda v: self.set_setting("usb_autoscan", v)},
             {"type": "toggle", "label": "Import into subfolder",
@@ -2640,11 +2764,11 @@ class GBALauncher:
             {"type": "action", "label": "Rescan library",
              "hint": "Re-index the games folder now.",
              "action": lambda shell: shell.rescan_library()},
-            {"type": "action", "label": "Import from USB",
-             "hint": "List mounted drives and copy their ROMs.",
-             "action": lambda shell: shell.push_overlay(UsbManagerOverlay())},
+            {"type": "action", "label": "Import from USB / MTP",
+             "hint": "List drives and Android phone storages; copy their ROMs.",
+             "action": lambda shell: shell.push_overlay(UsbManagerOverlay(shell))},
             {"type": "info", "label": "Games folder", "value": get_games_dir(),
-             "hint": "Copy .gba/.gbc/.gb files here or use a pendrive."},
+             "hint": "Copy .gba/.gbc/.gb here, or import from USB/MTP."},
         ]
 
     def _deletable_games(self) -> List[Dict[str, Any]]:
@@ -3046,7 +3170,7 @@ class GBALauncher:
         status = self.usb_status_text()
         if status != "none":
             font = theme.font("micro")
-            text = font.render(f"USB {status.split(' (')[0]}", True, c.bg_deep)
+            text = font.render(status.split(" (")[0], True, c.bg_deep)
             chip = pygame.Rect(0, 0, text.get_width() + theme.px(8), theme.px(12))
             chip.topright = (theme.px(right), theme.px(7))
             pygame.draw.rect(self.surface, c.info, chip, border_radius=theme.px(6))
@@ -3274,7 +3398,7 @@ class GBALauncher:
             title, color = "No games on the shelf", c.text
             notes = ["copy .gba / .gbc / .gb files to:",
                      get_games_dir(),
-                     "plug in a pendrive and choose USB Import"]
+                     "plug in a pendrive or MTP phone; choose Import"]
         theme.text(self.surface, title, (x, y), "body_bold", color)
         y += 14
         for note in notes:
