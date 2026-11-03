@@ -39,7 +39,13 @@ toolkit, not a new GUI framework or a competing save system.
 ### Changed
 
 - `scripts/install.sh` and `Makefile` install/lint the three new handler modules.
-- 89 focused tests added for cheat isolation/persistence, the exact speed cycle and held-combo
+- Overlay scaling hardened: launcher popups centre against the real `design_h`
+  (not a literal 320, which drifts above 1920px where `ui_scale_for()` clamps),
+  the in-game fullscreen overlay resolves SDL's actual desktop mode instead of
+  its 960x640 fallback, and long cheat names / timestamps / dialog lines are
+  clipped to their boxes (fonts round up to whole pixels on small panels).
+  A headless suite renders every popup at 320x240 through 3840x2160.
+- 94 focused tests added for cheat isolation/persistence, the exact speed cycle and held-combo
   behaviour, nine-slot save/load/overwrite/persistence/corruption, shortcut configuration, native
   mGBA command flags and hotkeys, headless overlay rendering, favorites, and deletion safety.
 

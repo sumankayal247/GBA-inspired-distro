@@ -176,10 +176,14 @@ class Overlay:
     # -- geometry ------------------------------------------------------
     def rect(self, shell) -> pygame.Rect:
         theme = shell.theme
+        # Centre against the *actual* design height. On a >1920px-tall panel
+        # ui_scale_for() clamps at 6.0, so design_h grows past the 320-unit
+        # reference; using a literal 320 would leave the popup off-centre.
+        design_h = getattr(shell, "design_h", 320) or 320
         w = min(self.width, shell.design_w - 16)
-        h = min(self.height, 320 - 10)
+        h = min(self.height, design_h - 10)
         x = (shell.design_w - w) / 2
-        y = (320 - h) / 2
+        y = (design_h - h) / 2
         return theme.rect(x, y, w, h)
 
     def content_rect(self, shell) -> pygame.Rect:

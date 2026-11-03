@@ -41,10 +41,33 @@ class InGameOverlayRenderer:
         self.joysticks = []
         self.clock = None
         self._display_ready = False
+        self._apply_size(self.size)
+
+    def _apply_size(self, size: Tuple[int, int]) -> None:
+        """Recompute the whole design-unit layout for one physical mode."""
+        self.size = (max(320, int(size[0])), max(240, int(size[1])))
         self.scale = settings_store.ui_scale_for(self.size[1])
         self.design_w = self.size[0] / self.scale
         self.design_h = self.size[1] / self.scale
-        self.theme = Theme(theme_name, self.scale)
+        self.theme = Theme(self.theme_name, self.scale)
+
+    @staticmethod
+    def _fullscreen_size(fallback: Tuple[int, int]) -> Tuple[int, int]:
+        """Use the real display mode, not a guessed default, for FULLSCREEN.
+
+        The handler normally passes the mode it resolved for mGBA. If that was
+        unavailable (fallback 960x640), asking SDL for the desktop size keeps
+        the overlay truly fullscreen — otherwise the popup would be drawn in a
+        small window and its whole design-unit scale would be wrong.
+        """
+        try:
+            info = pygame.display.Info()
+            width, height = int(info.current_w), int(info.current_h)
+            if width >= 320 and height >= 240:
+                return width, height
+        except Exception:
+            pass
+        return fallback
 
     def _log(self, message: str, *args) -> None:
         if self.logger:
@@ -64,7 +87,10 @@ class InGameOverlayRenderer:
             # SDL's dummy driver has a fixed 1024x768 mode; asking it for a
             # fullscreen window would silently change the overlay geometry.
             dummy = os.environ.get("SDL_VIDEODRIVER") == "dummy"
-            flags = 0 if (self.windowed or dummy) else pygame.FULLSCREEN
+            fullscreen = not (self.windowed or dummy)
+            if fullscreen:
+                self._apply_size(self._fullscreen_size(self.size))
+            flags = pygame.FULLSCREEN if fullscreen else 0
             self.surface = pygame.display.set_mode(self.size, flags)
             pygame.display.set_caption("GBA OS")
             self._display_ready = True
@@ -216,6 +242,17 @@ class InGameOverlayRenderer:
             pass
 
     # ------------------------------------------------------------------ geometry
+    @staticmethod
+    def _fit(text: str, font, max_pixels: int) -> str:
+        """Clip one line to its box; at small scales fonts round up a pixel."""
+        if max_pixels <= 0:
+            return ""
+        if font.size(text)[0] <= max_pixels:
+            return text
+        while text and font.size(text + "...")[0] > max_pixels:
+            text = text[:-1]
+        return text + "..." if text else ""
+
     def panel_rect(self) -> pygame.Rect:
         width = min(360.0, self.design_w - 16)
         height = min(272.0, self.design_h - 16)
@@ -326,7 +363,9 @@ class InGameOverlayRenderer:
                 pygame.draw.rect(surface, c.card_sel, row, border_radius=theme.px(4))
                 pygame.draw.rect(surface, c.highlight, row, width=1,
                                  border_radius=theme.px(4))
-            theme.label(surface, item["name"], (x0 + 5, y + 5),
+            name = self._fit(item["name"], theme.font("body"),
+                             theme.px(width - 60))
+            theme.label(surface, name, (x0 + 5, y + 5),
                         c.text if selected else c.text_muted, key="body")
             state = "ENABLED" if item["enabled"] else "DISABLED"
             color = c.success if item["enabled"] else c.text_dim
@@ -371,6 +410,8 @@ class InGameOverlayRenderer:
                             c.danger if info["corrupt"] else c.text_dim,
                             key="micro", align="center")
             stamp = info["timestamp_label"] if info["occupied"] else "—"
+            stamp = self._fit(stamp, theme.font("micro"),
+                              cell.width - theme.px(6))
             theme.label(surface, stamp,
                         (cell.x / theme.scale + 3,
                          cell.bottom / theme.scale - 10), c.text_muted,
@@ -405,6 +446,8 @@ class InGameOverlayRenderer:
                    (box.centerx / theme.scale, box.y / theme.scale + 7),
                    "body_bold", c.highlight, align="center")
         for index, line in enumerate(lines):
+            line = self._fit(line, theme.font("micro"),
+                             box.width - theme.px(16))
             theme.label(self.surface, line,
                         (box.centerx / theme.scale, box.y / theme.scale + 28 + index * 12),
                         c.text, key="small", align="center")
