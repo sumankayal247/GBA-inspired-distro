@@ -154,5 +154,87 @@ class TestLibraryContract(unittest.TestCase):
         self.assertEqual(filenames, {"game1.gba", "emerald.gba"})
 
 
+class TestDurableIdentity(unittest.TestCase):
+    """
+    The "already imported" knowledge: `known_content_ids` must be durable
+    (on disk, survives restarts) and `register_content` must let the USB
+    importer record freshly copied files without waiting for a full rescan.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.games_dir = os.path.join(self.test_dir, "games")
+        self.data_dir = os.path.join(self.test_dir, "data")
+        os.makedirs(self.games_dir, exist_ok=True)
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.rom1_path = os.path.join(self.games_dir, "game1.gba")
+        with open(self.rom1_path, "wb") as f:
+            f.write(b"\x00" * 0xA0)
+            f.write(b"SAMPLE GAME\x00")
+            f.write(b"\x00" * 1024)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_known_content_ids_track_cache_and_survive_reopen(self):
+        lib = Library(games_dir=self.games_dir, data_dir=self.data_dir)
+        entries = lib.scan_games()
+        self.assertEqual(lib.known_content_ids(), {entries[0]["id"]})
+        # Simulated restart: a new instance reading the same on-disk cache
+        # still knows the content.
+        reopened = Library(games_dir=self.games_dir, data_dir=self.data_dir)
+        self.assertEqual(reopened.known_content_ids(), {entries[0]["id"]})
+
+    def test_register_content_seeds_the_cache(self):
+        lib = Library(games_dir=self.games_dir, data_dir=self.data_dir)
+        target = os.path.join(self.games_dir, "imported.gba")
+        shutil.copy2(self.rom1_path, target)
+        cid = compute_content_id(target)
+
+        self.assertEqual(lib.register_content([(target, cid)]), 1)
+        self.assertIn(cid, lib.known_content_ids())
+
+        # A later rescan is a cache hit and reports the same identity.
+        entries = lib.scan_games()
+        self.assertEqual(len(entries), 2)
+        self.assertIn(cid, {e["id"] for e in entries})
+        reopened = Library(games_dir=self.games_dir, data_dir=self.data_dir)
+        self.assertIn(cid, reopened.known_content_ids())
+
+    def test_register_content_ignores_missing_or_invalid_files(self):
+        lib = Library(games_dir=self.games_dir, data_dir=self.data_dir)
+        missing = os.path.join(self.games_dir, "gone.gba")
+        self.assertEqual(lib.register_content([(missing, "abc123")]), 0)
+        note = os.path.join(self.games_dir, "notes.txt")
+        with open(note, "w") as f:
+            f.write("not a rom")
+        self.assertEqual(lib.register_content([(note, "abc123"), ("x", "")]), 0)
+        self.assertEqual(lib.known_content_ids(), set())
+
+    def test_scan_saves_cache_incrementally(self):
+        for i in range(40):
+            with open(os.path.join(self.games_dir, f"rom{i:02d}.gba"), "wb") as f:
+                f.write(b"\x00" * 0xA0)
+                f.write(f"G{i:011d}".encode("utf-8"))
+                f.write(b"\x00" * 512)
+                f.write(bytes([i]) * 64)
+        lib = Library(games_dir=self.games_dir, data_dir=self.data_dir)
+        saves = []
+        original = lib._save_cache
+
+        def counting():
+            saves.append(len(lib._cache))
+            return original()
+
+        lib._save_cache = counting
+        entries = lib.scan_games()
+        self.assertEqual(len(entries), 41)
+        self.assertGreaterEqual(len(saves), 2)
+        self.assertLess(saves[0], len(entries))  # flushed mid-scan, not only at the end
+        # Everything hashed so far is durable even if the scan is abandoned.
+        reopened = Library(games_dir=self.games_dir, data_dir=self.data_dir)
+        self.assertGreaterEqual(len(reopened.known_content_ids()), 32)
+
+
 if __name__ == "__main__":
     unittest.main()

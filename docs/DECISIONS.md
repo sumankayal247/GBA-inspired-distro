@@ -568,3 +568,53 @@ is wrong is not knowable in advance — a stale `DISPLAY`, a DRM master already 
 whose first card drives no output — so the fix is to try the plausible alternatives once, cheaply,
 and only when the failure looks like a video failure (fast exit, not a clean one, not a long session,
 not headless).
+
+---
+
+## D-048 The import prompt measures new content, not discovery
+
+**Decision.** A plugged-in volume is offered for import only when it holds ROMs whose content ids
+(Rule L2 hashes — the library's existing identity, not a second system) are absent from
+`Library.known_content_ids()`. That known-id set is backed by the on-disk library cache; the source
+side is memoised in `DATA/library/usb_sources.json` (path + size + mtime, Rule L4 semantics, ST2
+disposable) so a stick is fully hashed at most once per machine. When the library knows nothing
+(fresh install) every discovered ROM is provably new and the prompt appears without hashing
+anything. All walking and hashing happens on the watcher thread, off its lock; `refresh()` re-arms
+detection instead of analysing synchronously. Imports register their copies' ids
+(`register_content`) the moment the files land, and the library cache flushes every 16 freshly
+hashed files mid-scan because the scanner is a daemon thread that dies when the launcher exits into
+a game.
+
+**Why.** The supervisor restarts the launcher process after every game session and every boot, so
+any memory-only notion of "this stick was already offered" evaporates — a 1130-ROM stick was
+re-announced forever. Persisting "the prompt was shown" is the wrong state: it silently suppresses
+genuinely new content added to the same stick and lies after a reinstall. The only durable truth
+about "already imported" is the library's own content identity, which already exists on disk; the
+prompt just had to be computed from it. Discovery minus known library equals new content — that
+difference, not a flag, is what the user is asked about.
+
+---
+
+## D-049 The emulator window is born screen-sized, because fullscreen needs a window manager
+
+**Decision.** The adapter reads the physical display mode without acquiring the display
+(`/sys/class/drm/*/status,modes`, internal panel preferred, `SDL_VIDEO_KMSDRM_DEVICE` pin honoured,
+`xrandr` fallback under X11) and passes it to mGBA as `-C width=… -C height=…` alongside `-f`,
+`lockAspectRatio=1` and `lockIntegerScaling`. When the mode cannot be determined it falls back to
+`-4` (4× native) rather than the default 1×. It also passes `-C rewindEnable=0` (and writes it into
+the managed `config.ini`), disabling mgba-sdl's default every-frame rewind snapshot recording that
+the appliance never exposes as a control.
+
+**Why.** SDL2's X11 backend implements `FULLSCREEN_DESKTOP` purely as a `_NET_WM_STATE_FULLSCREEN`
+client message, and the appliance session (`xinit gba-session -- :0 vt1`) has no window manager:
+the request is dropped, the window keeps its birth size (mGBA's default viewport = native ×1), and
+mGBA's one-shot post-start `SDL_SetWindowSize` is a no-op under the fullscreen flag — a 240×160 GBA
+image centred on a laptop screen, 160×144 for GBC. Explicit screen-sized geometry produces the same
+result with or without a WM, and mGBA's own viewport math then centres the largest
+correctly-proportioned integer- or fit-scaled image inside it: no crop, no stretch, correct 3:2 /
+10:9. KMSDRM sessions ignore window size (scanout is the mode), so the change is inert there. The
+rewind default costs a full core snapshot per emulated frame into a 600-second buffer on the
+emulation thread — the only default-on per-frame overhead the adapter controls, and the prime
+suspect for stutter on modest hardware; pacing (`audioSync`/`videoSync`/`fpsTarget`) is untouched.
+Verified against mgba-sdl 0.9.3, 0.10.1, 0.10.3 and master (identical GL viewport path; `-C`
+overrides win over `config.ini`; all needed keys mapped in every version).
