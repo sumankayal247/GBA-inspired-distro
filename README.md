@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Contract](https://img.shields.io/badge/Contract-Draft%202%20(V1)-purple.svg)](docs/CONTRACT.md)
-[![Tests](https://img.shields.io/badge/Tests-229%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/Tests-350%20passing-brightgreen.svg)](tests)
 [![Safe by default](https://img.shields.io/badge/install-safe%20by%20default-blue.svg)](docs/SAFETY.md)
 
 **GBA OS** is an appliance-style Linux operating system experience designed to turn any PC or laptop into a dedicated Game Boy Advance console.
@@ -78,6 +78,9 @@ The shell itself is deliberately small and single-purpose per module:
 | `src/gba_terminal.py` | PTY session, ANSI screen emulator, key translation, terminal view |
 | `src/gba_browser.py` | HTTP fetch, HTML extraction, text layout, history, URL bar |
 | `src/gba_usb.py` | `/proc/mounts` discovery, ROM scan, verified import, background watcher |
+| `src/game_data.py` | per-content-id cheats, nine save-state slots, favorites, game deletion |
+| `src/gba_ingame.py` | shortcut router, fast-forward cycle, overlay models, session state (no GUI dependency) |
+| `src/gba_ingame_ui.py` | pygame/Theme overlay renderer used *inside the mGBA handler* |
 
 ### Process Lifecycle
 1. **Supervisor** starts and executes `gba-launcher`.
@@ -214,6 +217,63 @@ Ctrl/Alt) and duplicate assignments are rejected with an inline explanation.
 
 ---
 
+## 🎛️ In-Game Overlays & Shortcuts
+
+These live in the mGBA handler, not in a second application: mGBA keeps running, is paused while an
+overlay is open and is resumed on close. The overlays reuse the launcher's `Theme`/pygame approach —
+no new GUI toolkit, no second display stack. Navigation is controller-first (D-pad/hat/buttons) with
+keyboard and mouse fallback. Combos are edge-triggered: holding them does not fire again, and the
+consumed buttons are released so they cannot also act as gameplay input.
+
+| Action | Default combo | Behaviour |
+| :--- | :--- | :--- |
+| **Cheats Overlay** | `Up + Left` | Only this game's cheats; `A` toggles one with an `ENABLED`/`DISABLED` chip, `B` closes. |
+| **Fast-Forward Cycle** | `L + R` | Each deliberate press cycles `1x → 2x → 3x → Normal`, showing a temporary `2x` / `3x` / `Normal` badge. |
+| **Save States Overlay** | `Left + Right` | Exactly nine slots in a 3×3 grid with thumbnails and timestamps; `Load Save` / `Overwrite Save` for occupied slots. |
+
+All three are configurable under **SETTINGS → Controls → In-game shortcuts** (press `A` on a row,
+then two distinct controller or keyboard buttons; `R` resets to defaults). They are stored in the
+existing `DATA/config/settings.json` as `shortcut_cheats`, `shortcut_fast_forward` and
+`shortcut_save_states`. Defaults work on a fresh install.
+
+Per-game data uses the library's stable content id (SHA-256 of the ROM — never the filename), which
+the supervisor already passes to the handler as `SYS_ENTRY_ID`:
+
+```text
+DATA/saves/<content-id>/
+├── cheats.json                  # metadata only: names, codes, enabled flags
+├── cheats/<rom-base>.cheats     # mGBA's native # name / !disabled / code format
+├── states/slots.json            # metadata only: timestamp, size, SHA-256, has_thumbnail
+├── states/slot_N/state.ss       # the real mGBA state (F1–F9 / Shift+F1–F9)
+├── states/slot_N/thumbnail.png  # visual thumbnail only (F12), never state data
+└── runtime/                     # mGBA's native slot files + speed-reload state
+DATA/config/favorites.json       # content ids, stable favorites-first ordering
+```
+
+Cheats are loaded through mGBA's own `-c <file>` mechanism (`cheatAutoload=0` when a game has none,
+so no global list leaks in). Save/load use mGBA's native state hotkeys; screenshots are separate PNGs.
+Speed uses mGBA's real `fpsTarget` (60/120/180) rather than skipped frames or hand-written timing.
+State files, thumbnails and JSON are written atomically, verified by size + SHA-256 on load, and
+rolled back to the previous good save if a later write fails; missing/corrupt data never crashes the
+emulator or supervisor.
+
+**SETTINGS → Game Management** lists imported games and offers `Delete Selected Games` (multi-select,
+confirmation) and `Delete All Imported Games` (confirmation plus a two-second hold). Deletion removes
+the ROM, its per-game cheats/states/runtime data, its favorite flag and its library-cache entry.
+**GAME LIST → Favorites** (`Ctrl+F` / pad `X`) keeps favorites first as a stable partition: relative
+order is preserved in both groups, unfavoriting returns a game to its original position, and no game
+is duplicated.
+
+> **Real-hardware caveats.** Native hotkeys are delivered through `/dev/uinput` (or `xdotool` on
+> X11); without either, overlays still open/close but native capture, load and speed reload degrade
+> gracefully. `gba-selftest` reports this. Cheat enable/disable changes are persisted immediately but
+> mGBA applies them on the next launch — closing the overlay never restarts the game. Speed changes
+> use a state-preserving in-session reload (`-t` with a freshly captured native state) because
+> mgba-sdl has no runtime speed IPC; the exact audio pacing and display sharing on KMS/DRM need
+> verification on the appliance. None of this is verifiable in the headless test suite.
+
+---
+
 ## 📂 Managing ROMs, Saves & Settings
 
 - **Games Directory:** `/games/` (sub-folders are allowed)
@@ -237,7 +297,7 @@ Ctrl/Alt) and duplicate assignments are rejected with an inline explanation.
 ## 🧪 Testing & Development
 
 ```bash
-make test       # 229 tests (headless, no display needed)
+make test       # 350 tests (headless, no display needed)
 make lint       # byte-compile Python + syntax-check every shell script
 make selftest   # check *this* machine: interpreter, fonts, pty, display, mGBA, storage, config
 make iso-check  # what is missing to build a bootable ISO here

@@ -22,6 +22,9 @@ import shutil
 import subprocess
 import struct
 import select
+import glob
+import json
+import queue
 import threading
 import time
 from typing import Optional
@@ -30,12 +33,21 @@ from typing import Optional
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from common import setup_logging, load_keybindings, load_display_config, DEFAULT_KEYBINDINGS
+from common import (
+    setup_logging, load_keybindings, load_display_config, DEFAULT_KEYBINDINGS,
+    compute_content_id,
+)
+import config as settings_store
 from config import (
     display_mode_size,
     display_session,
     other_drm_devices,
     prepare_child_environment,
+)
+from game_data import CheatStore, SaveStateStore, valid_game_id
+from gba_ingame import (
+    InGameBackend, InGameSession, ComboRouter,
+    button_from_joy_button, button_from_axis, buttons_from_hat, BASE_FPS,
 )
 
 logger = setup_logging("gba.adapter")
@@ -43,7 +55,11 @@ logger = setup_logging("gba.adapter")
 # Linux input constants (avoid a hard dependency on python-evdev)
 EV_SYN = 0x00
 EV_KEY = 0x01
+EV_ABS = 0x03
+EVIOCGNAME_256 = 0x81004506       # read a /dev/input device's name
+VIRTUAL_INPUT_NAME = "gba-os-hotkeys"
 KEY_ESC = 1
+ABS_HAT0X, ABS_HAT0Y = 16, 17
 
 # Gamepad combos that quit a game: SELECT+START, or a Guide/Home button.
 GAMEPAD_START_BUTTONS = {7, 9}
@@ -51,6 +67,71 @@ GAMEPAD_SELECT_BUTTONS = {6, 8}
 GAMEPAD_GUIDE_BUTTONS = {10, 12, 16, 17}
 
 BACKUP_SUFFIX = ".bak"
+
+# --- input translation ------------------------------------------------------
+# SDL key codes (the shared keybinding profile, I3) -> Linux evdev key codes.
+# The input monitor reads raw /dev/input events, so shortcut detection has to
+# translate the profile instead of hard-coding "Up + Left" or "L + R".
+_SDL_TO_EVDEV = {
+    1073741906: 103,  # Up
+    1073741905: 108,  # Down
+    1073741904: 105,  # Left
+    1073741903: 106,  # Right
+    8: 14,            # Backspace (SELECT)
+    13: 28,           # Return (START)
+    9: 15,            # Tab
+    32: 57,           # Space
+    27: 1,            # Escape
+}
+_EVDEV_LETTERS = {
+    "q": 16, "w": 17, "e": 18, "r": 19, "t": 20, "y": 21, "u": 22,
+    "i": 23, "o": 24, "p": 25, "a": 30, "s": 31, "d": 32, "f": 33,
+    "g": 34, "h": 35, "j": 36, "k": 37, "l": 38, "z": 44, "x": 45,
+    "c": 46, "v": 47, "b": 48, "n": 49, "m": 50,
+}
+
+# evdev gamepad button codes -> SDL-style joystick button numbers.
+_EVDEV_GAMEPAD_BUTTONS = {
+    304: 0,  # BTN_A
+    305: 1,  # BTN_B
+    307: 2,  # BTN_X
+    306: 3,  # BTN_Y
+    310: 4,  # BTN_TL (L)
+    311: 5,  # BTN_TR (R)
+    314: 6,  # BTN_SELECT
+    315: 7,  # BTN_START
+}
+
+# mGBA SDL hotkeys (see src/platform/sdl/sdl-events.c): F1..F9 load a native
+# state slot, Shift+F1..F9 save it, F12 takes a native screenshot.
+KEY_LEFTSHIFT = 42
+KEY_F1 = 59
+KEY_F12 = 88
+INJECTABLE_KEYS = tuple(range(KEY_F1, KEY_F1 + 9)) + (KEY_F12, KEY_LEFTSHIFT)
+
+# X11 key names for "release the buttons we just consumed".  Under X11 a
+# key-up from a *different* uinput device does not clear the physical key's
+# state, so xdotool is used in addition to uinput when a display is present.
+_EVDEV_TO_X11 = {
+    103: "Up", 108: "Down", 105: "Left", 106: "Right",
+    14: "BackSpace", 28: "Return", 15: "Tab", 57: "space", 1: "Escape",
+}
+for _letter, _code in _EVDEV_LETTERS.items():
+    _EVDEV_TO_X11[_code] = _letter
+
+
+def evdev_button_map(bindings: dict):
+    """Returns {evdev code: GBA button id} for every bound keyboard key."""
+    result = {}
+    for button_id, sdl_code in (bindings or {}).items():
+        code = _SDL_TO_EVDEV.get(sdl_code)
+        if code is None and isinstance(sdl_code, int):
+            # SDL uses ASCII for plain letters (a=97 ... z=122).
+            letter = chr(sdl_code).lower() if 0 < sdl_code < 128 else ""
+            code = _EVDEV_LETTERS.get(letter)
+        if code is not None:
+            result[code] = button_id
+    return result
 
 MIGBA_CONFIG_TEMPLATE = """[ports.sdl]
 fullscreen={fullscreen}
@@ -235,21 +316,37 @@ def restore_backup_if_needed(save_dir: str) -> bool:
 
 class InputMonitor(threading.Thread):
     """
-    Background watcher that converts the system exit combo into SIGTERM.
+    Background watcher for the system exit combo and in-game action combos.
 
     It reads raw `/dev/input` events so it works without evdev bindings and
-    without stealing input from mGBA. Only explicit exit gestures are handled:
-    Escape (from the shared profile) plus a gamepad combo.
+    without stealing input from mGBA.  Combo detection is edge-triggered by
+    `ComboRouter`: a shortcut is queued once when its last button is pressed,
+    never again while the buttons stay held.  The buttons of a consumed combo
+    are reported through `on_consumed` so the handler can neutralise them in
+    the emulator instead of letting them leak into gameplay.
     """
 
-    def __init__(self, target_proc: subprocess.Popen, escape_keys=None):
+    def __init__(self, target_proc: subprocess.Popen, escape_keys=None,
+                 shortcuts=None, action_queue=None, keybindings=None,
+                 on_consumed=None):
         super().__init__(daemon=True, name="gba-input-monitor")
         self.proc = target_proc
         self.running = True
         self.escape_keys = set(escape_keys or {KEY_ESC})
+        self.shortcuts = shortcuts
+        self.action_queue = action_queue
+        self.on_consumed = on_consumed
+        self._evdev_map = evdev_button_map(keybindings or load_keybindings())
 
     def stop(self):
         self.running = False
+        # Before a speed relaunch, make sure the old watcher has stopped
+        # reading /dev/input and cannot terminate the freshly spawned child.
+        try:
+            if self.is_alive() and threading.current_thread() is not self:
+                self.join(timeout=0.6)
+        except Exception:
+            pass
 
     def _trigger(self, reason: str) -> None:
         logger.info("%s - sending SIGTERM to emulator", reason)
@@ -257,6 +354,31 @@ class InputMonitor(threading.Thread):
             self.proc.terminate()
         except Exception:
             pass
+
+    # -- combo helpers -------------------------------------------------
+    def _press(self, router, button) -> None:
+        if router is None or not button:
+            return
+        for action in router.press(button):
+            if self.action_queue is not None:
+                self.action_queue.put(action)
+        if self.on_consumed is not None:
+            self.on_consumed(router.consumed_buttons())
+
+    def _release(self, router, button) -> None:
+        if router is None or not button:
+            return
+        router.release(button)
+        if self.on_consumed is not None:
+            self.on_consumed(router.consumed_buttons())
+
+    @staticmethod
+    def _hat_button(code, value):
+        if code == ABS_HAT0X:
+            return "keyLeft" if value < 0 else ("keyRight" if value > 0 else None)
+        if code == ABS_HAT0Y:
+            return "keyUp" if value < 0 else ("keyDown" if value > 0 else None)
+        return None
 
     def run(self):
         fds = {}
@@ -267,13 +389,49 @@ class InputMonitor(threading.Thread):
                 path = os.path.join("/dev/input", dev)
                 try:
                     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                    # Never watch our own uinput device: the synthetic key-ups
+                    # used to neutralise a consumed combo would otherwise look
+                    # like a real release and could re-arm a still-held combo.
+                    if dev.startswith("event"):
+                        import fcntl
+                        name_buf = bytearray(256)
+                        try:
+                            fcntl.ioctl(fd, EVIOCGNAME_256, name_buf, True)
+                            name = bytes(name_buf).split(b"\x00", 1)[0].decode(
+                                "utf-8", "ignore")
+                        except Exception:
+                            name = ""
+                        if VIRTUAL_INPUT_NAME in name:
+                            os.close(fd)
+                            continue
                     fds[fd] = dev.startswith("js")
                 except Exception:
                     pass
             if not fds:
                 return
 
-            held = set()
+            router = ComboRouter(self.shortcuts) if self.shortcuts else None
+            held = set()                 # legacy gamepad exit combo
+            axis_buttons = {}            # (fd, axis) -> currently held button
+
+            def axis_update(fd, axis, value, normalise=False):
+                key = (fd, axis)
+                old = axis_buttons.get(key)
+                new = None
+                if normalise:
+                    new = button_from_axis(axis, value / 32767.0)
+                else:
+                    new = self._hat_button(axis, value)
+                if new == old:
+                    return
+                if old:
+                    self._release(router, old)
+                    held.discard(old)
+                if new:
+                    self._press(router, new)
+                    held.add(new)
+                axis_buttons[key] = new
+
             while self.running and self.proc.poll() is None:
                 try:
                     readable, _, _ = select.select(list(fds.keys()), [], [], 0.2)
@@ -287,24 +445,43 @@ class InputMonitor(threading.Thread):
                             if len(raw) != 8:
                                 continue
                             _t_ms, value, ev_type, number = struct.unpack("IhBB", raw)
-                            if not ev_type & 0x01:  # JS_EVENT_BUTTON
+                            if ev_type & 0x02:       # JS_EVENT_AXIS
+                                axis_update(fd, number, value, normalise=True)
                                 continue
+                            if not ev_type & 0x01:   # JS_EVENT_BUTTON
+                                continue
+                            button = button_from_joy_button(number)
                             if value:
                                 held.add(number)
-                                combo = (held & GAMEPAD_SELECT_BUTTONS) and (held & GAMEPAD_START_BUTTONS)
+                                combo = ((held & GAMEPAD_SELECT_BUTTONS) and
+                                         (held & GAMEPAD_START_BUTTONS))
                                 if number in GAMEPAD_GUIDE_BUTTONS or combo:
                                     self._trigger("Gamepad exit combo")
                                     return
+                                self._press(router, button)
                             else:
                                 held.discard(number)
+                                self._release(router, button)
                         else:
                             raw = os.read(fd, 24)
                             if len(raw) != 24:
                                 continue
                             _s, _us, ev_t, code, value = struct.unpack("qqHHi", raw)
-                            if ev_t == EV_KEY and value == 1 and code in self.escape_keys:
-                                self._trigger("Exit key detected")
-                                return
+                            if ev_t == EV_KEY:
+                                if value == 1 and code in self.escape_keys:
+                                    self._trigger("Exit key detected")
+                                    return
+                                button = self._evdev_map.get(code)
+                                if button is None:
+                                    button = button_from_joy_button(
+                                        _EVDEV_GAMEPAD_BUTTONS.get(code, -1))
+                                if button:
+                                    if value == 1:      # ignore auto-repeat (2)
+                                        self._press(router, button)
+                                    elif value == 0:
+                                        self._release(router, button)
+                            elif ev_t == EV_ABS and code in (ABS_HAT0X, ABS_HAT0Y):
+                                axis_update(fd, code, value)
                     except BlockingIOError:
                         continue
                     except Exception:
@@ -317,12 +494,339 @@ class InputMonitor(threading.Thread):
                     pass
 
 
+class HotkeyInjector:
+    """Sends mGBA's *native* hotkeys (F1-F9, Shift+F1-F9, F12) to the emulator.
+
+    `/dev/uinput` is the primary transport: it works under X11 as well as
+    KMS/DRM without a window manager.  On X11-only setups `xdotool` is a
+    fallback.  Both are optional: if neither exists the emulator still runs
+    and every in-game operation fails gracefully instead of crashing.
+    """
+
+    UI_SET_EVBIT = 0x40045564
+    UI_SET_KEYBIT = 0x40045565
+    UI_DEV_CREATE = 0x5501
+    UI_DEV_DESTROY = 0x5502
+
+    def __init__(self, device: str = "/dev/uinput"):
+        self.fd = None
+        self._xdotool = None
+        fd = None
+        try:
+            import fcntl
+            fd = os.open(device, os.O_WRONLY | os.O_NONBLOCK)
+            fcntl.ioctl(fd, self.UI_SET_EVBIT, EV_KEY)
+            for code in INJECTABLE_KEYS:
+                fcntl.ioctl(fd, self.UI_SET_KEYBIT, code)
+            setup = bytearray(1116)      # struct uinput_user_dev
+            name = VIRTUAL_INPUT_NAME.encode()
+            setup[:len(name)] = name
+            os.write(fd, bytes(setup))
+            fcntl.ioctl(fd, self.UI_DEV_CREATE)
+            time.sleep(0.05)            # let udev create /dev/input/eventN
+            self.fd = fd
+        except Exception:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+            self.fd = None
+        # xdotool is useful even when uinput works: X11 tracks key state per
+        # input device, so a uinput key-up alone cannot neutralise a physical
+        # key that mGBA saw through X.
+        if os.environ.get("DISPLAY"):
+            self._xdotool = shutil.which("xdotool")
+
+    def available(self) -> bool:
+        return self.fd is not None or self._xdotool is not None
+
+    def key(self, code: int, value: int) -> bool:
+        """Sends one key press/release (used to neutralise consumed combos)."""
+        if self.fd is None:
+            return False
+        try:
+            os.write(self.fd, struct.pack("qqHHi", 0, 0, EV_KEY, int(code), int(value)))
+            os.write(self.fd, struct.pack("qqHHi", 0, 0, EV_SYN, 0, 0))
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _x11_names(codes):
+        names = []
+        for code in codes:
+            if KEY_F1 <= code < KEY_F1 + 9:
+                names.append(f"F{code - KEY_F1 + 1}")
+            elif code == KEY_F12:
+                names.append("F12")
+            elif code == KEY_LEFTSHIFT:
+                names.append("shift")
+            else:
+                name = _EVDEV_TO_X11.get(code)
+                if name:
+                    names.append(name)
+        return names
+
+    def tap(self, codes, hold: float = 0.04) -> bool:
+        codes = list(codes)
+        if self.fd is not None:
+            ok = True
+            for code in codes:
+                ok = self.key(code, 1) and ok
+            time.sleep(hold)
+            for code in reversed(codes):
+                ok = self.key(code, 0) and ok
+            if ok:
+                return True
+        names = self._x11_names(codes)
+        if self._xdotool and names:
+            try:
+                subprocess.run([self._xdotool, "key", "--clearmodifiers",
+                                "+".join(names)], timeout=3.0, check=False,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                return True
+            except Exception:
+                return False
+        return False
+
+    def release(self, codes) -> bool:
+        """Neutralise a consumed shortcut so it cannot also reach gameplay."""
+        codes = list(codes)
+        ok = False
+        for code in codes:
+            ok = self.key(code, 0) or ok
+        names = self._x11_names(codes)
+        if self._xdotool and names:
+            try:
+                subprocess.run([self._xdotool, "keyup"] + names, timeout=2.0,
+                               check=False, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                ok = True
+            except Exception:
+                pass
+        return ok
+
+    def close(self) -> None:
+        if self.fd is None:
+            return
+        try:
+            import fcntl
+            fcntl.ioctl(self.fd, self.UI_DEV_DESTROY)
+            os.close(self.fd)
+        except Exception:
+            pass
+        self.fd = None
+
+
+class MgbaNativeController(InGameBackend):
+    """mGBA-native operations for cheats, nine states and fast-forward.
+
+    The real emulator state is always an mGBA `.ssN` file produced by mGBA's
+    own Shift+F<N> hotkey.  Screenshots are separate PNGs produced by mGBA's
+    F12 hotkey; they are only ever visual thumbnails.  Speed changes use
+    mGBA's `fpsTarget` config (60/120/180), applied with a state-preserving
+    in-session reload.  Nothing here writes outside the handler's save dir.
+    """
+
+    supports_runtime_speed = True
+
+    def __init__(self, proc, content_path: str, save_dir: str,
+                 injector=None, fps_target: float = BASE_FPS):
+        self.proc = proc
+        self.content_path = content_path
+        self.save_dir = save_dir
+        self.runtime_dir = os.path.join(save_dir, "runtime")
+        self.capture_dir = os.path.join(self.runtime_dir, "captures")
+        os.makedirs(self.capture_dir, exist_ok=True)
+        self.base = os.path.splitext(os.path.basename(content_path))[0] or "game"
+        self.injector = injector if injector is not None else HotkeyInjector()
+        self.fps_target = float(fps_target)
+        self._paused = False
+        self.last_screenshot = None
+        self._button_to_evdev = {button: code for code, button in
+                                 evdev_button_map(load_keybindings()).items()}
+
+    # -- process control -----------------------------------------------
+    def _signal(self, sig) -> bool:
+        try:
+            if self.proc is not None and self.proc.poll() is None:
+                self.proc.send_signal(sig)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def pause(self) -> bool:
+        # Capture the last gameplay frame *before* stopping mGBA: the overlay
+        # shows it behind the panel so the game appears preserved.  The short
+        # timeout keeps a missing screenshot from stalling the whole overlay.
+        self.last_screenshot = self.capture_screenshot(0, timeout=0.6)
+        self._paused = self._signal(signal.SIGSTOP)
+        return self._paused
+
+    def resume(self) -> bool:
+        if not self._paused:
+            return False
+        self._paused = False
+        return self._signal(signal.SIGCONT)
+
+    def set_speed(self, multiplier: int, fps_target: float) -> bool:
+        self.fps_target = float(fps_target)
+        # mGBA SDL reads fpsTarget when the core starts; request the
+        # state-preserving reload only when hotkeys are actually deliverable.
+        return self.injector.available()
+
+    def suppress_combo(self, buttons) -> None:
+        """Best effort: release consumed keys so they do not reach gameplay."""
+        codes = [self._button_to_evdev[button] for button in buttons or ()
+                 if button in self._button_to_evdev]
+        if not codes:
+            return
+        release = getattr(self.injector, "release", None)
+        if callable(release):
+            release(codes)
+        else:                              # duck-typed test injectors
+            for code in codes:
+                self.injector.key(code, 0)
+
+    # -- native files ---------------------------------------------------
+    def native_state_path(self, slot: int) -> str:
+        return os.path.join(self.runtime_dir, f"{self.base}.ss{int(slot)}")
+
+    @staticmethod
+    def _wait_changed(path: str, before: float, timeout: float = 1.6) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if os.path.isfile(path) and os.path.getsize(path) > 0 and \
+                        os.path.getmtime(path) > before:
+                    return True
+            except OSError:
+                pass
+            time.sleep(0.05)
+        return False
+
+    @staticmethod
+    def _restore(path: str, backup: str, had_previous: bool) -> None:
+        try:
+            if had_previous and os.path.isfile(backup):
+                shutil.copyfile(backup, path)
+            elif not had_previous and os.path.isfile(path):
+                os.remove(path)
+        except Exception:
+            pass
+        try:
+            if os.path.isfile(backup):
+                os.remove(backup)
+        except OSError:
+            pass
+
+    def save_state(self, slot: int):
+        """Asks mGBA for a native state; returns a staged copy or None."""
+        try:
+            slot = int(slot)
+        except (TypeError, ValueError):
+            return None
+        if not 1 <= slot <= 9:
+            return None
+        path = self.native_state_path(slot)
+        backup = path + ".previous"
+        had_previous = os.path.isfile(path)
+        try:
+            if had_previous:
+                shutil.copyfile(path, backup)
+            before = os.path.getmtime(path) if os.path.isfile(path) else 0.0
+        except OSError:
+            return None
+        ok = self.injector.tap([KEY_LEFTSHIFT, KEY_F1 + slot - 1])
+        if not ok or not self._wait_changed(path, before):
+            self._restore(path, backup, had_previous)
+            return None
+        staged = os.path.join(self.capture_dir, f"slot_{slot}.ss")
+        try:
+            shutil.copyfile(path, staged)
+        except Exception:
+            self._restore(path, backup, had_previous)
+            return None
+        self._restore(path, backup, had_previous)
+        return staged
+
+    def capture_screenshot(self, slot: int = 0, timeout: float = 1.6):
+        """Asks mGBA for a native PNG frame; a visual thumbnail, never state."""
+        pattern = os.path.join(self.runtime_dir, "*.png")
+        before = set(glob.glob(pattern))
+        if not self.injector.tap([KEY_F12]):
+            return None
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        while time.monotonic() < deadline:
+            fresh = [p for p in set(glob.glob(pattern)) - before
+                     if os.path.isfile(p) and os.path.getsize(p) > 0]
+            if fresh:
+                shot = max(fresh, key=os.path.getmtime)
+                self._prune_screenshots(keep=shot)
+                return shot
+            time.sleep(0.05)
+        return None
+
+    def _prune_screenshots(self, keep: Optional[str] = None) -> None:
+        """mGBA creates a new PNG per F12; keep only a few runtime frames."""
+        files = sorted(glob.glob(os.path.join(self.runtime_dir, "*.png")),
+                       key=os.path.getmtime, reverse=True)
+        for stale in files[3:]:
+            if stale == keep:
+                continue
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+
+    def load_state(self, slot: int, state_path: str) -> bool:
+        """Restores the *actual* mGBA state with its native F<N> hotkey."""
+        try:
+            slot = int(slot)
+        except (TypeError, ValueError):
+            return False
+        if not 1 <= slot <= 9 or not state_path or not os.path.isfile(state_path):
+            return False
+        try:
+            shutil.copyfile(state_path, self.native_state_path(slot))
+        except Exception:
+            return False
+        return self.injector.tap([KEY_F1 + slot - 1])
+
+    def capture_ephemeral_state(self):
+        """Native state used only to resume at the exact frame after a reload."""
+        staged = self.save_state(9)
+        if not staged:
+            return None
+        target = os.path.join(self.runtime_dir, "speed_state.ss")
+        try:
+            shutil.copyfile(staged, target)
+            return target
+        except Exception:
+            return None
+
+
 def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
                        windowed: bool, display_scaling: str,
-                       display_size: Optional[tuple] = None) -> list:
+                       display_size: Optional[tuple] = None,
+                       cheat_file: Optional[str] = None,
+                       cheats_dir: Optional[str] = None,
+                       savestate: Optional[str] = None,
+                       fps_target: Optional[float] = None,
+                       runtime_dir: Optional[str] = None) -> list:
     """
     Builds the mGBA argv with save routing (SV1), scaling (D2) and explicit
     video settings.
+
+    The optional arguments are the mGBA-native hooks for the in-game
+    features: `-c` loads this game's cheat file, `-t` resumes a native state
+    after a speed reload, `fpsTarget` is mGBA's real speed setting, and the
+    native state/screenshot slots are routed into a per-game runtime folder
+    separate from the nine archived slots.  With no optional arguments the
+    command is byte-for-byte the original one (SV1/D2 tests included).
 
     The video settings are passed as `-C` overrides rather than only through
     config.ini: mGBA reads its config from `$XDG_CONFIG_HOME/mgba/config.ini`,
@@ -341,11 +845,12 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
     stretch). When the mode cannot be determined, `-4` requests 4x native
     (960x640) instead of the useless 1x window.
     """
+    native_dir = runtime_dir or save_dir
     cmd = [
         mgba_bin,
         "-C", f"savegamePath={save_dir}",
-        "-C", f"savestatePath={save_dir}",
-        "-C", f"screenshotPath={save_dir}",
+        "-C", f"savestatePath={native_dir}",
+        "-C", f"screenshotPath={native_dir}",
         "-C", f"fullscreen={0 if windowed else 1}",
         # mgba-sdl enables rewind recording by default: a full core snapshot
         # every emulated frame plus a 600-second buffer, serialized on the
@@ -354,6 +859,16 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
         # suspect for stutter (most visible in the GB/GBC frame loop).
         "-C", "rewindEnable=0",
     ]
+    if fps_target:
+        cmd.extend(["-C", f"fpsTarget={float(fps_target):g}"])
+    if cheats_dir:
+        cmd.extend(["-C", f"cheatsPath={cheats_dir}"])
+        if not cheat_file:
+            cmd.extend(["-C", "cheatAutoload=0"])
+    if cheat_file:
+        cmd.extend(["-c", cheat_file])
+    if savestate:
+        cmd.extend(["-t", savestate])
     if windowed:
         cmd.extend(["-3"])
     else:
@@ -394,47 +909,205 @@ def retry_strategy(session: str, ret: int, elapsed: float, windowed: bool,
     return None
 
 
-def _run_mgba(cmd: list, env: dict) -> int:
-    """Runs mGBA, streaming its log, and returns the exit status."""
-    bindings = load_keybindings()
-    try:
-        child = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                 env=env)
-    except Exception as exc:
-        logger.error("Failed to launch mGBA: %s", exc)
-        return 3
+class MgbaSessionRunner:
+    """Runs mGBA, streams its log, watches input and serves in-game actions.
 
-    monitor = InputMonitor(child, escape_keys={KEY_ESC, bindings.get("keySelect", 8)})
-    monitor.start()
+    With no session this is exactly the old behaviour (one child, one input
+    watcher).  With a session the same child is kept alive across overlays;
+    only a fast-forward speed change performs a *state-preserving* relaunch so
+    mGBA can pick up its native `fpsTarget` override (1x/2x/3x), which its SDL
+    frontend reads at core start.
+    """
 
-    def handle_signal(sig, frame):
-        logger.info("Adapter received signal %d, forwarding to child %d", sig, child.pid)
+    def __init__(self, cmd: list, env: dict, session=None, action_queue=None,
+                 native=None, build_command=None, overlay_size=None,
+                 theme_name: str = "indigo", windowed: bool = False):
+        self.cmd = cmd
+        self.env = env
+        self.session = session
+        self.action_queue = action_queue
+        self.native = native
+        self.build_command = build_command
+        self.overlay_size = overlay_size
+        self.theme_name = theme_name
+        self.windowed = windowed
+        self.child = None
+        self.monitor = None
+        self.bindings = load_keybindings()
+
+    def _spawn(self, cmd: list) -> None:
+        self.child = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT, text=True,
+                                      bufsize=1, env=self.env)
+        if self.native is not None:
+            self.native.proc = self.child
+        self.monitor = InputMonitor(
+            self.child,
+            escape_keys={KEY_ESC, self.bindings.get("keySelect", 8)},
+            shortcuts=self.session.shortcuts if self.session else None,
+            action_queue=self.action_queue,
+            keybindings=self.bindings,
+            on_consumed=(self.native.suppress_combo if self.native else None),
+        )
+        self.monitor.start()
+        threading.Thread(target=self._pump_stdout, args=(self.child,),
+                         daemon=True, name="gba-mgba-log").start()
+
+    @staticmethod
+    def _pump_stdout(child) -> None:
         try:
-            child.send_signal(sig)
-        except ProcessLookupError:
+            if child.stdout:
+                for line in iter(child.stdout.readline, ""):
+                    cleaned = line.strip()
+                    if cleaned:
+                        logger.info("[mgba] %s", cleaned)
+                child.stdout.close()
+        except Exception:
             pass
 
-    previous = {}
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        previous[sig] = signal.signal(sig, handle_signal)
+    def _terminate_child(self) -> None:
+        child = self.child
+        if child is None:
+            return
+        try:
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=3.0)
+                except Exception:
+                    child.kill()
+                    child.wait()
+        except Exception:
+            pass
 
-    try:
-        if child.stdout:
-            for line in iter(child.stdout.readline, ""):
-                cleaned = line.strip()
-                if cleaned:
-                    logger.info("[mgba] %s", cleaned)
-            child.stdout.close()
-        ret = child.wait()
-    finally:
-        monitor.stop()
-        for sig, handler in previous.items():
+    def _restart_for_speed(self, fps_target: float) -> bool:
+        """Applies mGBA's fpsTarget natively, resuming at the exact frame."""
+        if self.native is None or not self.build_command:
+            return False
+        state = None
+        try:
+            state = self.native.capture_ephemeral_state()
+        except Exception as exc:
+            logger.warning("Could not capture a state for speed change: %s", exc)
+        if not state:
+            logger.warning("Speed change needs a native state; keeping current speed")
+            return False
+        try:
+            self.monitor.stop()
+            self._terminate_child()
+            cmd = self.build_command(fps_target=fps_target, savestate=state)
+            logger.info("Applying mGBA fpsTarget=%g with native state resume", fps_target)
+            self._spawn(cmd)
+            return True
+        except Exception as exc:
+            logger.error("Speed reload failed (%s); restarting normally", exc)
             try:
-                signal.signal(sig, handler)
+                self._spawn(self.build_command())
             except Exception:
                 pass
-    return ret
+            return False
+
+    def _drain_actions(self) -> None:
+        if self.action_queue is None or self.session is None:
+            return
+        while True:
+            try:
+                action = self.action_queue.get_nowait()
+            except queue.Empty:
+                return
+            self.session.handle_action(action)
+
+    def _serve_overlay(self) -> None:
+        if self.session is None or self.session.overlay is None:
+            return
+        try:
+            from gba_ingame_ui import InGameOverlayRenderer
+            renderer = InGameOverlayRenderer(
+                self.session,
+                self.overlay_size or (960, 640),
+                theme_name=self.theme_name,
+                screenshot_path=getattr(self.native, "last_screenshot", None),
+                windowed=self.windowed,
+                logger=logger,
+                poll_actions=self._drain_actions,
+            )
+            renderer.run()
+        except Exception as exc:
+            logger.warning("In-game overlay unavailable: %s", exc)
+        finally:
+            # Never leave the emulator paused if the display/UI failed.
+            self.session.close_overlay()
+
+    def run(self) -> int:
+        try:
+            self._spawn(self.cmd)
+        except Exception as exc:
+            logger.error("Failed to launch mGBA: %s", exc)
+            return 3
+
+        def handle_signal(sig, frame):
+            child = self.child
+            logger.info("Adapter received signal %d, forwarding to child %d",
+                        sig, getattr(child, "pid", -1))
+            try:
+                if child is not None:
+                    child.send_signal(sig)
+            except (ProcessLookupError, Exception):
+                pass
+
+        previous = {}
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous[sig] = signal.signal(sig, handle_signal)
+
+        try:
+            while True:
+                if self.session is not None and self.action_queue is not None:
+                    try:
+                        action = self.action_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        action = None
+                    if action:
+                        self.session.handle_action(action)
+                    # The overlay loop can also drain actions (e.g. a speed
+                    # change queued while a badge was showing), so serve and
+                    # check for a pending reload on every tick, not only when
+                    # this thread dequeued the action itself.
+                    self._serve_overlay()
+                    if self.session.take_relaunch():
+                        self._restart_for_speed(
+                            self.session.fast_forward.fps_target)
+                else:
+                    time.sleep(0.1)
+                child = self.child
+                if child is None or child.poll() is not None:
+                    break
+            child = self.child
+            ret = child.wait() if child is not None else 0
+        finally:
+            if self.monitor:
+                self.monitor.stop()
+            for sig, handler in previous.items():
+                try:
+                    signal.signal(sig, handler)
+                except Exception:
+                    pass
+            if self.native is not None:
+                try:
+                    self.native.resume()
+                except Exception:
+                    pass
+        return ret
+
+
+def _run_mgba(cmd: list, env: dict, session=None, action_queue=None,
+              native=None, build_command=None, overlay_size=None,
+              theme_name: str = "indigo", windowed: bool = False) -> int:
+    """Runs mGBA, streaming its log, and returns the exit status."""
+    return MgbaSessionRunner(
+        cmd, env, session=session, action_queue=action_queue, native=native,
+        build_command=build_command, overlay_size=overlay_size,
+        theme_name=theme_name, windowed=windowed,
+    ).run()
 
 
 def main():
@@ -491,12 +1164,70 @@ def main():
                 is_windowed, display_scaling,
                 f"{screen[0]}x{screen[1]}" if screen else "unknown")
 
-    cmd = build_mgba_command(mgba_bin, content_path, save_dir, is_windowed,
-                             display_scaling, screen)
+    # --- per-game in-game features (keyed by stable content identity) ------
+    settings = settings_store.load_settings()
+    shortcuts = settings_store.load_shortcuts(settings)
+    game_id = os.environ.get("SYS_ENTRY_ID") or ""
+    if not valid_game_id(game_id):
+        # Fall back to hashing the ROM itself: identity must never be a name.
+        try:
+            game_id = compute_content_id(content_path)
+        except Exception:
+            game_id = ""
+    session = None
+    actions = None
+    native = None
+    cheat_file = None
+    cheats_dir = None
+    runtime_dir = None
+    if valid_game_id(game_id):
+        try:
+            cheat_store = CheatStore(game_id, content_path)
+            state_store = SaveStateStore(game_id)
+            runtime_dir = os.path.join(save_dir, "runtime")
+            os.makedirs(runtime_dir, exist_ok=True)
+            native = MgbaNativeController(None, content_path, save_dir)
+            session = InGameSession(game_id, shortcuts, cheat_store,
+                                    state_store, native)
+            actions = queue.Queue()
+            cheats_dir = cheat_store.cheats_dir
+            cheat_file = cheat_store.write_native()
+            logger.info("In-game features ready for %s (cheats=%d, shortcuts=%s)",
+                        game_id, len(cheat_store.cheats()), shortcuts)
+        except Exception as exc:
+            # A broken optional feature must never stop a game from starting.
+            logger.warning("In-game features unavailable: %s", exc)
+            session, actions, native = None, None, None
+            cheat_file, cheats_dir, runtime_dir = None, None, None
+    else:
+        logger.warning("Invalid game identity; in-game features disabled")
+
+    def make_command(windowed=None, size=None, fps_target=None, savestate=None):
+        return build_mgba_command(
+            mgba_bin, content_path, save_dir,
+            is_windowed if windowed is None else windowed,
+            display_scaling, screen if size is None else size,
+            cheat_file=cheat_file, cheats_dir=cheats_dir,
+            savestate=savestate, fps_target=fps_target,
+            runtime_dir=runtime_dir)
+
+    def reload_command(**kwargs):
+        return make_command(fps_target=kwargs.get("fps_target"),
+                            savestate=kwargs.get("savestate"))
+
+    cmd = make_command()
     logger.info("Executing mGBA: %s", " ".join(cmd))
 
+    run_kwargs = dict(
+        session=session, action_queue=actions, native=native,
+        build_command=reload_command if session else None,
+        overlay_size=screen or (960, 640),
+        theme_name=settings.get("theme", "indigo"),
+        windowed=is_windowed,
+    )
+
     started = time.monotonic()
-    ret = _run_mgba(cmd, env)
+    ret = _run_mgba(cmd, env, **run_kwargs)
     elapsed = time.monotonic() - started
     logger.info("Child mGBA exited with code %d after %.1fs", ret, elapsed)
 
@@ -508,19 +1239,31 @@ def main():
         logger.warning("mGBA failed early; retrying once in a window without SDL video pinning")
         retry_env = dict(os.environ)
         retry_env.pop("SDL_VIDEODRIVER", None)
-        retry_cmd = build_mgba_command(mgba_bin, content_path, save_dir, True, display_scaling)
+        retry_cmd = make_command(windowed=True, size=None)
         logger.info("Retrying: %s", " ".join(retry_cmd))
-        ret = _run_mgba(retry_cmd, retry_env)
+        retry_kwargs = dict(run_kwargs, windowed=True)
+
+        def retry_reload(**kwargs):
+            return make_command(windowed=True, size=None,
+                                fps_target=kwargs.get("fps_target"),
+                                savestate=kwargs.get("savestate"))
+        retry_kwargs["build_command"] = retry_reload if session else None
+        ret = _run_mgba(retry_cmd, retry_env, **retry_kwargs)
     elif strategy and strategy[0] == "card":
         retry_env = dict(env)
         retry_env["SDL_VIDEO_KMSDRM_DEVICE"] = strategy[1]
         logger.warning("mGBA failed early on %s; retrying on %s",
                        env.get("SDL_VIDEO_KMSDRM_DEVICE") or "default", strategy[1])
-        ret = _run_mgba(cmd, retry_env)
+        ret = _run_mgba(cmd, retry_env, **run_kwargs)
 
     # Durability: fsync save files and their directory, then keep a backup.
     sync_directory(save_dir)
     backup_saves(save_dir)
+    if native is not None:
+        try:
+            native.injector.close()
+        except Exception:
+            pass
 
     # If the child died from a signal, propagate it so the supervisor can
     # classify the session faithfully (H9).

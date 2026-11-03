@@ -71,7 +71,9 @@ from common import (
     save_keybindings,
     setup_logging,
 )
+import game_data
 from gba_browser import Browser
+from gba_ingame import button_from_key, button_from_joy_button, buttons_from_hat
 from gba_terminal import TerminalScreen, TerminalSession, TerminalView, key_to_bytes
 from gba_usb import VolumeWatcher, import_roms, list_mounted_volumes
 from library import Library
@@ -841,6 +843,329 @@ class KeyRemapOverlay(Overlay):
                         (x0, y0 + 15 + 5 * 14), c.danger)
 
 
+class ShortcutOverlay(Overlay):
+    """Configure the three in-game action combos through the settings store.
+
+    Controller-first: press two controller buttons (D-pad included), or use
+    the keyboard equivalents from the shared keybinding profile (I3).
+    """
+
+    def __init__(self, shell):
+        super().__init__()
+        self.title = "IN-GAME SHORTCUTS"
+        self.subtitle = "A capture two buttons · R reset · B close"
+        self.width = 360.0
+        self.height = 210.0
+        self.accent = "info"
+        self.actions = list(settings_store.SHORTCUT_ACTIONS)
+        self.index = 0
+        self.listening = False
+        self.captured: List[str] = []
+        self.message = ""
+        self._reload(shell)
+
+    def _reload(self, shell) -> None:
+        self.shortcuts = settings_store.load_shortcuts(shell.settings)
+
+    def handle(self, event, shell) -> None:
+        if event.type == pygame.QUIT:
+            if not shell.appliance_mode:
+                self.close(shell)
+            return
+        if event.type == pygame.KEYDOWN:
+            if self.listening:
+                if event.key == pygame.K_ESCAPE:
+                    self.listening = False
+                    self.captured = []
+                    return
+                button = button_from_key(event.key, shell.keybindings)
+                self._capture(button, shell)
+                return
+            if event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE, pygame.K_x):
+                self.close(shell)
+            elif event.key == pygame.K_UP:
+                self.index = (self.index - 1) % len(self.actions)
+            elif event.key == pygame.K_DOWN:
+                self.index = (self.index + 1) % len(self.actions)
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_z,
+                               pygame.K_SPACE):
+                self.listening = True
+                self.captured = []
+                self.message = ""
+            elif event.key == pygame.K_r:
+                self._reset(shell)
+            return
+        if event.type == pygame.JOYBUTTONDOWN:
+            if self.listening:
+                self._capture(button_from_joy_button(event.button), shell)
+            elif event.button == 0:
+                self.listening = True
+                self.captured = []
+                self.message = ""
+            elif event.button == 1:
+                self.close(shell)
+            return
+        if event.type == pygame.JOYHATMOTION and self.listening:
+            for button in buttons_from_hat(event.value):
+                self._capture(button, shell)
+            return
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            rect = self.content_rect(shell)
+            row = (event.pos[1] - rect.y) // shell.theme.px(30)
+            if 0 <= row < len(self.actions):
+                if row == self.index:
+                    self.listening = True
+                    self.captured = []
+                    self.message = ""
+                else:
+                    self.index = row
+
+    def _capture(self, button: Optional[str], shell) -> None:
+        if not button or button in self.captured:
+            return
+        self.captured.append(button)
+        if len(self.captured) == 2:
+            combo = tuple(self.captured)
+            action = self.actions[self.index]
+            payload = dict(self.shortcuts)
+            payload[action] = combo
+            # Persist through the single settings document (settings.json).
+            settings = settings_store.save_shortcuts(payload, shell.settings)
+            shell.settings.update(settings)
+            self._reload(shell)
+            self.listening = False
+            self.captured = []
+            self.message = f"Saved {settings_store.shortcut_label(list(combo))}"
+
+    def _reset(self, shell) -> None:
+        defaults = {action: settings_store.DEFAULT_SHORTCUTS[
+            settings_store.SHORTCUT_SETTING_FOR_ACTION[action]]
+            for action in self.actions}
+        settings = settings_store.save_shortcuts(defaults, shell.settings)
+        shell.settings.update(settings)
+        self._reload(shell)
+        self.message = "Shortcuts reset to defaults"
+        shell.toast("In-game shortcuts reset", TOAST_OK)
+
+    def draw_body(self, shell) -> None:
+        theme, c = shell.theme, shell.theme.colors
+        rect = self.content_rect(shell)
+        x0, y0 = rect.x / theme.scale, rect.y / theme.scale
+        width = rect.width / theme.scale
+        for index, action in enumerate(self.actions):
+            y = y0 + index * 30
+            row = theme.rect(x0, y, width, 26)
+            selected = index == self.index
+            if selected:
+                pygame.draw.rect(shell.surface, c.card_sel, row,
+                                 border_radius=theme.px(4))
+                pygame.draw.rect(shell.surface, c.info, row, width=1,
+                                 border_radius=theme.px(4))
+            theme.label(shell.surface, settings_store.SHORTCUT_LABELS[action],
+                        (x0 + 6, y + 4), c.text if selected else c.text_muted,
+                        key="body")
+            if selected and self.listening:
+                value = " + ".join(settings_store.SHORTCUT_BUTTON_LABELS.get(b, b)
+                                   for b in self.captured) + " ..."
+            else:
+                value = settings_store.shortcut_label(list(self.shortcuts[action]))
+            theme.label(shell.surface, value, (x0 + width - 6, y + 4),
+                        c.highlight if selected else c.info, align="right")
+        if self.listening:
+            theme.label(shell.surface, "PRESS TWO DISTINCT BUTTONS",
+                        (x0 + 6, y0 + 3 * 30 + 6), c.highlight)
+        elif self.message:
+            theme.label(shell.surface, self.message,
+                        (x0 + 6, y0 + 3 * 30 + 6), c.success)
+
+
+class StrongConfirmOverlay(Overlay):
+    """Delete-all guard: hold A / Enter for two seconds, with a visible bar."""
+
+    HOLD_SECONDS = 2.0
+
+    def __init__(self, title: str, message: str, on_confirm=None,
+                 confirm_label: str = "HOLD TO DELETE"):
+        super().__init__()
+        self.title = title
+        self.message = message
+        self.on_confirm = on_confirm
+        self.confirm_label = confirm_label
+        self.accent = "danger"
+        self.width = 340.0
+        self.height = 150.0
+        self.hold_started = None
+        self.done = False
+
+    def handle(self, event, shell) -> None:
+        if self.done:
+            return
+        if event.type == pygame.QUIT:
+            if not shell.appliance_mode:
+                self.close(shell)
+            return
+        if event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE, pygame.K_x):
+                self.close(shell)
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER,
+                               pygame.K_z, pygame.K_SPACE):
+                self.hold_started = time.monotonic()
+        elif event.type == pygame.KEYUP:
+            if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER,
+                             pygame.K_z, pygame.K_SPACE):
+                self.hold_started = None
+        elif event.type == pygame.JOYBUTTONDOWN:
+            if event.button == 0:
+                self.hold_started = time.monotonic()
+            elif event.button == 1:
+                self.close(shell)
+        elif event.type == pygame.JOYBUTTONUP and event.button == 0:
+            self.hold_started = None
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self.hold_started = time.monotonic()
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self.hold_started = None
+
+    def draw_body(self, shell) -> None:
+        theme, c = shell.theme, shell.theme.colors
+        rect = self.rect(shell)
+        font = theme.font("body")
+        for index, line in enumerate(wrap_text(font, self.message,
+                                               rect.width - theme.px(24), 3)):
+            surf = font.render(line, True, c.text)
+            shell.surface.blit(surf, (rect.x + theme.px(12),
+                                      rect.y + theme.px(38 + index * 12)))
+        bar = theme.rect(rect.x / theme.scale + 12,
+                         rect.bottom / theme.scale - 36,
+                         rect.width / theme.scale - 24, 9)
+        progress = 0.0
+        if self.hold_started is not None:
+            progress = min(1.0, (time.monotonic() - self.hold_started) /
+                           self.HOLD_SECONDS)
+        theme.bar(shell.surface, bar, progress, c.danger)
+        theme.label(shell.surface, self.confirm_label,
+                    (rect.centerx / theme.scale,
+                     rect.bottom / theme.scale - 22), c.danger,
+                    key="micro", align="center")
+        if progress >= 1.0 and not self.done:
+            self.done = True
+            self.close(shell)
+            if self.on_confirm:
+                self.on_confirm()
+
+
+class GameManagementOverlay(Overlay):
+    """Multi-select list for permanently deleting imported games."""
+
+    def __init__(self, shell):
+        super().__init__()
+        self.title = "DELETE SELECTED GAMES"
+        self.subtitle = "A toggle · Start/D delete · B back"
+        self.accent = "danger"
+        self.width = 380.0
+        self.height = 260.0
+        self.index = 0
+        self.selected: set = set()
+        self.items = self._candidates(shell)
+
+    @staticmethod
+    def _candidates(shell) -> List[Dict[str, Any]]:
+        return [g for g in shell.games
+                if g.get("type") == "game" and g.get("content_path")
+                and os.path.isfile(g["content_path"])]
+
+    def handle(self, event, shell) -> None:
+        if event.type == pygame.QUIT:
+            if not shell.appliance_mode:
+                self.close(shell)
+            return
+        if event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE, pygame.K_x):
+                self.close(shell)
+            elif event.key == pygame.K_UP:
+                self.index = (self.index - 1) % max(1, len(self.items))
+            elif event.key == pygame.K_DOWN:
+                self.index = (self.index + 1) % max(1, len(self.items))
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER,
+                               pygame.K_z, pygame.K_SPACE) and self.items:
+                self._toggle(self.index)
+            elif event.key in (pygame.K_d, pygame.K_DELETE):
+                self._confirm(shell)
+        elif event.type == pygame.JOYBUTTONDOWN:
+            if event.button == 0 and self.items:
+                self._toggle(self.index)
+            elif event.button == 1:
+                self.close(shell)
+            elif event.button in (7, 9):
+                self._confirm(shell)
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            rect = self.content_rect(shell)
+            row = (event.pos[1] - rect.y) // shell.theme.px(20)
+            if 0 <= row < len(self.items):
+                self._toggle(row)
+
+    def _toggle(self, index: int) -> None:
+        if index in self.selected:
+            self.selected.discard(index)
+        else:
+            self.selected.add(index)
+        self.index = index
+
+    def _confirm(self, shell) -> None:
+        if not self.selected:
+            shell.toast("Select at least one game", TOAST_WARN)
+            return
+        chosen = [self.items[i] for i in sorted(self.selected)]
+
+        def do_delete():
+            result = game_data.delete_all_games(
+                chosen, library=shell.library, favorites=shell.favorites)
+            logger.warning("Deleted %d selected game(s): %s",
+                           result["roms"], result["errors"])
+            shell.close_overlays()
+            shell.rescan_library(quiet=True)
+            shell.toast(f"Deleted {result['roms']} game(s)", TOAST_OK)
+
+        shell.push_overlay(ConfirmOverlay(
+            "DELETE SELECTED GAMES?",
+            f"Permanently remove {len(chosen)} ROM(s) and all their cheats "
+            f"and save states. This cannot be undone.",
+            "DELETE", True, do_delete))
+
+    def draw_body(self, shell) -> None:
+        theme, c = shell.theme, shell.theme.colors
+        rect = self.content_rect(shell)
+        x0, y0 = rect.x / theme.scale, rect.y / theme.scale
+        width = rect.width / theme.scale
+        if not self.items:
+            theme.text(shell.surface, "No imported ROMs to delete",
+                       (x0 + 4, y0 + 6), "body", c.text_muted)
+            return
+        visible = min(len(self.items), 9)
+        start = max(0, min(self.index - visible + 1, len(self.items) - visible))
+        for offset, index in enumerate(range(start, start + visible)):
+            item = self.items[index]
+            y = y0 + offset * 20
+            row = theme.rect(x0, y, width, 18)
+            checked = index in self.selected
+            if index == self.index:
+                pygame.draw.rect(shell.surface, c.card_sel, row,
+                                 border_radius=theme.px(3))
+                pygame.draw.rect(shell.surface, c.danger, row, width=1,
+                                 border_radius=theme.px(3))
+            theme.label(shell.surface, "[X]" if checked else "[ ]",
+                        (x0 + 5, y + 4), c.danger if checked else c.text_dim,
+                        key="small")
+            theme.label(shell.surface, truncate(theme.font("small"),
+                                                item.get("title", ""),
+                                                theme.px(width - 40)),
+                        (x0 + 26, y + 4), c.text if index == self.index
+                        else c.text_muted)
+        theme.label(shell.surface,
+                    f"{len(self.selected)} selected · Start/D delete (asks first)",
+                    (x0 + 4, y0 + visible * 20 + 4), c.highlight, key="micro")
+
+
 class UsbManagerOverlay(Overlay):
     """Manual import surface: lists mounted volumes and imports on request."""
 
@@ -1258,6 +1583,8 @@ class GBALauncher:
         self.settings_entries = self.library.get_settings_entries()
         self.keybindings = load_keybindings()
         self.history = load_play_history()
+        # Favorites are keyed by the stable content id, persisted in DATA/config.
+        self.favorites = game_data.Favorites()
 
         self.current_tab = max(0, min(len(TABS) - 1, initial_tab))
         self.selected = [0] * len(TABS)
@@ -1305,6 +1632,7 @@ class GBALauncher:
 
         if demo:
             self.games = self._demo_entries()
+            self._reorder_games(preserve=False)
             self._apply_focus()
         else:
             self.scanner = self.library.start_scan()
@@ -1385,11 +1713,47 @@ class GBALauncher:
         }
         return entries
 
+    def _reorder_games(self, preserve: bool = True,
+                       target_id: Optional[str] = None) -> None:
+        """Refresh favorites-first visibility, keeping the selection stable.
+
+        `self.games` stays in canonical library order (scan order); the
+        favorites-first ordering is a *stable partition* computed in
+        `visible_games()`.  Sorting the canonical list itself would make the
+        result depend on the order in which games were favorited and would
+        stop an unfavorited game from returning to its original position.
+        """
+        items = self.visible_games()
+        if preserve and target_id is None:
+            index = self.selected[TAB_GAMES]
+            if 0 <= index < len(items):
+                target_id = items[index]["id"]
+        if target_id:
+            for position, game in enumerate(items):
+                if game["id"] == target_id:
+                    self.selected[TAB_GAMES] = position
+                    return
+        self._clamp()
+
+    def toggle_favorite(self, item: Optional[Dict[str, Any]] = None) -> bool:
+        """Favorite/unfavorite one game immediately, keeping it selected."""
+        current = self.current_item() if self.current_tab == TAB_GAMES else None
+        item = item or current
+        if not item or item.get("type") != "game" or self.current_tab != TAB_GAMES:
+            return False
+        selected_id = current.get("id") if current else None
+        is_favorite = self.favorites.toggle(item.get("id", ""))
+        self._reorder_games(target_id=selected_id)
+        self.toast(("★ Favorite: " if is_favorite else "Unfavorited: ") +
+                   item.get("title", ""), TOAST_OK if is_favorite else TOAST_INFO)
+        return is_favorite
+
     def visible_games(self) -> List[Dict[str, Any]]:
+        games = self.favorites.order(self.games)
         if not self.filter_text:
-            return self.games
+            return games
         needle = self.filter_text.lower()
-        return [g for g in self.games
+        return [g for g in games
                 if needle in g.get("title", "").lower() or needle in g.get("filename", "").lower()]
 
     def items_for_tab(self, tab: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -1477,6 +1841,7 @@ class GBALauncher:
     def update(self) -> None:
         if self.scanner is not None and self.scanner.done:
             self.games = self.scanner.entries
+            self._reorder_games(preserve=False)
             self.scanner = None
             if not self._focus_applied:
                 self._apply_focus()
@@ -1493,7 +1858,7 @@ class GBALauncher:
             self.toast_text = ""
 
     def _apply_focus(self) -> None:
-        items = self.games
+        items = self.visible_games()      # selection indexes the sorted shelf
         if not items:
             return
         self._focus_applied = True
@@ -1754,6 +2119,8 @@ class GBALauncher:
                 self.activate_current()
             elif event.button == 1:
                 self.back()
+            elif event.button == 2 and self.current_tab == TAB_GAMES:
+                self.toggle_favorite()
             elif event.button in (7, 9):
                 self.switch_tab(1)
             elif event.button in (6, 8):
@@ -1762,6 +2129,10 @@ class GBALauncher:
     def _handle_key(self, event) -> None:
         key = event.key
         mod = getattr(event, "mod", 0)
+        if key == pygame.K_f and (mod & pygame.KMOD_CTRL) and \
+                self.current_tab == TAB_GAMES:
+            self.toggle_favorite()
+            return
         if key == pygame.K_TAB:
             self.switch_tab(-1 if mod & pygame.KMOD_SHIFT else 1)
         elif key == pygame.K_RIGHT:
@@ -2036,6 +2407,7 @@ class GBALauncher:
             "internal_settings_audio": lambda: self.open_settings_page("audio"),
             "internal_settings_controls": lambda: self.open_settings_page("controls"),
             "internal_settings_library": lambda: self.open_settings_page("library"),
+            "internal_settings_games": lambda: self.open_settings_page("games"),
             "internal_settings_storage": lambda: self.open_settings_page("storage"),
             "internal_settings_system": lambda: self.open_settings_page("system"),
             "internal_reboot": lambda: self.confirm_system("Reboot to the GRUB menu?",
@@ -2143,12 +2515,14 @@ class GBALauncher:
             "audio": self._rows_audio,
             "controls": self._rows_controls,
             "library": self._rows_library,
+            "games": self._rows_games,
             "storage": self._rows_storage,
             "system": self._rows_system,
         }
         titles = {
             "display": "DISPLAY", "audio": "AUDIO", "controls": "CONTROLS",
-            "library": "LIBRARY", "storage": "STORAGE & SAVES", "system": "SYSTEM",
+            "library": "LIBRARY", "games": "GAME MANAGEMENT",
+            "storage": "STORAGE & SAVES", "system": "SYSTEM",
         }
         builder = builders.get(section)
         if builder:
@@ -2215,6 +2589,7 @@ class GBALauncher:
         ]
 
     def _rows_controls(self) -> List[dict]:
+        s = self.settings
         return [
             {"type": "action", "label": "Remap buttons",
              "hint": "Rebind all ten GBA buttons for shell and emulator.",
@@ -2228,6 +2603,18 @@ class GBALauncher:
             {"type": "action", "label": "Reset bindings",
              "hint": "Restore the shipped defaults.",
              "action": lambda shell: shell.reset_keybindings()},
+            {"type": "action", "label": "In-game shortcuts",
+             "hint": "Configure cheats, fast-forward and save-state combos.",
+             "action": lambda shell: shell.push_overlay(ShortcutOverlay(shell))},
+            {"type": "info", "label": "Cheats overlay",
+             "value": settings_store.shortcut_label(s["shortcut_cheats"]),
+             "hint": "Open the per-game cheats overlay while playing."},
+            {"type": "info", "label": "Fast-forward cycle",
+             "value": settings_store.shortcut_label(s["shortcut_fast_forward"]),
+             "hint": "1x → 2x → 3x → 1x, one step per press."},
+            {"type": "info", "label": "Save states overlay",
+             "value": settings_store.shortcut_label(s["shortcut_save_states"]),
+             "hint": "Nine per-game save-state slots with thumbnails."},
         ]
 
     def _rows_library(self) -> List[dict]:
@@ -2255,6 +2642,62 @@ class GBALauncher:
             {"type": "info", "label": "Games folder", "value": get_games_dir(),
              "hint": "Copy .gba/.gbc/.gb files here or use a pendrive."},
         ]
+
+    def _deletable_games(self) -> List[Dict[str, Any]]:
+        """Only real imported ROMs, never demo cartridges or built-in apps."""
+        return [g for g in self.games
+                if g.get("type") == "game" and g.get("content_path")
+                and os.path.isfile(g["content_path"])]
+
+    def _rows_games(self) -> List[dict]:
+        games = self._deletable_games()
+        return [
+            {"type": "info", "label": "Imported games", "value": str(len(games)),
+             "hint": "ROM files found in the games folder."},
+            {"type": "info", "label": "Favorites",
+             "value": str(len(self.favorites.ids())),
+             "hint": "Ctrl+F or controller X toggles a favorite in GAMES."},
+            {"type": "action", "label": "Delete Selected Games",
+             "hint": "Choose multiple ROMs; each deletion asks for confirmation.",
+             "action": lambda shell: shell.push_overlay(GameManagementOverlay(shell))},
+            {"type": "action", "label": "Delete All Imported Games",
+             "hint": "Hold A for two seconds after a second confirmation.",
+             "action": lambda shell: shell.confirm_delete_all()},
+        ]
+
+    def confirm_delete_all(self) -> None:
+        games = self._deletable_games()
+        if not games:
+            self.toast("No imported games to delete", TOAST_WARN)
+            return
+        # Two gates: an explicit yes/no first, then a deliberate two-second
+        # hold. A single accidental Enter can never remove the library.
+        self.push_overlay(ConfirmOverlay(
+            "DELETE ALL IMPORTED GAMES?",
+            f"Permanently remove ALL {len(games)} imported ROM(s) and their "
+            f"cheats, save states and thumbnails. This cannot be undone.",
+            "CONTINUE", True, self._hold_confirm_delete_all))
+
+    def _hold_confirm_delete_all(self) -> None:
+        self.push_overlay(StrongConfirmOverlay(
+            "LAST CHANCE — DELETE ALL",
+            "Hold A / Enter for two seconds to permanently delete every "
+            "imported ROM and its per-game data. Press B to cancel.",
+            on_confirm=self.delete_all_games,
+            confirm_label="HOLD [A] FOR 2 SECONDS TO DELETE ALL"))
+
+    def delete_all_games(self) -> None:
+        games = self._deletable_games()
+        if not games:
+            self.toast("No imported games to delete", TOAST_WARN)
+            return
+        result = game_data.delete_all_games(
+            games, library=self.library, favorites=self.favorites)
+        logger.warning("Deleted all imported games: %d ROM(s), errors=%s",
+                       result["roms"], result["errors"])
+        self.close_overlays()
+        self.rescan_library(quiet=True)
+        self.toast(f"Deleted {result['roms']} game(s)", TOAST_OK)
 
     def _rows_storage(self) -> List[dict]:
         info = settings_store.storage_info(get_data_dir()) or {}
@@ -2385,7 +2828,13 @@ class GBALauncher:
             "  Ctrl+V          toggle cartridge/list view",
             "  F1              help",
             "  F12             screenshot to DATA/screenshots",
+            "  Ctrl+F          favorite / unfavorite a game (pad X)",
             "  typing          search the games shelf",
+            "",
+            "IN-GAME (Settings -> Controls -> In-game shortcuts)",
+            "  UP + LEFT       cheats overlay (per game)",
+            "  L + R           fast-forward cycle (1x/2x/3x)",
+            "  LEFT + RIGHT    save states (9 slots, per game)",
             "",
             "MAIN TABS",
             "  GAMES     cartridge shelf, A to play",
@@ -2410,10 +2859,15 @@ class GBALauncher:
             "  Tab / Alt+Tab    switch main tabs",
             "  Start            next tab",
             "  type to search   Backspace edits",
+            "  Ctrl+F / pad X   favorite (always listed first)",
             "",
-            "GAME",
+            "GAME (shortcuts are configurable in Settings -> Controls)",
             "  Esc              quit the emulator, back to the library",
             "  SELECT+START     same, from a controller",
+            "  UP + LEFT        cheats for this game only",
+            "  L + R            fast-forward: 1x -> 2x -> 3x -> 1x",
+            "  LEFT + RIGHT     nine save-state slots",
+            "  B / Esc          close an in-game overlay",
             "",
             "TERMINAL",
             "  Ctrl+Alt+T       toggle the terminal from anywhere",
@@ -2682,6 +3136,13 @@ class GBALauncher:
             return [("[A]", "open", c.primary),
                     ("[↑↓]", "select", c.text_muted),
                     ("[Tab]", "next tab", c.info)]
+        if tab == TAB_GAMES:
+            return [("(A)", "select", c.primary),
+                    ("(B)", "back", c.text_muted),
+                    ("(D-Pad)", "navigate", c.text_muted),
+                    ("Ctrl+F / X", "favorite", c.highlight),
+                    ("[Tab]", "tab", c.info),
+                    ("type", "search", c.text_dim)]
         return [("(A)", "select", c.primary),
                 ("(B)", "back", c.text_muted),
                 ("(D-Pad)", "navigate", c.text_muted),
@@ -2729,8 +3190,11 @@ class GBALauncher:
             cell = pygame.Rect(origin_x + col * (tile_w + gap),
                                origin_y + row * (tile_h + gap), tile_w, tile_h)
             selected = item_index == index
-            badge = "NEW" if item.get("id") in self.history and \
-                time.time() - self.history[item["id"]].get("last_played", 0) < 86400 else None
+            favorite = self.favorites.is_favorite(item.get("id", ""))
+            badge = "FAV" if favorite else (
+                "NEW" if item.get("id") in self.history and
+                time.time() - self.history[item["id"]].get("last_played", 0) < 86400
+                else None)
             theme.cartridge(self.surface, cell, item.get("title", ""),
                             item.get("format", "GBA"), item.get("id", ""),
                             selected=selected, badge=badge)
@@ -2780,6 +3244,11 @@ class GBALauncher:
                 subtitle = f"{human_size(item['size_bytes'])} · {item.get('id', '')[:8]}"
             theme.label(self.surface, truncate(theme.font("micro"), subtitle, theme.px(text_w)),
                         (text_x, box.y / theme.scale + 18.5), c.text_dim, key="micro")
+            if self.current_tab == TAB_GAMES and \
+                    self.favorites.is_favorite(item.get("id", "")):
+                theme.label(self.surface, "FAV",
+                            (box.right / theme.scale - 24,
+                             box.y / theme.scale + 2), c.highlight, key="micro")
             if selected:
                 theme.label(self.surface, ">", (box.right / theme.scale - 7,
                                                 box.y / theme.scale + 2), c.highlight)
@@ -2847,6 +3316,8 @@ class GBALauncher:
                 ("Format", item.get("format", "GBA")),
                 ("Size", human_size(item.get("size_bytes", 0))),
                 ("Save", human_size(summary["bytes"]) if summary["files"] else "none"),
+                ("Favorite", "YES" if self.favorites.is_favorite(
+                    item.get("id", "")) else "no"),
             ]
             if record:
                 info.append(("Played", f"{record.get('sessions', 0)}x"))

@@ -220,6 +220,22 @@ class Library:
             logger.info("Registered %d imported file(s) in the library cache", added)
         return added
 
+    def forget_path(self, path: str) -> bool:
+        """Drops one deleted ROM from the disposable scan cache.
+
+        Game Management removes the file itself; without this, a stale cache
+        entry would keep reappearing as a known content id until the next full
+        re-hash (and could make a re-imported copy look already present).
+        """
+        if not path:
+            return False
+        with self._cache_lock:
+            if path not in self._cache:
+                return False
+            del self._cache[path]
+            self._save_cache()
+        return True
+
     def count_content_files(self) -> int:
         """Cheap extension-only count used by the empty state hint."""
         total = 0
@@ -341,6 +357,15 @@ class Library:
                 "format": "LIB",
                 "description": "View mode, USB auto-import and rescanning",
                 "handler": "internal_settings_library",
+                "args": []
+            },
+            {
+                "id": "setting_game_management",
+                "title": "Game Management",
+                "type": "settings",
+                "format": "GAM",
+                "description": "Delete imported ROMs and their per-game data",
+                "handler": "internal_settings_games",
                 "args": []
             },
             {

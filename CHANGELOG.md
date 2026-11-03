@@ -4,6 +4,54 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — in-game cheats, nine save states, fast-forward, favorites
+
+Everything below is additive to the existing supervisor → launcher → mgba-adapter architecture.
+The USB import path, the display/fullscreen fix, the existing `.sav/.srm` backup and the five-tab
+shell are untouched; the overlays are rendered inside the handler with the existing pygame/Theme
+toolkit, not a new GUI framework or a competing save system.
+
+### Added
+
+- **Three configurable in-game actions** (`Up+Left` cheats, `L+R` fast-forward, `Left+Right` save
+  states) in `DATA/config/settings.json`, editable at **SETTINGS → Controls → In-game shortcuts**.
+  `src/gba_ingame.py` has an edge-triggered `ComboRouter`: one action per deliberate two-button
+  press, never on key repeat, with consumed buttons released so they cannot also reach gameplay.
+- **Per-game Cheats overlay**: `CheatStore` in `src/game_data.py` keys `cheats.json` and an mGBA
+  native `.cheats` file by the library's stable content id; mGBA loads it with `-c`, and
+  `cheatAutoload=0` prevents a global list from appearing. Enabled/disabled state persists per game.
+- **Fast-forward cycle** `1x → 2x → 3x → Normal` using mGBA's real `fpsTarget` (60/120/180), a
+  temporary badge-only overlay, and a state-preserving in-session reload (mgba-sdl has no runtime
+  speed IPC). No artificial frame skipping or manual timing.
+- **Nine save-state slots**: real `.ss` files produced by mGBA's Shift+F1–F9 / F1–F9 hotkeys and
+  separate F12 PNG thumbnails, archived under `DATA/saves/<content-id>/states/slot_N/` with
+  `slots.json` metadata (timestamp, size, SHA-256). Occupied slots offer `Load Save` and a
+  confirmation-gated `Overwrite Save`. Missing/corrupt/partial files are detected and fail
+  gracefully; a failed metadata write rolls back to the previous good save.
+- **Favorites** (`Ctrl+F` / pad `X`, `DATA/config/favorites.json`): stable favorites-first
+  partition by content id, preserving relative order in both groups.
+- **SETTINGS → Game Management**: multi-select `Delete Selected Games` with confirmation and
+  `Delete All Imported Games` with confirmation plus a two-second hold. Deletion removes the ROM,
+  its per-game cheats/states/runtime data, its favorite flag and its library-cache entry.
+- `gba-selftest` now checks the three new modules and warns when neither `/dev/uinput` nor
+  `xdotool` can deliver mGBA's native hotkeys.
+
+### Changed
+
+- `scripts/install.sh` and `Makefile` install/lint the three new handler modules.
+- 89 focused tests added for cheat isolation/persistence, the exact speed cycle and held-combo
+  behaviour, nine-slot save/load/overwrite/persistence/corruption, shortcut configuration, native
+  mGBA command flags and hotkeys, headless overlay rendering, favorites, and deletion safety.
+
+### Real-hardware-only verification
+
+Native hotkey delivery (`/dev/uinput` or X11 `xdotool`), the exact audio pacing of `fpsTarget`,
+sharing a KMS/DRM display between mGBA and the overlay, and the state-preserving speed reload are
+not observable in the headless suite. Cheat toggles are persisted immediately but mGBA applies them
+on the next launch, since closing an overlay must never restart the game.
+
+---
+
 ## [Unreleased] — import identity and display geometry fixes
 
 Two runtime bugs fixed with the smallest changes that solve them; no subsystem was redesigned
