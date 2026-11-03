@@ -3,7 +3,8 @@
 PYTHON ?= python3
 SRC     = src/gba_launcher.py src/gba_supervisor.py src/gba_adapter_mgba.py \
           src/gba_recovery.py src/common.py src/library.py src/config.py \
-          src/theme.py src/gba_terminal.py src/gba_browser.py src/gba_usb.py
+          src/theme.py src/gba_terminal.py src/gba_browser.py src/gba_usb.py \
+          src/game_data.py src/gba_ingame.py src/gba_ingame_ui.py
 TESTS   = tests
 
 all: test

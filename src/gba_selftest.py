@@ -69,7 +69,8 @@ def check_python() -> Check:
 def check_modules() -> List[Check]:
     results = []
     modules = ["common", "config", "theme", "library", "gba_terminal",
-               "gba_browser", "gba_usb", "gba_launcher", "gba_supervisor"]
+               "gba_browser", "gba_usb", "gba_launcher", "gba_supervisor",
+               "game_data", "gba_ingame", "gba_ingame_ui"]
     for name in modules:
         try:
             __import__(name)
@@ -221,6 +222,18 @@ def check_config_roundtrip(data_dir: str) -> Check:
         config.get_data_dir = previous
 
 
+def check_native_hotkeys() -> Check:
+    """Save states/cheats need mGBA's native hotkeys to be deliverable."""
+    if os.path.exists("/dev/uinput"):
+        return Check("native:hotkeys", PASS, "/dev/uinput available")
+    if os.environ.get("DISPLAY") and shutil.which("xdotool"):
+        return Check("native:hotkeys", PASS, "xdotool available on X11")
+    return Check("native:hotkeys", WARN,
+                 "no /dev/uinput and no xdotool on X11",
+                 "In-game save states, overlays and fast-forward will open but "
+                 "native capture/load cannot run; add uinput access or xdotool.")
+
+
 def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
     try:
         _import(src_hint)
@@ -229,7 +242,8 @@ def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
                       "The shell's src directory is missing from this install.")]
 
     checks: List[Check] = [check_python(), check_fonts(), check_pty(),
-                           check_display(), check_mgba()]
+                           check_display(), check_mgba(),
+                           check_native_hotkeys()]
     checks.extend(check_modules())
     checks.extend(check_pygame())
     checks.extend(check_storage(data_dir, games_dir))

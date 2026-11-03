@@ -23,6 +23,53 @@ SETTINGS_VERSION = 1
 # native resolution and fills the whole display without letterboxing.
 DESIGN_HEIGHT = 320
 
+# ---------------------------------------------------------------------------
+# In-game actions (see src/gba_ingame.py and the mGBA handler).
+#
+# Shortcuts are expressed as *GBA button combinations*, not raw keyboard
+# codes: the controller stays the primary device and the shared keybinding
+# profile (common.load_keybindings) supplies the keyboard fallback.  A combo
+# is a pair of distinct button ids from GBA_BUTTON_ORDER.
+# ---------------------------------------------------------------------------
+ACTION_CHEATS = "cheats"
+ACTION_FAST_FORWARD = "fast_forward"
+ACTION_SAVE_STATES = "save_states"
+
+SHORTCUT_ACTIONS = (ACTION_CHEATS, ACTION_FAST_FORWARD, ACTION_SAVE_STATES)
+
+SHORTCUT_SETTING_FOR_ACTION = {
+    ACTION_CHEATS: "shortcut_cheats",
+    ACTION_FAST_FORWARD: "shortcut_fast_forward",
+    ACTION_SAVE_STATES: "shortcut_save_states",
+}
+
+SHORTCUT_LABELS = {
+    ACTION_CHEATS: "Cheats Overlay",
+    ACTION_FAST_FORWARD: "Fast-Forward Cycle",
+    ACTION_SAVE_STATES: "Save States Overlay",
+}
+
+DEFAULT_SHORTCUTS: Dict[str, List[str]] = {
+    # Arrow Up + Arrow Left (D-Pad up + D-Pad left on a controller)
+    "shortcut_cheats": ["keyUp", "keyLeft"],
+    # L + R pressed together
+    "shortcut_fast_forward": ["keyL", "keyR"],
+    # Arrow Left + Arrow Right
+    "shortcut_save_states": ["keyLeft", "keyRight"],
+}
+
+# The button ids are the same ones the shared keybinding profile uses (I3).
+SHORTCUT_BUTTON_IDS = (
+    "keyUp", "keyDown", "keyLeft", "keyRight", "keySelect",
+    "keyA", "keyB", "keyL", "keyR", "keyStart",
+)
+
+SHORTCUT_BUTTON_LABELS = {
+    "keyUp": "UP", "keyDown": "DOWN", "keyLeft": "LEFT", "keyRight": "RIGHT",
+    "keySelect": "SELECT", "keyA": "A", "keyB": "B", "keyL": "L",
+    "keyR": "R", "keyStart": "START",
+}
+
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "version": SETTINGS_VERSION,
     # Display
@@ -40,7 +87,60 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # Misc
     "confirm_launch": True,
     "browser_home": "about:welcome",
+    # In-game action shortcuts (controller buttons, keyboard fallback via I3)
+    **{key: list(value) for key, value in DEFAULT_SHORTCUTS.items()},
 }
+
+
+def normalise_shortcut(value: Any, default: Optional[List[str]] = None) -> List[str]:
+    """Validates a hand-edited combo, falling back to the shipped default.
+
+    Accepts the JSON form (`["keyL", "keyR"]`) and the convenient text form
+    (`"keyL+keyR"`); anything else — a single button, a duplicate, an unknown
+    id, a three-button combo — is rejected so a broken file can never leave
+    the emulator without a working shortcut.
+    """
+    fallback = list(default or DEFAULT_SHORTCUTS["shortcut_fast_forward"])
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.replace(",", "+").split("+")]
+    elif isinstance(value, (list, tuple)):
+        parts = list(value)
+    else:
+        return fallback
+    parts = [p for p in parts if isinstance(p, str)]
+    if len(parts) != 2 or parts[0] == parts[1] or \
+            any(p not in SHORTCUT_BUTTON_IDS for p in parts):
+        return fallback
+    return parts
+
+
+def shortcut_label(combo) -> str:
+    """Human-readable combo, e.g. `L + R`."""
+    parts = normalise_shortcut(combo)
+    return " + ".join(SHORTCUT_BUTTON_LABELS.get(p, p.upper()) for p in parts)
+
+
+def load_shortcuts(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Tuple[str, ...]]:
+    """Returns {action: (button, button)} for the three in-game actions."""
+    settings = load_settings() if settings is None else settings
+    result = {}
+    for action in SHORTCUT_ACTIONS:
+        key = SHORTCUT_SETTING_FOR_ACTION[action]
+        combo = normalise_shortcut(settings.get(key), DEFAULT_SHORTCUTS[key])
+        result[action] = tuple(combo)
+    return result
+
+
+def save_shortcuts(shortcuts: Dict[str, Any],
+                   settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Persists action combos through the single settings store (settings.json)."""
+    settings = dict(load_settings() if settings is None else settings)
+    for action in SHORTCUT_ACTIONS:
+        key = SHORTCUT_SETTING_FOR_ACTION[action]
+        if action in shortcuts:
+            settings[key] = normalise_shortcut(shortcuts[action], DEFAULT_SHORTCUTS[key])
+    save_settings(settings)
+    return settings
 
 
 SCALING_ALIASES = {
@@ -100,7 +200,11 @@ def load_settings() -> Dict[str, Any]:
             data = json.load(f)
         if isinstance(data, dict):
             for key, value in data.items():
-                if key in DEFAULT_SETTINGS and isinstance(value, type(DEFAULT_SETTINGS[key])):
+                if key in DEFAULT_SHORTCUTS:
+                    # Combos also accept the text form "keyL+keyR", so they
+                    # cannot go through the generic type check below.
+                    settings[key] = normalise_shortcut(value, DEFAULT_SHORTCUTS[key])
+                elif key in DEFAULT_SETTINGS and isinstance(value, type(DEFAULT_SETTINGS[key])):
                     settings[key] = value
     except Exception:
         pass
@@ -110,6 +214,10 @@ def load_settings() -> Dict[str, Any]:
     if settings.get("view_mode") not in ("grid", "list"):
         settings["view_mode"] = "grid"
     settings["volume"] = max(0, min(100, int(settings.get("volume", 85))))
+    # Combos are lists in settings.json: validate them explicitly so a broken
+    # file cannot disable the in-game actions or inject unknown button ids.
+    for shortcut_key, default in DEFAULT_SHORTCUTS.items():
+        settings[shortcut_key] = normalise_shortcut(settings.get(shortcut_key), default)
     return settings
 
 
@@ -120,6 +228,8 @@ def save_settings(settings: Dict[str, Any]) -> None:
     payload = {k: settings.get(k, v) for k, v in DEFAULT_SETTINGS.items()}
     payload["version"] = SETTINGS_VERSION
     payload["scaling"] = normalise_scaling(payload.get("scaling"))
+    for shortcut_key, default in DEFAULT_SHORTCUTS.items():
+        payload[shortcut_key] = normalise_shortcut(payload.get(shortcut_key), default)
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:

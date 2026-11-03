@@ -226,7 +226,8 @@ install_files() {
     done
 
     local mod
-    for mod in common.py library.py config.py theme.py gba_terminal.py gba_browser.py gba_usb.py; do
+    for mod in common.py library.py config.py theme.py gba_terminal.py gba_browser.py gba_usb.py \
+               game_data.py gba_ingame.py gba_ingame_ui.py; do
         [ -f "$REPO_DIR/src/$mod" ] || gb_die "missing source file: src/$mod"
         gb_run install -m 0644 "$REPO_DIR/src/$mod" "$INSTALL_DIR/src/$mod"
     done

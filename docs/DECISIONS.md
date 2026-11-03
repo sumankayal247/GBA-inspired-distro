@@ -618,3 +618,31 @@ emulation thread — the only default-on per-frame overhead the adapter controls
 suspect for stutter on modest hardware; pacing (`audioSync`/`videoSync`/`fpsTarget`) is untouched.
 Verified against mgba-sdl 0.9.3, 0.10.1, 0.10.3 and master (identical GL viewport path; `-C`
 overrides win over `config.ini`; all needed keys mapped in every version).
+
+---
+
+## D-050 In-game features stay inside the mGBA handler
+
+**Status:** Accepted
+
+**Decision.** Cheats, the nine-slot save-state overlay and the fast-forward cycle are implemented as
+handler-side features, not launcher applications and not a replacement emulator. `src/game_data.py`
+owns per-content-id storage, `src/gba_ingame.py` owns display-independent routing/models, and
+`src/gba_ingame_ui.py` renders with the existing `Theme`/pygame primitives while mGBA is paused with
+`SIGSTOP`. Closing an overlay sends `SIGCONT` to the *same* process. Three two-button actions are
+stored in `settings.json` and routed through `ComboRouter`; no key check is hard-coded in the
+feature logic.
+
+**Why.** mgba-sdl has no runtime IPC for cheats, speed or a nine-slot UI. Its supported mechanisms
+are a `-c` cheat file, `-C fpsTarget`, `-t` startup state load, and the F1–F9 / Shift+F1–F9 / F12
+native hotkeys. Using those keeps real state data in mGBA's own `.ssN` files, keeps cheat execution
+inside the emulator, and avoids a competing save system or a second emulator frontend. The only
+process restart is a speed change, which captures a native state first and resumes it with `-t`,
+because `fpsTarget` is read at core start. D-007's "embedding deferred" remains true: this is a
+sidecar overlay, not a thin frontend over libmgba.
+
+**Trade-offs.** Native hotkeys require `/dev/uinput` (or `xdotool` under X11); without them the
+overlays still open/close but capture/load degrade gracefully. Cheat enable/disable changes are
+persisted immediately but take effect on the next launch, since closing the overlay must not restart
+the game. Display sharing under KMS/DRM and audio pacing at 2x/3x can only be verified on the
+appliance.
