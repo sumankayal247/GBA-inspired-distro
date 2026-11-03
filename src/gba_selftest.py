@@ -69,7 +69,7 @@ def check_python() -> Check:
 def check_modules() -> List[Check]:
     results = []
     modules = ["common", "config", "theme", "library", "gba_terminal",
-               "gba_browser", "gba_usb", "gba_launcher", "gba_supervisor",
+               "gba_browser", "gba_usb", "gba_mtp", "gba_launcher", "gba_supervisor",
                "game_data", "gba_ingame", "gba_ingame_ui"]
     for name in modules:
         try:
@@ -222,6 +222,20 @@ def check_config_roundtrip(data_dir: str) -> Check:
         config.get_data_dir = previous
 
 
+def check_mtp() -> Check:
+    """Android phones need a libmtp/GVfs FUSE backend; USB sticks do not."""
+    if shutil.which("jmtpfs"):
+        return Check("android:mtp", PASS, "jmtpfs available (MTP FUSE import)")
+    if shutil.which("gio"):
+        return Check("android:mtp", PASS, "GVfs/GIO MTP backend available")
+    if shutil.which("mtp-detect"):
+        return Check("android:mtp", WARN, "libmtp detection present, no FUSE backend",
+                     "Install jmtpfs: sudo apt install jmtpfs (USB stick import still works).")
+    return Check("android:mtp", WARN, "no MTP backend installed",
+                 "Android File Transfer import needs jmtpfs or GVfs; "
+                 "install with: sudo apt install jmtpfs mtp-tools")
+
+
 def check_native_hotkeys() -> Check:
     """Save states/cheats need mGBA's native hotkeys to be deliverable."""
     if os.path.exists("/dev/uinput"):
@@ -242,7 +256,7 @@ def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
                       "The shell's src directory is missing from this install.")]
 
     checks: List[Check] = [check_python(), check_fonts(), check_pty(),
-                           check_display(), check_mgba(),
+                           check_display(), check_mgba(), check_mtp(),
                            check_native_hotkeys()]
     checks.extend(check_modules())
     checks.extend(check_pygame())

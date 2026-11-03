@@ -646,3 +646,38 @@ overlays still open/close but capture/load degrade gracefully. Cheat enable/disa
 persisted immediately but take effect on the next launch, since closing the overlay must not restart
 the game. Display sharing under KMS/DRM and audio pacing at 2x/3x can only be verified on the
 appliance.
+
+---
+
+## D-051 Android MTP is a FUSE-backed Volume, not a removable disk
+
+**Status:** Accepted
+
+**Decision.** `src/gba_usb.py` owns MTP discovery and mounting alongside pendrive discovery.
+`jmtpfs -l`, `mtp-detect`, `gio mount -l`, USB MTP interface descriptors in
+`/sys/bus/usb/devices` and MTP/GVfs FUSE entries in `/proc/mounts` identify Android phones. An
+unclaimed device is mounted with `jmtpfs -device=<bus>,<dev>` (or reused from an existing GVfs
+`mtp://` mount); each accessible storage becomes an `MtpVolume`. That subclass has
+`removable=False`, a non-`/dev/` URI and its own `SourceIndex` namespace, but otherwise uses the
+existing `Volume.scan_roms`, `find_new_roms`, `SourceIndex`, `VolumeWatcher`, `import_roms`,
+`Library.known_content_ids()` and `Library.register_content()` paths. `parse_mounts()` and
+`list_mounted_volumes()` skip `/dev/fuse`, so FUSE mounts never enter `/sys/block` removability or
+fixed-disk handling.
+MTP-specific media/app directories are skipped only for phone volumes, leaving the pendrive skip
+list and depth unchanged.
+
+**Why.** Android File Transfer is a USB protocol, not USB Mass Storage: there is no partition to
+mount, no `/dev/sdX` and no `/sys/block` removable flag. Treating a phone as a normal disk would
+either miss it entirely or risk applying disk logic to a virtual device. A libmtp/GVfs FUSE path
+makes phone files readable through ordinary `os.walk`/`open`, which is exactly the interface the
+import pipeline already knows. That avoids a second importer, a second identity system, and any
+user-visible ROM copy before confirmation: hashing reads from FUSE, and only `import_roms()` writes
+to GAMES after the user accepts. The content-ID check works across a stick and a phone, so a ROM
+already in the library is neither offered as new nor copied again even under a different filename.
+
+**Trade-offs.** One libmtp session can own a device at a time, so an existing GVfs mount is reused
+rather than mounted twice. A locked phone, charging-only mode or missing `jmtpfs`/FUSE yields no MTP
+source and a diagnostic; pendrives, booting and gameplay are unaffected. `jmtpfs` may buffer an
+opened file in its own temporary storage, so hashing/copying large ROMs is slower than a block
+device. Real phones, vendor MTP quirks, SD-card layouts and FUSE unmount behavior need appliance
+verification; the headless suite uses simulated sysfs, mount tables, commands and FUSE roots.

@@ -296,7 +296,7 @@ class Library:
                 "title": "USB Import",
                 "type": "app",
                 "format": "USB",
-                "description": "Copy ROMs from a pendrive into the library",
+                "description": "Copy ROMs from a pendrive or Android MTP phone into the library",
                 "handler": "internal_usb_import",
                 "args": []
             },

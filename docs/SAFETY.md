@@ -121,6 +121,7 @@ Uninstalling restores `/etc/inittab` from `/etc/inittab.gba-backup` and keeps
 | pygame | The launcher prints what to install and exits `103`; the supervisor goes straight to the recovery console instead of looping |
 | mGBA | The game does not start; the adapter prints "mGBA is not installed" with the install command; saves are untouched |
 | mGBA crashes mid-game | Saves are backed up before the session and restored if the session dies (`restore_backup_if_needed`) |
+| `jmtpfs`/GVfs missing, locked phone, or charging-only USB | No Android MTP source is offered; pendrive import, games and boot are unaffected. MTP is read through a FUSE path — nothing on the phone is written, mounted as a disk, partitioned or formatted |
 | X11 / Wayland | The shell runs directly on KMS/DRM, then on the dummy driver for headless checks |
 | `gba-supervisor` missing | `gba_init.sh` starts a rescue shell, never a black screen |
 | python3 missing | The init prints one line saying so, then starts the rescue shell |
@@ -136,7 +137,7 @@ reports pass / warn / fail per row, with the exact fix for each failure.
 ## 7. How the claims are tested
 
 ```
-make test          # 355 tests: unit, contract, safety
+make test          # 370 tests: unit, contract, safety
 make lint          # python compile + sh/bash syntax of every script
 make iso-check     # what is missing to build an ISO on this machine
 make selftest      # does *this* machine have everything GBA OS needs

@@ -111,7 +111,7 @@ gb_step "Creating the base system in $ROOTFS_DIR"
 debootstrap \
     --variant=minbase \
     --arch=amd64 \
-    --include=systemd,systemd-sysv,udev,kmod,live-boot,live-config,linux-image-amd64,grub2-common,grub-pc-bin,grub-efi-amd64-bin,efibootmgr,parted,sgdisk,e2fsprogs,dosfstools,squashfs-tools,python3,python3-pygame,fonts-dejavu-core,alsa-utils,util-linux \
+    --include=systemd,systemd-sysv,udev,kmod,live-boot,live-config,linux-image-amd64,grub2-common,grub-pc-bin,grub-efi-amd64-bin,efibootmgr,parted,sgdisk,e2fsprogs,dosfstools,squashfs-tools,python3,python3-pygame,fonts-dejavu-core,alsa-utils,util-linux,jmtpfs,mtp-tools \
     bookworm "$ROOTFS_DIR" "${GBA_ISO_MIRROR:-http://deb.debian.org/debian}"
 
 # apt and python inside the chroot need working /dev, /proc and DNS.
