@@ -4,6 +4,94 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — Runtime bug-fix pass (seven reported defects)
+
+Seven defects reported against the in-game and USB-import runtime, fixed in place. No module was
+rewritten, no dependency was added, and the supervisor → launcher → handler architecture is
+unchanged. Suite: **412 passing, 1 skipped** (`make test`).
+
+### Fixed
+
+- **Android MTP never detected** (`src/gba_usb.py`, `src/gba_launcher.py`, `src/gba_selftest.py`,
+  `scripts/install.sh`). Five independent causes, each capable of hiding the phone by itself:
+  `jmtpfs -l` prints its fields **quoted**, and the CSV parser dropped every such row; sysfs
+  detection required interface protocol `1`, while several vendor stacks report `0` (they are still
+  MTP, not PTP-only); a device known only from sysfs had no `mtp://` URI, so the GVfs fallback was
+  never attempted even though it is what mounts the phone; MTP storages report `0`-byte file sizes
+  until a file is read, so those ROMs were filtered out of the scan and aborted imports; and a phone
+  that mounted while locked produced an empty storage that `VolumeWatcher` marked as *seen*, so
+  unlocking it never re-prompted. Also: mount failures now say which stage failed and retry three
+  times at 3 s, then every 15 s; PTP cameras are explicitly not claimed as phones; and the UI thread
+  no longer runs `jmtpfs`/mount commands (it lists already-mounted volumes only).
+- **In-game overlays did not open, and the game froze with no overlay** (`src/gba_ingame.py`,
+  `src/gba_ingame_ui.py`, `src/gba_adapter_mgba.py`). The old design `SIGSTOP`ped mGBA and expected a
+  second pygame process to take the display — but a stopped emulator keeps its SDL/KMS surface, so
+  the overlay could not acquire it and the game stayed frozen behind it. Overlays now use a display
+  handoff: capture a native state + frame while mGBA is running, stop it, draw with the existing
+  `Theme`/pygame code, then start a new mGBA from the captured state (`-t`) at the current speed.
+  If the capture fails the overlay does not open and the game keeps running; the handler's safety
+  net resumes on any failure instead of leaving an emulator stopped.
+- **Save states** (`src/gba_ingame.py`, `src/game_data.py`). Capture happened *after* the emulator was
+  stopped, where native hotkeys are never read, so slots stored nothing. Capture is now part of the
+  handoff while the game is live; the nine slots stay per game, are written atomically, verified by
+  size + SHA-256, and an overwrite keeps the previous state until the new one is verified. The
+  handler's private handoff state is stored outside the user's nine slots.
+- **Cheats overlay** (`src/gba_ingame.py`). Same display cause; additionally a toggle now marks the
+  session dirty, is persisted immediately, and reaches the running game through mGBA's own
+  `-c` cheat file when the overlay closes (previously the game kept the cheat list it started with).
+  The overlay only ever shows the current game's cheats.
+- **Fast-forward** (`src/gba_ingame.py`, `src/gba_adapter_mgba.py`). `L + R` cycles
+  `1x → 2x → 3x → 1x`; each step reloads the emulator from a freshly captured state (mgba-sdl has no
+  runtime speed IPC) and passes `-C fpsTarget=60/120/180`. A reload that could not capture a state no
+  longer runs, so the game cannot end up frozen; the combo is edge-triggered, so holding it is one
+  step, not a loop.
+- **Keyboard `A`/`B` reversed** (`src/common.py`). `DEFAULT_KEYBINDINGS` is now `keyA=122` (`Z`) and
+  `keyB=120` (`X`), and the handler writes that pair into mGBA's `config.ini`. A stored profile that
+  is *exactly* the old stock pair is migrated; any customised profile is left untouched.
+- **No path sends a hotkey to a stopped emulator** (`src/gba_adapter_mgba.py`). State and screenshot
+  capture refuse immediately when the emulator is stopped/handed off instead of burning the timeout.
+
+### Added
+
+- **MTP diagnostics.** `MtpManager.diagnose()` / `mtp_diagnostics()` and `gba-selftest --mtp` print
+  sysfs interfaces, tools, mount root, GVfs, devices, import volumes, last error and one actionable
+  hint. `VolumeWatcher` logs the whole chain once per distinct error.
+- **`list_mounted_mtp_volumes()`** (exported through `src/gba_mtp.py`): lists already-mounted phone
+  storages without running any command, for the import overlay and the launcher's UI thread.
+- **`scripts/install.sh`** now distinguishes "no MTP tools", "no `/dev/fuse`" and "no `fusermount`",
+  each with its own fix, and still only warns.
+- **21 new tests**: `tests/test_mtp.py` grows from 15 to 27 (one per link of the MTP chain, the ISO
+  package list, and the "no subprocess on the UI thread" rule); `tests/test_common.py` (5),
+  `tests/test_adapter.py` (1) and `tests/test_ingame.py` (3) pin the `Z`→`A` / `X`→`B` defaults, the
+  mGBA `config.ini` values, the migration rules and the fast-forward fallback when no overlay can
+  take the display. The new `tests/test_ingame_handoff.py` (22) was added with the handoff itself.
+
+### Changed
+
+- `docs/CONTRACT.md`: new **ST8a** (MTP chain and diagnostics, 0-byte sizes, locked-phone retry),
+  **I6** (shipped keyboard mapping and migration), **SV8** (nine save-state slots), section **5.6**
+  (IG1–IG7: display handoff, no hotkeys to a stopped emulator, idempotent resume) and the matching
+  acceptance tests **T-LIBRARY-5**, **T-INGAME-1…5**, **T-INPUT-4**.
+- `docs/DECISIONS.md`: **D-052** (an overlay needs the display, so the emulator is stopped and
+  restarted from a state — supersedes the `SIGSTOP` mechanism of D-050) and **D-053** (MTP detection
+  is a chain, and every link says what it saw — amends D-051); D-050/D-051 carry amendment notes.
+- `docs/SAFETY.md`: new §6.1 (stopping an emulator is not pausing it) plus fallback rows for a
+  failed overlay, a dead renderer, missing `/dev/fuse` and unavailable input injection.
+- `README.md`: the overlay section describes the handoff honestly, the controls table names the
+  in-game `Z`/`X` mapping, the MTP paragraph names the diagnostics, and the troubleshooting table
+  gains `gba-selftest --mtp` and "overlay does not open".
+- `GAME_PLAN.md`: §19 records the V1 implementation status, the root cause of each of the seven
+  defects, and what still needs physical hardware.
+
+### Real-hardware-only verification
+
+Unchanged and still open: real Android unlock/vendor MTP behaviour, FUSE read/unmount performance,
+DRM/KMS release latency and audio across the overlay restart, `/dev/uinput` hotkey injection on the
+appliance, 2x/3x frame/audio pacing, and overlay scaling on real panels. The headless suite simulates
+states, processes, sysfs entries and mount tables; it does not claim any of the above.
+
+---
+
 ## [Unreleased] — Android phone (MTP) import
 
 An Android phone in **File Transfer (MTP)** mode is now a first-class ROM import source. It is

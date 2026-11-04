@@ -78,7 +78,23 @@ MTP_JMTPFS_ENV = "GBA_MTP_JMTPFS"
 MTP_DETECT_ENV = "GBA_MTP_DETECT"
 MTP_LIST_TIMEOUT = 8.0
 MTP_MOUNT_TIMEOUT = 20.0
+# A locked phone unlocks within seconds of the user noticing the prompt, so the
+# first retry is quick; repeated failures back off to the steady interval
+# instead of running `jmtpfs -l` every watcher tick.
 MTP_RETRY_INTERVAL = 15.0
+MTP_QUICK_RETRY = 3.0
+MTP_QUICK_RETRIES = 3
+# error text → user-facing hint. `jmtpfs`/libmtp report these for the states
+# the contract says must degrade gracefully (locked screen, charging-only).
+MTP_ERROR_HINTS = (
+    ("no mtp device", "No MTP device found. Unlock the phone and choose File Transfer (MTP)."),
+    ("unable to open", "The phone refused the MTP session. Unlock it and approve the USB prompt."),
+    ("permission", "Permission denied opening the phone. Add the user to the 'fuse' group and replug."),
+    ("busy", "The phone is already mounted by another program (close it or use GVfs)."),
+    ("no such device", "The phone disconnected during the mount attempt."),
+    ("timed out", "The phone did not answer in time. Unlock it and try R to rescan."),
+)
+MTP_ROMS_UNREADABLE = "MTP storage is empty or still locked"
 MTP_STORAGE_HINTS = ("internal", "storage", "sd", "card", "phone", "memory",
                      "external", "download", "document", "rom", "game")
 MTP_BUS_RE = re.compile(r"usb[:/](\d+)[,:](\d+)", re.IGNORECASE)
@@ -128,6 +144,10 @@ class Volume:
         return (f"<Volume {self.label} {self.mountpoint} "
                 f"transport={self.transport} removable={self.removable}>")
 
+    #: Some MTP/FUSE backends report a 0-byte size until the file is opened.
+    #: Block devices never do, so this stays off for pendrives.
+    allow_unknown_size = False
+
     def scan_roms(self, max_files: int = 2000, max_depth: int = 5) -> List[Tuple[str, int]]:
         """Returns [(absolute_path, size_bytes)] of ROM files on the volume."""
         if self._roms is not None:
@@ -160,8 +180,11 @@ class Volume:
                 try:
                     size = os.path.getsize(path)
                 except OSError:
+                    # A stat that fails outright means the file is gone (or the
+                    # phone disappeared); only a *reported* 0 is tolerated,
+                    # because that is the MTP/FUSE "size not known yet" case.
                     continue
-                if size <= 0:
+                if size <= 0 and not self.allow_unknown_size:
                     continue
                 found.append((path, size))
                 if len(found) >= max_files:
@@ -317,6 +340,7 @@ class MtpVolume(Volume):
         super().__init__(device=device.uri_value(), mountpoint=mountpoint,
                          label=label, removable=False, total=total, free=free,
                          transport="mtp", skip_dirs=frozenset(_SKIP_DIRS) | MTP_SKIP_DIRS)
+        self.allow_unknown_size = True
         self.mtp_device = device
         self.storage = storage or os.path.basename(mountpoint.rstrip("/"))
         self.mount_root = mount_root or os.path.dirname(mountpoint.rstrip("/"))
@@ -372,17 +396,28 @@ def _mtp_storage_roots(root: str) -> List[Tuple[str, str]]:
     return [(root, os.path.basename(root.rstrip("/")) or "MTP storage")]
 
 
+def _csv_field(value: str) -> str:
+    """One `jmtpfs -l` column without surrounding quotes or padding."""
+    return value.strip().strip('"').strip("'").strip()
+
+
 def parse_jmtpfs_devices(output: str) -> List[MtpDevice]:
     """
     Parses `jmtpfs -l`'s CSV device table:
     bus, dev, productId, vendorId, product, vendor.
+
+    Device *name* fields may be quoted (`"Pixel 7"`) when they contain a comma,
+    so quotes are stripped and the last two columns are optional.
     """
     devices: List[MtpDevice] = []
     for line in _command_text(output).splitlines():
-        if not re.match(r"^\s*\d+\s*,", line):
+        line = line.strip()
+        # Rows start with the bus location; headers and log lines do not.
+        if not re.match(r"^\d+\s*,", line):
             continue
-        parts = [part.strip() for part in line.split(",", 5)]
+        parts = [_csv_field(part) for part in line.split(",", 5)]
         if len(parts) < 4:
+            logger.debug("Unparsed jmtpfs -l row: %r", line)
             continue
         try:
             bus, dev = int(parts[0]), int(parts[1])
@@ -395,6 +430,9 @@ def parse_jmtpfs_devices(output: str) -> List[MtpDevice]:
             manufacturer=parts[5] if len(parts) > 5 else "",
             backend="jmtpfs",
         ))
+    if not devices and _command_text(output).strip():
+        logger.debug("jmtpfs -l reported no parsable device: %r",
+                     _command_text(output)[:300])
     return devices
 
 
@@ -476,11 +514,17 @@ def discover_usb_mtp_devices(sysfs_root: str = DEFAULT_MTP_SYSFS) -> List[MtpDev
             # PTP cameras share class 6/1/1 with MTP; their interface string
             # distinguishes them and must not become an Android import source.
             if "ptp" in description and "mtp" not in description:
+                logger.debug("Ignoring PTP camera interface %s (%s)",
+                             interface_name, description)
                 continue
-            # USB class 6/subclass 1/protocol 1 is PTP/MTP; many Android
-            # devices additionally advertise "MTP" in the interface string.
-            if (cls == 6 and (subclass == 1 and protocol == 1 or "mtp" in description)) \
-                    or "mtp" in description:
+            # USB class 6 (still image) / subclass 1 is the PTP/MTP interface
+            # set. Android always negotiates MTP over it; protocol is 1 on
+            # most phones and 0 on a few vendor stacks, so both are accepted.
+            # Many devices additionally name the interface "MTP".
+            if "mtp" in description or (cls == 6 and subclass == 1
+                                        and protocol in (0, 1)):
+                logger.debug("MTP interface %s: class=%s/%s/%s %r",
+                             interface_name, cls, subclass, protocol, description)
                 is_mtp = True
                 break
         if not is_mtp:
@@ -582,6 +626,16 @@ def default_gvfs_roots() -> List[str]:
     roots.append(f"/run/user/{os.getuid()}/gvfs")
     roots.extend(sorted(glob.glob("/run/user/*/gvfs")))
     return list(dict.fromkeys(os.path.normpath(root) for root in roots))
+
+
+def _writable(path: str) -> bool:
+    """True when `path` (or its closest existing parent) can be written to."""
+    candidate = os.path.abspath(path)
+    while candidate and candidate != os.path.dirname(candidate):
+        if os.path.exists(candidate):
+            return os.access(candidate, os.W_OK)
+        candidate = os.path.dirname(candidate)
+    return False
 
 
 def _read(path: str, default: str = "") -> str:
@@ -730,8 +784,10 @@ class MtpManager:
         self._lock = threading.RLock()
         self._owned: Dict[str, str] = {}
         self._failed_until: Dict[str, float] = {}
+        self._fail_count: Dict[str, int] = {}
         self._devices: List[MtpDevice] = []
         self._volumes: List[MtpVolume] = []
+        self._gvfs_seen: set = set()
         self.last_error = ""
 
     # -- command plumbing -------------------------------------------------
@@ -800,26 +856,47 @@ class MtpManager:
                        serial=primary.serial or sysfs.serial)
 
     def _discover_devices(self) -> List[MtpDevice]:
+        """Every MTP-capable device, whichever backend can see it.
+
+        Each stage is logged with its counts, and a failure in one stage never
+        hides a device another stage found: libmtp can be missing while sysfs
+        still shows the phone, GVfs can own a device libmtp refuses to list,
+        and vice versa.
+        """
         sysfs_devices = discover_usb_mtp_devices(self.sysfs_root)
+        logger.debug("MTP sysfs: %d interface(s) look like MTP under %s",
+                     len(sysfs_devices), self.sysfs_root)
         sysfs_by_key = {self._device_key(device): device for device in sysfs_devices}
         found: Dict[Tuple[str, Any, ...], MtpDevice] = {}
         if self._has_command(self.jmtpfs_bin):
-            _code, out, err = self._run_text([self.jmtpfs_bin, "-l"], self.list_timeout)
-            for device in parse_jmtpfs_devices(out):
+            code, out, err = self._run_text([self.jmtpfs_bin, "-l"], self.list_timeout)
+            listed = parse_jmtpfs_devices(out)
+            if code != 0:
+                logger.info("jmtpfs -l exited %s: %s", code,
+                            (err or out).strip()[:200] or "no output")
+            logger.debug("jmtpfs -l reported %d device(s)", len(listed))
+            for device in listed:
                 key = self._device_key(device)
                 sysfs = sysfs_by_key.get(key)
                 found[key] = self._with_sysfs(device, sysfs) if sysfs else device
             if not found and err:
-                self.last_error = err
+                self.last_error = err.strip()
+        else:
+            logger.debug("jmtpfs is not installed; skipping `jmtpfs -l`")
         if not found and self._has_command(self.mtp_detect_bin):
-            _code, out, _err = self._run_text([self.mtp_detect_bin], self.list_timeout)
-            for device in parse_mtp_detect(out):
+            code, out, err = self._run_text([self.mtp_detect_bin], self.list_timeout)
+            detected = parse_mtp_detect(out)
+            logger.debug("mtp-detect (exit %s) reported %d device(s)", code,
+                         len(detected))
+            for device in detected:
                 key = self._device_key(device)
                 sysfs = sysfs_by_key.get(key)
                 found[key] = self._with_sysfs(device, sysfs) if sysfs else device
         if not found and self._has_command("gio"):
             _code, out, _err = self._run_text(["gio", "mount", "-l"], self.list_timeout)
-            for uri in parse_gio_mtp_uris(out):
+            uris = parse_gio_mtp_uris(out)
+            logger.debug("gio mount -l reported %d MTP URI(s)", len(uris))
+            for uri in uris:
                 bus, dev = _mtp_bus_dev(uri)
                 device = MtpDevice(bus=bus, dev=dev, product="Android phone",
                                    uri=uri, backend="gio")
@@ -871,6 +948,8 @@ class MtpManager:
             base = os.path.basename(root.rstrip("/")).lower()
             if "mtp" in base and ("host=" in base or base.startswith("mtp:")):
                 add_root(root, root, "gvfs")
+                with self._lock:
+                    self._gvfs_seen.add(root)
             try:
                 entries = sorted(os.listdir(root))
             except OSError:
@@ -881,6 +960,8 @@ class MtpManager:
                 if ("mtp" in lower and ("host=" in lower or lower.startswith("mtp:"))) \
                         and os.path.isdir(path):
                     add_root(path, name, "gvfs")
+                    with self._lock:
+                        self._gvfs_seen.add(path)
 
         for source, mountpoint, fstype in parse_mtp_mount_entries(self.mounts_path):
             marker = f"{source} {fstype}".lower()
@@ -915,7 +996,29 @@ class MtpManager:
         return list(roots.values())
 
     # -- mounting ---------------------------------------------------------
+    @staticmethod
+    def _mount_error_text(text: str) -> str:
+        """Maps a libmtp/jmtpfs failure onto the action the user can take."""
+        lowered = (text or "").lower()
+        for needle, hint in MTP_ERROR_HINTS:
+            if needle in lowered:
+                return hint
+        return ""
+
+    def _backoff(self, identity: str, failed: bool) -> None:
+        """Short first retries (an unlock takes seconds), then the steady one."""
+        with self._lock:
+            if not failed:
+                self._failed_until.pop(identity, None)
+                self._fail_count.pop(identity, None)
+                return
+            count = self._fail_count.get(identity, 0) + 1
+            self._fail_count[identity] = count
+            delay = MTP_QUICK_RETRY if count <= MTP_QUICK_RETRIES else MTP_RETRY_INTERVAL
+            self._failed_until[identity] = time.monotonic() + delay
+
     def _mount_one(self, device: MtpDevice) -> Optional[str]:
+        """Mounts one device with jmtpfs; returns the FUSE root or None."""
         if not self._has_command(self.jmtpfs_bin):
             self.last_error = "jmtpfs is not installed"
             return None
@@ -923,39 +1026,70 @@ class MtpManager:
         try:
             os.makedirs(root, exist_ok=True)
         except OSError as exc:
-            self.last_error = str(exc)
+            self.last_error = f"cannot create {root}: {exc}"
+            logger.warning("MTP mount root unusable: %s", self.last_error)
             return None
         argv = [self.jmtpfs_bin]
         if device.bus and device.dev:
             argv.append(f"-device={device.bus},{device.dev}")
         argv.append(root)
+        logger.info("Mounting MTP device %s with %s", device.label, " ".join(argv))
         code, out, err = self._run_text(argv, self.mount_timeout)
+        detail = " ".join(part for part in (err.strip(), out.strip()) if part)
         if code != 0 or not os.path.isdir(root):
-            self.last_error = " ".join((err, out)).strip() or "jmtpfs could not open the device"
-            with self._lock:
-                self._failed_until[device.identity] = time.monotonic() + MTP_RETRY_INTERVAL
-            try:
-                os.rmdir(root)  # only succeeds when the failed mount left it empty
-            except OSError:
-                pass
-            logger.info("MTP mount failed for %s: %s", device.identity, self.last_error)
+            self.last_error = detail or f"jmtpfs exited with status {code}"
+            hint = self._mount_error_text(detail)
+            if hint:
+                self.last_error = f"{self.last_error} ({hint})"
+            logger.warning("MTP mount failed for %s (status %s): %s",
+                           device.label, code, self.last_error)
+            # A failed jmtpfs can still have claimed the mountpoint.
+            self._unmount_partial(root)
+            self._backoff(device.identity, failed=True)
             return None
+        # A successful jmtpfs on a locked phone still yields an empty root;
+        # the watcher retries, so do not treat that as a hard failure here.
         self.last_error = ""
+        self._backoff(device.identity, failed=False)
         with self._lock:
             self._owned[device.identity] = root
         logger.info("Mounted Android MTP device %s at %s", device.label, root)
         return root
 
+    def _unmount_partial(self, root: str) -> None:
+        """Cleans up after a failed mount without disturbing a healthy one."""
+        if not root or not os.path.isdir(root):
+            return
+        try:
+            if os.listdir(root):
+                return                     # something is mounted; leave it
+        except OSError:
+            return
+        try:
+            os.rmdir(root)
+        except OSError:
+            pass
+
     def _gio_mount(self, device: MtpDevice) -> bool:
-        if not device.uri or not self._has_command("gio"):
+        """Mounts through GVfs when jmtpfs is unavailable or refused.
+
+        Devices found through sysfs/`mtp-detect` carry no URI, so it is
+        derived from the USB address — otherwise a GVfs-only image could
+        detect a phone and never mount it.
+        """
+        uri = device.uri or device.uri_value()
+        if not uri or not self._has_command("gio"):
             return False
-        code, _out, err = self._run_text(["gio", "mount", device.uri], self.mount_timeout)
+        code, _out, err = self._run_text(["gio", "mount", uri], self.mount_timeout)
         if code != 0:
-            self.last_error = err or "gio could not mount the MTP device"
-            with self._lock:
-                self._failed_until[device.identity] = time.monotonic() + MTP_RETRY_INTERVAL
+            self.last_error = err.strip() or f"gio mount {uri} failed"
+            logger.warning("GVfs MTP mount failed for %s: %s", uri, self.last_error)
+            self._backoff(device.identity, failed=True)
             return False
+        device = replace(device, uri=uri)
         self.last_error = ""
+        self._backoff(device.identity, failed=False)
+        logger.info("Mounted Android MTP device through GVfs at %s", uri)
         return True
 
     def _mount_devices(self, devices: List[MtpDevice],
@@ -963,6 +1097,7 @@ class MtpManager:
         if not self.auto_mount:
             return roots
         mounted = {(d.bus, d.dev) for _root, d, _backend in roots if d.bus and d.dev}
+        mounted_ids = {d.identity for _root, d, _backend in roots}
         now = time.monotonic()
         gio_mounted = False
         for device in devices:
@@ -974,16 +1109,22 @@ class MtpManager:
             if owned and os.path.isdir(owned):
                 roots.append((owned, device, "jmtpfs"))
                 continue
+            if device.identity in mounted_ids:
+                continue
             if now < retry_at:
+                logger.debug("Skipping MTP mount for %s until %.1fs from now",
+                             device.identity, retry_at - now)
                 continue
             if self._has_command(self.jmtpfs_bin):
                 root = self._mount_one(device)
                 if root:
                     roots.append((root, device, "jmtpfs"))
                     mounted.add((device.bus, device.dev))
-                elif self._gio_mount(device):
-                    gio_mounted = True
-            elif self._gio_mount(device):
+                    mounted_ids.add(device.identity)
+                    continue
+            # jmtpfs missing or refused (locked phone, missing /dev/fuse):
+            # try the desktop's GVfs backend before giving up on this device.
+            if self._gio_mount(device):
                 gio_mounted = True
         if gio_mounted:
             # `gio mount` chooses its own GVfs path; rescan to discover it.
@@ -1002,7 +1143,10 @@ class MtpManager:
             roots = self._mount_devices(self._devices, roots)
             volumes: Dict[str, MtpVolume] = {}
             for root, device, backend in roots:
-                for storage_path, storage_name in _mtp_storage_roots(root):
+                storages = _mtp_storage_roots(root)
+                if not storages:
+                    logger.debug("MTP root %s has no readable storage yet", root)
+                for storage_path, storage_name in storages:
                     try:
                         volume = MtpVolume(device, storage_path, storage_name,
                                            mount_root=root, backend=backend)
@@ -1013,6 +1157,27 @@ class MtpManager:
             self._volumes = sorted(volumes.values(), key=lambda v: v.mountpoint)
             return list(self._volumes)
 
+    def scan_mounted(self) -> List[MtpVolume]:
+        """Already-mounted MTP sources only: no subprocess, no sysfs probing.
+
+        Used by the import overlay, which must never block the UI thread on
+        `jmtpfs -l` or on a mount attempt.
+        """
+        with self._lock:
+            roots = self._find_existing_roots()
+            volumes: Dict[str, MtpVolume] = {}
+            for root, device, backend in roots:
+                for storage_path, storage_name in _mtp_storage_roots(root):
+                    try:
+                        volume = MtpVolume(device, storage_path, storage_name,
+                                           mount_root=root, backend=backend)
+                    except Exception:
+                        continue
+                    volumes[volume.key] = volume
+            if volumes:
+                self._volumes = sorted(volumes.values(), key=lambda v: v.mountpoint)
+            return sorted(volumes.values(), key=lambda v: v.mountpoint)
+
     def cached_volumes(self) -> List[MtpVolume]:
         """Last poll's volumes without running any command or FUSE walk."""
         with self._lock:
@@ -1022,6 +1187,7 @@ class MtpManager:
         """Lets an explicit R/rescan retry a previously locked MTP session."""
         with self._lock:
             self._failed_until.clear()
+            self._fail_count.clear()
             self.last_error = ""
 
     def status(self) -> str:
@@ -1029,11 +1195,53 @@ class MtpManager:
         with self._lock:
             if self._volumes:
                 return ""  # an existing GVfs/FUSE source already works
+            error = self.last_error
+            devices = len(self._devices)
         if not self._has_command(self.jmtpfs_bin) and not self._has_command("gio"):
             return "Install jmtpfs for Android MTP (USB sticks still work)."
-        if self.last_error:
-            return "Unlock the phone and choose File Transfer (MTP)."
+        if error:
+            hint = self._mount_error_text(error)
+            return hint or f"MTP: {error}"
+        if devices:
+            return "Android phone detected but its storage is not readable yet."
         return ""
+
+    def diagnose(self) -> Dict[str, object]:
+        """Everything the detection chain knows, for logs and `gba-selftest`.
+
+        Each stage is reported separately so a failure is attributable: a
+        phone can be detected and still fail to mount, or mount and still show
+        no ROMs.
+        """
+        with self._lock:
+            devices = list(self._devices)
+            volumes = list(self._volumes)
+            last_error = self.last_error
+        try:
+            sysfs_mtp = discover_usb_mtp_devices(self.sysfs_root)
+        except Exception as exc:  # pragma: no cover - unreadable sysfs
+            sysfs_mtp = []
+            logger.warning("sysfs MTP scan failed: %s", exc)
+        with self._lock:
+            gvfs_roots = list(self._gvfs_seen)
+        fuse_device = os.path.exists("/dev/fuse")
+        return {
+            "sysfs_mtp_interfaces": len(sysfs_mtp),
+            "jmtpfs": self._has_command(self.jmtpfs_bin),
+            "mtp_detect": self._has_command(self.mtp_detect_bin),
+            "gio": self._has_command("gio"),
+            "fusermount": self._has_command("fusermount3") or self._has_command("fusermount"),
+            "dev_fuse": fuse_device,
+            "mount_root": self.mount_root,
+            # The directory is created on the first mount; report the
+            # writability of the closest existing parent until then.
+            "mount_root_writable": _writable(self.mount_root),
+            "gvfs_roots": gvfs_roots,
+            "devices": [d.label for d in devices],
+            "mounted_roots": sorted(self._owned.values()),
+            "volumes": [v.mountpoint for v in volumes],
+            "last_error": last_error,
+        }
 
     def close(self) -> None:
         """Unmounts FUSE mounts this manager created; never touches GVfs."""
@@ -1044,6 +1252,7 @@ class MtpManager:
             for command in ("fusermount3", "fusermount"):
                 if not self._has_command(command):
                     continue
+                logger.info("Unmounting MTP FUSE root %s with %s", root, command)
                 code, _out, _err = self._run_text([command, "-u", root], 6.0)
                 if code == 0:
                     break
@@ -1083,6 +1292,64 @@ def list_mtp_volumes(mounts_path: str = "/proc/mounts", roots: Optional[Sequence
 def scan_mtp_roms(volume: Volume) -> List[Tuple[str, int]]:
     """ROMs on one MTP/phone storage, using the shared extension/depth rules."""
     return volume.scan_roms()
+
+
+def list_mounted_mtp_volumes(mounts_path: str = "/proc/mounts",
+                             roots: Optional[Sequence[str]] = None,
+                             gvfs_roots: Optional[Sequence[str]] = None,
+                             **kwargs) -> List[MtpVolume]:
+    """Already-mounted MTP sources, without running any external command.
+
+    This is what the import overlay uses: `jmtpfs -l` and mount attempts block
+    for seconds on a locked phone, and they must never run on the UI/event
+    thread. Mounting stays the watcher's job.
+    """
+    kwargs.pop("extra_roots", None)   # `roots` is the documented spelling
+    manager = MtpManager(auto_mount=False, mounts_path=mounts_path,
+                         extra_roots=roots, gvfs_roots=gvfs_roots,
+                         command_exists=lambda _name: False, **kwargs)
+    return manager.scan_mounted()
+
+
+def mtp_diagnostics(mounts_path: str = "/proc/mounts",
+                    sysfs_root: Optional[str] = None,
+                    manager: Optional["MtpManager"] = None,
+                    auto_mount: bool = False) -> str:
+    """Human-readable report of every stage of the MTP detection chain.
+
+    Written into the log when MTP looks broken and shown by `gba-selftest`, so
+    "the phone is not detected" can be attributed to sysfs discovery, libmtp,
+    GVfs, the FUSE mount or an empty storage instead of guessed at.
+    """
+    manager = manager or MtpManager(auto_mount=auto_mount, mounts_path=mounts_path,
+                                    sysfs_root=sysfs_root)
+    if auto_mount:
+        manager.poll()
+    report = manager.diagnose()
+    lines = ["MTP detection chain:"]
+    lines.append(f"  sysfs MTP interfaces : {report['sysfs_mtp_interfaces']}"
+                 f" ({sysfs_root or manager.sysfs_root})")
+    lines.append("  tools                : "
+                 f"jmtpfs={'yes' if report['jmtpfs'] else 'no'} · "
+                 f"mtp-detect={'yes' if report['mtp_detect'] else 'no'} · "
+                 f"gio={'yes' if report['gio'] else 'no'} · "
+                 f"fusermount={'yes' if report['fusermount'] else 'no'} · "
+                 f"/dev/fuse={'yes' if report['dev_fuse'] else 'no'}")
+    lines.append(f"  mount root           : {report['mount_root']}"
+                 f" (writable={'yes' if report['mount_root_writable'] else 'no'})")
+    lines.append(f"  GVfs roots           : {', '.join(report['gvfs_roots']) or 'none'}")
+    lines.append(f"  devices              : {', '.join(report['devices']) or 'none'}")
+    lines.append(f"  mounted by us        : {', '.join(report['mounted_roots']) or 'none'}")
+    lines.append(f"  import volumes       : {', '.join(report['volumes']) or 'none'}")
+    if report["last_error"]:
+        lines.append(f"  last error           : {report['last_error']}")
+    if not report["devices"] and not report["volumes"]:
+        lines.append("  hint                 : no MTP device seen — unlock the phone and "
+                     "choose File Transfer (MTP), then replug it.")
+    elif report["devices"] and not report["volumes"]:
+        lines.append("  hint                 : the phone is visible but not mountable — "
+                     "approve the USB prompt on the phone, or install/repair jmtpfs+FUSE.")
+    return "\n".join(lines)
 
 
 def list_import_sources(mounts_path: str = "/proc/mounts", media_roots=MEDIA_ROOTS,
@@ -1287,6 +1554,21 @@ def _safe_folder(name: str) -> str:
     return cleaned or "USB"
 
 
+def _size_matches(path: str, expected_size: int) -> bool:
+    """Copy verification that tolerates an unknown (0) source size.
+
+    MTP backends may report 0 for a file whose real size only becomes known
+    once it is read, so "unknown" is verified as "something was written".
+    """
+    try:
+        actual = os.path.getsize(path)
+    except OSError:
+        return False
+    if expected_size > 0:
+        return actual == expected_size
+    return actual > 0
+
+
 def _copy_source(source: str, target: str, expected_size: int) -> None:
     """
     Copies one source file, tolerating FUSE filesystems that refuse `copystat`.
@@ -1299,7 +1581,7 @@ def _copy_source(source: str, target: str, expected_size: int) -> None:
         shutil.copy2(source, target)
         return
     except OSError:
-        if os.path.isfile(target) and os.path.getsize(target) == expected_size:
+        if os.path.isfile(target) and _size_matches(target, expected_size):
             return
         try:
             if os.path.exists(target):
@@ -1362,7 +1644,7 @@ def import_roms(volume: Volume, games_dir: str, subfolder: bool = True,
                 target = os.path.join(destination, f"{stem} ({suffix}){ext}")
                 suffix += 1
             _copy_source(source, target, size)
-            if os.path.getsize(target) != size:
+            if not _size_matches(target, size):
                 raise IOError("size mismatch after copy")
             result.copied.append(target)
             if content_id:
@@ -1370,7 +1652,7 @@ def import_roms(volume: Volume, games_dir: str, subfolder: bool = True,
         except Exception as exc:
             result.failed.append((name, str(exc)))
             try:
-                if os.path.exists(target) and os.path.getsize(target) != size:
+                if os.path.exists(target) and not _size_matches(target, size):
                     os.remove(target)
             except Exception:
                 pass
@@ -1419,6 +1701,8 @@ class VolumeWatcher(threading.Thread):
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._initialised = False
+        self._empty_mtp_logged: set = set()
+        self._last_mtp_error = ""
 
     def get_mtp_manager(self) -> MtpManager:
         """The process-wide MTP mount manager, created lazily on first poll."""
@@ -1441,6 +1725,42 @@ class VolumeWatcher(threading.Thread):
         except Exception as exc:
             logger.warning("Could not read known library ids: %s", exc)
             return set()
+
+    def _report_mtp_failure(self, manager, volumes) -> None:
+        """Logs the whole detection chain once when MTP starts failing.
+
+        Without this a phone that is detected but cannot be mounted looks
+        exactly like no phone at all: the user sees "no import sources" and
+        the log says nothing.
+        """
+        if volumes:
+            self._last_mtp_error = ""
+            return
+        status = ""
+        getter = getattr(manager, "status", None)
+        if callable(getter):
+            try:
+                status = getter() or ""
+            except Exception:
+                status = ""
+        if not status or status == self._last_mtp_error:
+            return
+        self._last_mtp_error = status
+        logger.warning("MTP unavailable: %s", status)
+        try:
+            for line in mtp_diagnostics(manager=manager).splitlines():
+                logger.warning("%s", line)
+        except Exception as exc:  # pragma: no cover - diagnostics never fatal
+            logger.debug("MTP diagnostics failed: %s", exc)
+
+    def _log_empty_mtp(self, volume: Volume) -> None:
+        """One line per empty MTP source instead of one per 2-second poll."""
+        with self._lock:
+            already = volume.key in self._empty_mtp_logged
+            self._empty_mtp_logged.add(volume.key)
+        if not already:
+            logger.info("MTP source %s is mounted but lists no ROMs yet "
+                        "(locked phone or empty storage); retrying", volume.mountpoint)
 
     def _analyse(self, volume: Volume) -> None:
         """Fills `volume.new_roms` with the ROMs new to the library."""
@@ -1467,10 +1787,14 @@ class VolumeWatcher(threading.Thread):
         if self.mtp_enabled:
             try:
                 provider = self.mtp_provider
-                extra = list(provider() if provider is not None
-                             else self.get_mtp_manager().poll())
+                if provider is not None:
+                    extra = list(provider())
+                else:
+                    manager = self.get_mtp_manager()
+                    extra = list(manager.poll())
+                    self._report_mtp_failure(manager, extra)
             except Exception as exc:
-                logger.warning("Could not list MTP devices: %s", exc)
+                logger.warning("Could not list MTP devices: %s", exc, exc_info=True)
                 extra = []
             known = {v.key for v in volumes}
             known_paths = {os.path.realpath(v.mountpoint) for v in volumes}
@@ -1484,8 +1808,6 @@ class VolumeWatcher(threading.Thread):
         with self._lock:
             current_keys = {v.key for v in volumes}
             candidates = [v for v in volumes if v.key not in self.seen]
-            for volume in volumes:
-                self.seen.add(volume.key)
             # Forget sticks that were unplugged so re-inserting re-prompts.
             self.seen &= current_keys
             self.volumes = volumes
@@ -1495,11 +1817,24 @@ class VolumeWatcher(threading.Thread):
         for volume in candidates:
             try:
                 if volume.rom_count() <= 0:
+                    # A phone can be mounted while its screen is still locked:
+                    # the FUSE mount succeeds but lists nothing. Leaving the
+                    # key out of `seen` makes the next tick re-check it, so
+                    # unlocking the phone still produces the import prompt.
+                    # Empty block devices are stable, so they are marked seen.
+                    if getattr(volume, "is_mtp", False):
+                        self._log_empty_mtp(volume)
+                        continue
+                    with self._lock:
+                        self.seen.add(volume.key)
                     continue
                 self._analyse(volume)
             except Exception as exc:
                 logger.warning("Could not analyse %s: %s", volume.mountpoint, exc)
                 volume.new_roms = None  # fall back to the discovery count
+            with self._lock:
+                # Only a source that actually yielded content is "handled".
+                self.seen.add(volume.key)
             if volume.new_rom_count() > 0:
                 new.append(volume)
         with self._lock:

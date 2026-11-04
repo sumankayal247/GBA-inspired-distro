@@ -240,10 +240,10 @@ class TestShortcutUI(ManagementTestCase):
         overlay.handle(pygame.event.Event(pygame.KEYDOWN,
                                           key=pygame.K_RETURN, mod=0), launcher)
         self.assertTrue(overlay.listening)
-        # X and Z are the shared profile's A and B buttons.
-        overlay.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_x, mod=0),
-                       launcher)
+        # Z is the shared profile's A button, X its B button (Z -> A, X -> B).
         overlay.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_z, mod=0),
+                       launcher)
+        overlay.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_x, mod=0),
                        launcher)
         self.assertEqual(overlay.shortcuts["cheats"], ("keyA", "keyB"))
         self.assertEqual(settings_store.load_shortcuts()["cheats"],

@@ -663,3 +663,45 @@ Version 1.0 should satisfy all of the following:
 **Every component must justify its existence.**
 
 If a feature does not improve the game-library experience, enable a necessary PC capability, or provide a foundation for future distro-native applications, it should not be part of the minimal base system.
+
+---
+
+# 19. Implementation Status — V1 (as of 2026-11-04)
+
+This plan is the original forward-looking document; the V1 codebase implements Phases 2–6 for the
+Debian/bookworm appliance (see `README.md`). Status of the parts this plan reserved for "later":
+
+| Area | Status in V1 | Where |
+|---|---|---|
+| Boot straight to the shell, no desktop | Implemented (KMS/DRM, dummy-driver fallback) | `src/gba_init.sh`, `src/gba_supervisor.py`, `src/gba_launcher.py` |
+| Emulator integration | Implemented with `mgba-sdl`; saves routed per content id | `src/gba_adapter_mgba.py` |
+| Game library shell + controller/keyboard | Implemented (five tabs, cartridges, gamepad hot-plug) | `src/gba_launcher.py`, `src/theme.py` |
+| Saves, states, cheats | Implemented (battery saves + 9 native slots + per-game cheats) | `src/game_data.py`, `src/gba_ingame.py` |
+| USB pendrive import | Implemented (confirm, verify, content-ID dedupe) | `src/gba_usb.py` |
+| Android MTP import | Implemented (libmtp/GVfs/FUSE chain, diagnostics) | `src/gba_usb.py`, `src/gba_mtp.py` |
+| Browser, terminal, settings, apps | Implemented (stdlib only) | `src/gba_browser.py`, `src/gba_terminal.py`, `src/gba_settings*.py` |
+| Favorites, search, playtime | Favorites and search implemented; playtime is not | `src/gba_launcher.py` |
+| ISO / installer / setup | Implemented (hybrid BIOS+UEFI ISO, guided setup) | `scripts/build_iso.sh`, `src/gba_setup.py`, `src/gba_installer.py` |
+
+## 19.1 Runtime-hardening pass (the seven reported bugs)
+
+| # | Reported symptom | Root cause | Verified by |
+|---|---|---|---|
+| 1 | Android phone in MTP mode never detected | Quoted `jmtpfs -l` fields were dropped; sysfs required interface protocol 1; GVfs fallback never attempted for a sysfs-only device; 0-byte MTP sizes filtered; a phone mounted while locked was marked "seen" forever | `tests/test_mtp.py` (27) |
+| 2 | Overlay never opens / game freezes with no overlay | `SIGSTOP`ped mGBA keeps the SDL/KMS surface, so a second pygame window cannot take over | `tests/test_ingame_handoff.py` (22), `tests/test_ingame.py` |
+| 3 | Save states unusable | Capture happened while the emulator was paused, where hotkeys are never read; slots had no atomic archive/rollback | `tests/test_game_data.py`, `tests/test_ingame.py` |
+| 4 | Cheats overlay dead | Same display/handoff cause; toggles never reached the running game | `tests/test_ingame.py`, `tests/test_ingame_handoff.py` |
+| 5 | Fast-forward froze the game | Speed changes reloaded the emulator without a captured state and could retrigger while held | `tests/test_ingame.py` |
+| 6 | `A`/`B` reversed on the keyboard | Defaults were `X`→A, `Z`→B; the shipped profile is now `Z`→A, `X`→B with migration for stock profiles only | `tests/test_common.py`, `tests/test_adapter.py`, `tests/test_ingame.py` |
+| 7 | (test requirement) | Added hardware-free coverage for every item above; no emulator is left stopped or orphaned on any failure path | full suite: 412 passing, 1 skipped |
+
+## 19.2 Still requires physical hardware
+
+Nothing below can be proven by the headless suite, and none of the table above claims it:
+
+- real Android phones (unlock prompts, vendor MTP stacks, SD cards, large FUSE reads, `fusermount`);
+- DRM/KMS release latency and audio behaviour across the overlay restart, and restart cost on
+  modest hardware;
+- `/dev/uinput` hotkey injection on the appliance (save/state capture, cheat reload);
+- 2x/3x audio pacing and frame pacing under `fpsTarget`;
+- overlay scaling on real 1366×768 / 1080p / 4K panels.

@@ -16,8 +16,11 @@ Design
   hundreds of frames cannot cycle speed repeatedly.
 * While a combo is latched its buttons are "consumed", so the handler can
   neutralise them instead of letting them leak into gameplay.
-* Overlays are models owned by `InGameSession`; opening one pauses mGBA and
-  closing one resumes the *same* emulator process.
+* Overlays are models owned by `InGameSession`; opening one performs a
+  display handoff (capture a native state + frame, stop mGBA, let the overlay
+  own the screen) and closing one restarts mGBA from that captured state.
+  Nothing here ever leaves a stopped emulator behind: a handoff that cannot be
+  completed resumes gameplay instead.
 """
 
 import time
@@ -212,11 +215,25 @@ class FastForwardController:
 class InGameBackend:
     """mGBA-native operations. The handler subclasses/duck-types this.
 
+    There are two ways an overlay can get exclusive use of the screen:
+
+    * **display handoff** (`supports_display_handoff = True`): the handler
+      captures a native state plus a gameplay screenshot *while mGBA is still
+      running*, stops mGBA so it releases SDL/KMS/DRM, and only then lets the
+      overlay renderer open a window. Closing the overlay restarts mGBA from
+      the captured state. This is what the real handler does.
+    * **pause/resume** (`pause`/`resume`): the historical SIGSTOP/SIGCONT
+      behaviour, kept only as a fallback for backends (and tests) that do not
+      own a process. It cannot share a DRM/KMS display, so overlays may fail
+      to appear; the session then resumes immediately instead of freezing.
+
     ``set_speed`` returns True when the handler must apply the new native
-    `fpsTarget` with a state-preserving in-session reload.
+    `fpsTarget` with a state-preserving reload of its own. Handoff backends
+    apply it during the overlay-driven restart and therefore return False.
     """
 
     supports_runtime_speed = False
+    supports_display_handoff = False
 
     def pause(self) -> bool:
         return False
@@ -234,6 +251,27 @@ class InGameBackend:
         return None
 
     def load_state(self, slot: int, state_path: str) -> bool:
+        return False
+
+    # -- display handoff ---------------------------------------------------
+    def suspend_for_overlay(self, kind: str = "") -> bool:
+        """Frees the display for an overlay. True = the game is suspended."""
+        return self.pause()
+
+    def resume_from_handoff(self) -> bool:
+        """Restores gameplay at the captured state (or SIGCONT fallback)."""
+        return self.resume()
+
+    def overlay_state(self):
+        """Native state captured before the handoff, or None."""
+        return None
+
+    def overlay_screenshot(self):
+        """Gameplay screenshot captured before the handoff, or None."""
+        return None
+
+    def reload_cheats(self) -> bool:
+        """Called after a cheat was toggled; True if a restart is required."""
         return False
 
 
@@ -322,6 +360,7 @@ class SaveStatesOverlayModel(OverlayModel):
         self.index = 0
         self.mode = "grid"            # grid | actions | confirm
         self.action_index = 0
+        self.loaded_slot = 0          # set when a slot was loaded into gameplay
 
     @property
     def slot(self) -> int:
@@ -374,18 +413,47 @@ class SaveStatesOverlayModel(OverlayModel):
         else:
             self.close()
 
-    def _save(self, slot: int) -> bool:
+    def _captured_state(self, slot: int):
+        """State to archive for `slot`.
+
+        With a display handoff the state was captured *before* mGBA was
+        stopped, so the emulator does not have to be alive here — this is what
+        makes "save to an empty slot" work at all. A backend without a handoff
+        still falls back to asking the running emulator for a native state.
+        """
+        provider = getattr(self.backend, "overlay_state", None)
+        if callable(provider):
+            try:
+                state = provider()
+            except Exception:
+                state = None
+            if state:
+                return state
         try:
-            state = self.backend.save_state(slot)
+            return self.backend.save_state(slot)
         except Exception:
-            state = None
+            return None
+
+    def _captured_thumbnail(self, slot: int):
+        provider = getattr(self.backend, "overlay_screenshot", None)
+        if callable(provider):
+            try:
+                shot = provider()
+            except Exception:
+                shot = None
+            if shot:
+                return shot
+        try:
+            return self.backend.capture_screenshot(slot)
+        except Exception:
+            return None               # a missing thumbnail is not fatal
+
+    def _save(self, slot: int) -> bool:
+        state = self._captured_state(slot)
         if not state:
             self.message = "Could not capture the emulator state"
             return False
-        try:
-            thumbnail = self.backend.capture_screenshot(slot)
-        except Exception:
-            thumbnail = None          # a missing thumbnail is not fatal
+        thumbnail = self._captured_thumbnail(slot)
         try:
             ok = self.store.save(slot, state, thumbnail)
         except Exception:
@@ -406,6 +474,7 @@ class SaveStatesOverlayModel(OverlayModel):
             ok = False
         if ok:
             self.message = f"Slot {slot} loaded"
+            self.loaded_slot = slot
             self.close()              # return straight to gameplay
         else:
             self.message = "Load failed"
@@ -435,6 +504,14 @@ class InGameSession:
         self.indicator_until = 0.0
         self.relaunch_requested = False
         self.emulator_terminated = False       # overlays never terminate mGBA
+        # Display handoff bookkeeping. `suspended` means "the handler owns the
+        # screen and gameplay must be restarted from its captured state".
+        self.suspended = False
+        self.resume_pending = False
+        self._resumed = False
+        self.status_message = ""
+        self.last_failure = ""
+        self.cheats_changed = False
 
     @property
     def shortcuts(self) -> Dict[str, Tuple[str, ...]]:
@@ -453,21 +530,58 @@ class InGameSession:
 
         mGBA SDL has no OSD of its own, so the handler briefly takes the
         display for a badge-only overlay (no panel, no interactive controls).
-        The game is paused for that moment and the *same* process resumes.
+        That uses the same display handoff as the panels: the frame and a
+        native state are captured first, mGBA is stopped, and gameplay is
+        restarted from the state — now at the new speed.
         """
         self.show_indicator(text, seconds)
         if self.overlay is not None:
             return                        # an open overlay already draws it
-        try:
-            self.backend.pause()
-        except Exception:
-            return                        # no display: just keep playing
+        if not self._suspend("indicator"):
+            # No display handoff for the badge: fall back to the
+            # state-preserving reload, so the new speed still reaches the
+            # emulator instead of being announced and never applied.
+            self.relaunch_requested = True
+            return
         self.overlay = IndicatorOverlayModel(text, seconds, self.clock,
                                              self._overlay_closed)
+
+    def note_speed_reload_failed(self) -> None:
+        """The emulator kept its old speed, so the model must not claim 2x/3x."""
+        self.fast_forward.reset()
+        self.show_indicator(self.fast_forward.label)
 
     def tick(self) -> None:
         if self.indicator and self.clock() > self.indicator_until:
             self.indicator = ""
+
+    def _suspend(self, kind: str) -> bool:
+        """Takes the display for an overlay; never leaves the game frozen.
+
+        A failure here (no state could be captured, no handoff available) is
+        reported through `status_message` and the emulator is resumed instead
+        of being left stopped behind a window that cannot be drawn.
+        """
+        try:
+            ok = bool(self.backend.suspend_for_overlay(kind))
+        except Exception as exc:
+            self.status_message = f"Overlay unavailable: {exc}"
+            ok = False
+        if ok:
+            self.suspended = True
+            self._resumed = False
+            self.last_failure = ""
+            return True
+        self.status_message = (self.status_message
+                               or "Overlay unavailable: cannot capture the game state")
+        self.last_failure = self.status_message
+        try:
+            self.backend.resume()      # a half-applied handoff must not freeze
+        except Exception:
+            pass
+        self.suspended = False
+        self._resumed = True
+        return False
 
     def handle_action(self, action: str) -> None:
         # A transient speed badge must never swallow a deliberate shortcut.
@@ -494,34 +608,83 @@ class InGameSession:
         elif action == ACTION_SAVE_STATES:
             self.toggle_overlay(ACTION_SAVE_STATES)
 
-    def toggle_overlay(self, kind: str) -> None:
+    def toggle_overlay(self, kind: str) -> bool:
         if self.overlay is not None:
             previous = self.overlay.kind
             self.close_overlay()
             if previous == kind:       # pressing the combo again closes it
-                return
-        self.open_overlay(kind)
+                return True
+        return self.open_overlay(kind)
 
-    def open_overlay(self, kind: str) -> None:
+    def open_overlay(self, kind: str) -> bool:
+        """Suspends the game and opens an overlay. False = nothing opened."""
         if self.overlay is not None:
             self.close_overlay()
-        try:
-            self.backend.pause()
-        except Exception:
-            pass
+        if not self._suspend(kind):
+            return False
         if kind == ACTION_CHEATS:
             self.overlay = CheatsOverlayModel(self.cheat_store, on_close=self._overlay_closed)
         else:
             self.overlay = SaveStatesOverlayModel(self.state_store, self.backend,
                                                   on_close=self._overlay_closed)
+        return True
 
     def _overlay_closed(self, overlay: OverlayModel) -> None:
         if self.overlay is overlay:
             self.overlay = None
+        # Cheat toggles and loaded save states only take effect in a fresh
+        # mGBA process, which is exactly what the handoff restart provides.
+        if getattr(overlay, "kind", "") == ACTION_CHEATS:
+            self.cheats_changed = True
+            try:
+                self.backend.reload_cheats()
+            except Exception:
+                pass
+        if self.backend.supports_display_handoff:
+            # The overlay window still owns the screen here. Restarting mGBA
+            # now would make two processes fight for KMS/DRM, so the restart
+            # waits for `finish_overlay()` (called after the display closes).
+            self.resume_pending = True
+            return
+        self.resume_now()
+
+    def resume_now(self) -> bool:
+        """Restarts gameplay from the captured state (idempotent)."""
+        self.resume_pending = False
+        if self._resumed:
+            return False              # already playing; nothing to restore
+        suspended, self.suspended = self.suspended, False
+        self._resumed = True
+        if suspended or self.backend.supports_display_handoff:
+            try:
+                return bool(self.backend.resume_from_handoff())
+            except Exception as exc:
+                self.status_message = f"Could not resume the game: {exc}"
+                return False
         try:
-            self.backend.resume()      # same emulator process, no restart
+            return bool(self.backend.resume())
         except Exception:
-            pass
+            return False
+
+    def finish_overlay(self) -> bool:
+        """Called by the renderer once the overlay has released the display."""
+        if not self.resume_pending and not self.suspended:
+            return False
+        return self.resume_now()
+
+    def release_display(self) -> bool:
+        """Safety net: never leave the emulator suspended without an overlay.
+
+        Used by the handler when a session ends (or an overlay loop dies), so it
+        also completes a resume that was waiting for the display to close.
+        """
+        changed = False
+        if self.overlay is not None:
+            self.close_overlay()
+            changed = True
+        if self.resume_pending or self.suspended:
+            changed = self.resume_now() or changed
+        return changed
 
     def close_overlay(self) -> None:
         if self.overlay is None:

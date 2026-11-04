@@ -623,7 +623,7 @@ overrides win over `config.ini`; all needed keys mapped in every version).
 
 ## D-050 In-game features stay inside the mGBA handler
 
-**Status:** Accepted
+**Status:** Accepted (mechanism amended 2026-11-04 by D-052)
 
 **Decision.** Cheats, the nine-slot save-state overlay and the fast-forward cycle are implemented as
 handler-side features, not launcher applications and not a replacement emulator. `src/game_data.py`
@@ -642,16 +642,19 @@ because `fpsTarget` is read at core start. D-007's "embedding deferred" remains 
 sidecar overlay, not a thin frontend over libmgba.
 
 **Trade-offs.** Native hotkeys require `/dev/uinput` (or `xdotool` under X11); without them the
-overlays still open/close but capture/load degrade gracefully. Cheat enable/disable changes are
-persisted immediately but take effect on the next launch, since closing the overlay must not restart
-the game. Display sharing under KMS/DRM and audio pacing at 2x/3x can only be verified on the
-appliance.
+overlays still open/close but capture/load degrade gracefully. Display sharing under KMS/DRM and
+audio pacing at 2x/3x can only be verified on the appliance.
+
+**Amended 2026-11-04 (see D-052).** The "paused with SIGSTOP, resumed with SIGCONT" mechanism in
+this decision does not work: a stopped mGBA keeps the display. Overlays now capture a native state,
+stop the emulator, draw, and restart mGBA from that state — which also means cheat changes take
+effect in the *current* session at the next overlay close, not "on the next launch".
 
 ---
 
 ## D-051 Android MTP is a FUSE-backed Volume, not a removable disk
 
-**Status:** Accepted
+**Status:** Accepted (detection amended 2026-11-04 by D-053)
 
 **Decision.** `src/gba_usb.py` owns MTP discovery and mounting alongside pendrive discovery.
 `jmtpfs -l`, `mtp-detect`, `gio mount -l`, USB MTP interface descriptors in
@@ -681,3 +684,78 @@ source and a diagnostic; pendrives, booting and gameplay are unaffected. `jmtpfs
 opened file in its own temporary storage, so hashing/copying large ROMs is slower than a block
 device. Real phones, vendor MTP quirks, SD-card layouts and FUSE unmount behavior need appliance
 verification; the headless suite uses simulated sysfs, mount tables, commands and FUSE roots.
+
+**Amended 2026-11-04 (see D-053).** Detection proved to be a chain of five independent links, each
+of which could silently veto the others. Neither `jmtpfs` nor GVfs is trusted as the single source of
+truth, MTP storages may report 0-byte file sizes, and a phone mounted while locked must not be
+remembered as "already seen".
+
+---
+
+## D-052 An overlay needs the display, so the emulator is stopped and restarted from a state
+
+**Status:** Accepted (supersedes the SIGSTOP/SIGCONT mechanism of D-050)
+
+**Decision.** Opening an in-game overlay is a four-step display handoff, owned by the handler:
+
+1. while mGBA is still running, the handler injects `F12` (frame) and `Shift+F9` (native state into
+   the handler's private slot) and copies both out of mGBA's runtime directory;
+2. the handler stops mGBA (`terminate` → `wait` → `kill`) and waits for the display to be released;
+3. `src/gba_ingame_ui.py` opens a pygame window with the existing `Theme` code and draws the overlay
+   over the captured frame;
+4. on close, the renderer releases the display, `InGameSession.finish_overlay()` runs, and the
+   runner starts a **new** mGBA with `-t <captured state>` (plus `-c <cheats>` when cheats changed,
+   and `-C fpsTarget=<60|120|180>` for the current speed).
+
+`resume_now()` is idempotent (`_resumed`), `release_display()` is the safety net for a half-applied
+handoff, and no capture request is issued while the emulator is stopped.
+
+**Why.** A `SIGSTOP`ped mGBA keeps its SDL/DRM surface: `pygame.display.set_mode` on the same seat
+either fails or draws into a surface nobody scans out, which is exactly the "overlay doesn't open /
+game frozen, no overlay" symptom. `mgba-sdl` has no IPC to hand off its window, and mGBA cannot be
+asked to give up the display without exiting. A state-based restart is the only mechanism the
+emulator itself supports: `-t` starts a core from a real `.ss` file, so gameplay resumes at the byte
+the player left it, not at a save point.
+
+**Trade-offs.** Every overlay open/close costs one process restart (≈0.3–1 s on modest hardware) and
+one native state write. State must be captured *before* the stop, so an overlay cannot open if the
+capture fails — the game simply keeps running and the failure is reported. Audio may click across the
+restart. Reading a state that mGBA is still writing is avoided by waiting for the file to stop
+growing. Hardware timing (DRM release latency, audio gap, restart cost on a Raspberry Pi-class
+machine) can only be measured on the appliance.
+
+---
+
+## D-053 MTP detection is a chain, and every link says what it saw
+
+**Status:** Accepted (amends D-051)
+
+**Decision.** `src/gba_usb.py` treats MTP as five independent sources of evidence rather than a
+single check, and never lets one veto the others:
+
+| Link | Evidence | Failure it absorbs |
+|---|---|---|
+| USB interface | `/sys/bus/usb/devices/*/*/bInterfaceClass=06`, subclass 01, protocol 0 **or** 1, or an interface named `MTP` | vendor stacks that report protocol 0 (PTP-style) |
+| libmtp | `jmtpfs -l` (quoted CSV), `mtp-detect` (human output) | a phone that libmtp can see even when sysfs is unusual |
+| GVfs | `gio mount -l` `mtp://` URIs, and `gio mount mtp://[usb:BBB,DDD]/` derived from the USB address | a phone already mounted by a desktop session, or a sysfs-only device that libmtp cannot open |
+| FUSE table | `/proc/mounts` `/dev/fuse` entries pointing at a mount root | a mount we (or a previous run) already made |
+| Storage | directories under the mount root | phones whose storage appears late, i.e. mounted while locked |
+
+Supporting rules: a mount yields a volume even when every ROM reports size 0 (FUSE backends do that
+until data is read); a `VolumeWatcher` records a source as "seen" only once it has actually offered
+something, so unlocking a phone mid-session still prompts; failures are retried three times at 3 s
+then every 15 s, each mounting stage is attributed in the log, and `MtpManager.diagnose()` /
+`gba-selftest --mtp` print the whole chain plus one actionable hint (`Unlock the phone…`,
+`Install jmtpfs…`, `modprobe fuse`).
+
+**Why.** Every fix in this area came from a *different* link failing in the same way: no phone
+appeared, with no indication which step was responsible. Making each link observable is what turns
+"Android MTP not detected" from a guess into a report — and it is how the ISO dependency question was
+answered without adding packages: `jmtpfs` and `mtp-tools` were already in `scripts/build_iso.sh`;
+what was missing was the *parser* (`jmtpfs -l` quotes its fields), the protocol tolerance (0), the
+0-byte size tolerance, and the FUSE/`gio` fallback actually being attempted.
+
+**Trade-offs.** More log lines and more subprocess calls per poll, each bounded by a timeout and
+skipped entirely on the UI thread (`list_mounted_mtp_volumes()` reads the mount table only). A phone
+that is genuinely locked still produces no volume — now with a reason attached. Real phones and
+vendor stacks remain hardware-verification items.

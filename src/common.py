@@ -9,7 +9,7 @@ import json
 import hashlib
 import re
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 SYS_CONTRACT_VERSION = 1
 
@@ -244,18 +244,33 @@ def extract_gba_title(file_path: str) -> str:
     return _title_from_filename(file_path)
 
 
+# SDL key codes.  The GBA layout every emulator frontend ships is
+#   Z = A, X = B
+# i.e. the right-most of the two action keys is A, exactly like a real GBA
+# where A sits to the right of B.  The previous defaults had this backwards
+# (X = A, Z = B).
 DEFAULT_KEYBINDINGS = {
     "keyUp": 1073741906,     # Up Arrow
     "keyDown": 1073741905,   # Down Arrow
     "keyLeft": 1073741904,   # Left Arrow
     "keyRight": 1073741903,  # Right Arrow
     "keySelect": 8,          # Backspace (GBA SELECT)
-    "keyA": 120,             # X key (GBA A)
-    "keyB": 122,             # Z key (GBA B)
+    "keyA": 122,             # Z key (GBA A)
+    "keyB": 120,             # X key (GBA B)
     "keyL": 97,              # A key (GBA L)
     "keyR": 115,             # S key (GBA R)
     "keyStart": 13           # Enter / Return (GBA START)
 }
+
+# The shipped defaults before the Z -> A / X -> B correction.  They are used
+# only to recognise a *stock* profile written by an older install so it can be
+# migrated without touching anybody's custom bindings.
+LEGACY_DEFAULT_KEYBINDINGS = dict(DEFAULT_KEYBINDINGS, keyA=120, keyB=122)
+
+# Bumped whenever the shipped profile changes shape; recorded in
+# `keybindings.json` so an upgrade can tell "untouched defaults" from "the user
+# made choices".  Older files simply have no version key.
+KEYBINDINGS_PROFILE_VERSION = 2
 
 GBA_BUTTON_ORDER = [
     ("keyUp", "D-PAD UP"),
@@ -269,6 +284,35 @@ GBA_BUTTON_ORDER = [
     ("keyR", "R TRIGGER"),
     ("keyStart", "START")
 ]
+
+def is_legacy_default_profile(bindings: dict) -> bool:
+    """True when `bindings` is an untouched pre-Z=A shipped profile.
+
+    Only an exact match of every button counts: a single customised key means
+    the user made a choice, and their profile must survive an upgrade.
+    """
+    if not isinstance(bindings, dict):
+        return False
+    for key, _label in GBA_BUTTON_ORDER:
+        try:
+            value = int(bindings.get(key))
+        except (TypeError, ValueError):
+            return False
+        if value != LEGACY_DEFAULT_KEYBINDINGS[key]:
+            return False
+    return True
+
+
+def migrate_legacy_keybindings(bindings: dict) -> dict:
+    """Rewrites a stock old-default profile to the shipped defaults.
+
+    Customised profiles (any key differing from the old shipped values) are
+    returned unchanged, which is what keeps a user's Z/X choice intact.
+    """
+    if is_legacy_default_profile(bindings):
+        return dict(DEFAULT_KEYBINDINGS)
+    return dict(bindings) if isinstance(bindings, dict) else dict(DEFAULT_KEYBINDINGS)
+
 
 def load_keybindings() -> dict:
     """Loads active keybindings from config files, falling back to defaults."""
@@ -284,7 +328,7 @@ def load_keybindings() -> dict:
                 for k, v in data.items():
                     if k in bindings and isinstance(v, int) and not isinstance(v, bool):
                         bindings[k] = v
-                return sanitize_keybindings(bindings)
+                return sanitize_keybindings(migrate_legacy_keybindings(bindings))
         except Exception:
             pass
 
@@ -299,7 +343,7 @@ def load_keybindings() -> dict:
                 for k in bindings.keys():
                     if k in cp["input.SDLK"]:
                         bindings[k] = int(cp["input.SDLK"][k])
-                return sanitize_keybindings(bindings)
+                return sanitize_keybindings(migrate_legacy_keybindings(bindings))
         except Exception:
             pass
 
@@ -314,8 +358,14 @@ def save_keybindings(bindings: dict) -> None:
     os.makedirs(config_dir, exist_ok=True)
     json_path = os.path.join(config_dir, "keybindings.json")
     try:
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(bindings, f, indent=2)
+        payload = dict(bindings)
+        # Recorded so an upgrade can distinguish a stock profile from a
+        # customised one. load_keybindings ignores unknown keys.
+        payload["version"] = KEYBINDINGS_PROFILE_VERSION
+        tmp = json_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, json_path)
     except Exception:
         pass
 
@@ -381,30 +431,62 @@ def sanitize_keybindings(bindings: dict) -> dict:
 
     Invalid, reserved or duplicate assignments fall back to the shipped default
     so a hand-edited config can never leave the shell without working controls.
+    A value is only replaced when it is genuinely unusable: a custom binding
+    that happens to reuse another button's *default* key is a legitimate user
+    choice and is preserved.
     """
     result = dict(DEFAULT_KEYBINDINGS)
     if not isinstance(bindings, dict):
         return result
 
-    default_owner = {value: key for key, value in DEFAULT_KEYBINDINGS.items()}
+    def usable(value) -> bool:
+        return (isinstance(value, int) and not isinstance(value, bool)
+                and value > 0 and value not in RESERVED_ACTION_KEYS)
+
+    stored = {key: bindings.get(key) for key, _label in GBA_BUTTON_ORDER}
+    counts: Dict[int, int] = {}
+    for value in stored.values():
+        if usable(value):
+            counts[value] = counts.get(value, 0) + 1
+
+    # Pass 1: unambiguous custom values are always kept.
     used = set()
     for key, _label in GBA_BUTTON_ORDER:
-        value = bindings.get(key)
-        valid = (
-            isinstance(value, int)
-            and not isinstance(value, bool)
-            and value > 0
-            and value not in RESERVED_ACTION_KEYS
-            and value not in used
-            # A value that is another button's default is almost always a
-            # mistyped or stale config; prefer the shipped default.
-            and default_owner.get(value, key) == key
-        )
-        if not valid:
-            value = DEFAULT_KEYBINDINGS[key]
+        value = stored[key]
+        if usable(value) and counts.get(value) == 1 and value not in used:
+            result[key] = value
+            used.add(value)
+
+    # Pass 2: a contested key goes to the button whose shipped default it is;
+    # the loser falls back to its own default below.
+    contested = [key for key, _label in GBA_BUTTON_ORDER
+                 if key not in result and usable(stored[key])
+                 and stored[key] not in used]
+    contested.sort(key=lambda key: 0 if DEFAULT_KEYBINDINGS.get(key) == stored[key] else 1)
+    for key in contested:
+        value = stored[key]
+        if value not in used:
+            result[key] = value
+            used.add(value)
+
+    # Pass 3: everything else gets a working default, never a duplicate.
+    for key, _label in GBA_BUTTON_ORDER:
+        if key in result:
+            continue
+        value = DEFAULT_KEYBINDINGS[key]
+        if value in used:
+            value = next((candidate for candidate in _FALLBACK_KEYS
+                          if candidate not in used
+                          and candidate not in RESERVED_ACTION_KEYS),
+                         value)
         result[key] = value
         used.add(value)
     return result
+
+
+# Free function keys used only when a default itself is unusable (a profile
+# with clashing keys); they are never assigned automatically otherwise.
+_FALLBACK_KEYS = (113, 114, 115, 116, 117, 118, 119, 120, 121, 122)
 
 
 def keybindings_conflict_error(bindings: dict, key_id: str, keycode: int) -> "str | None":

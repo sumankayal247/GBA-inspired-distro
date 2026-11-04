@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -367,6 +368,244 @@ class TestMtpAutoMount(MtpTestCase):
         manager.close()
         self.assertTrue(any(argv and argv[0].startswith("fusermount")
                             for argv in calls))
+
+
+class TestMtpDetectionChain(MtpTestCase):
+    """One test per link of sysfs -> libmtp -> GVfs -> FUSE -> watcher."""
+
+    def test_sysfs_accepts_vendor_ptp_protocol_and_names_the_device(self):
+        root = os.path.join(self.temp, "sysfs")
+        # Some vendor stacks expose class 6/subclass 1/protocol 0.
+        self.sysfs_device(root, name="1-2", bus=1, dev=9, interface_class="06",
+                          subclass="01", protocol="00", description="")
+        (device,) = gba_usb.discover_usb_mtp_devices(root)
+        self.assertEqual((device.bus, device.dev), (1, 9))
+
+    def test_quoted_jmtpfs_names_and_blank_output(self):
+        output = ("Available devices (busLocation, devNum, productId, vendorId, product, vendor):\n"
+                  '2, 19, 0x6860, 0x04e8, "Pixel 7", "Google"\n')
+        (device,) = gba_usb.parse_jmtpfs_devices(output)
+        self.assertEqual(device.product, "Pixel 7")
+        self.assertEqual(device.manufacturer, "Google")
+        self.assertEqual(gba_usb.parse_jmtpfs_devices("No devices found.\n"), [])
+
+    def test_gio_fallback_derives_a_uri_for_a_sysfs_only_device(self):
+        sysfs = self.sysfs_device(
+            os.path.join(self.temp, "sysfs"), name="2-1", bus=2, dev=19,
+            interface_class="06", subclass="01", protocol="01", description="MTP")
+        calls = []
+
+        def runner(argv, timeout=0):
+            calls.append(list(argv))
+            if argv[0] == "gio":
+                return completed()
+            return completed(returncode=1, stderr="jmtpfs: unable to open device")
+
+        manager = gba_usb.MtpManager(
+            auto_mount=True, mounts_path=self.mounts, sysfs_root=sysfs,
+            mount_root=os.path.join(self.temp, "fuse"), gvfs_roots=(),
+            runner=runner,
+            command_exists=lambda name: name in ("gio", "jmtpfs"))
+        manager.poll()
+        # `gio mount -l` is discovery; `gio mount mtp://...` is the fallback.
+        gio_calls = [argv for argv in calls
+                     if argv[0] == "gio" and "-l" not in argv]
+        self.assertEqual(len(gio_calls), 1)
+        # libmtp found no device, so the phone is mounted through GVfs using
+        # the USB address; before the fix a sysfs-only device had no URI and
+        # `gio mount` was never even attempted.
+        self.assertIn("mtp://[usb:002,019]/", gio_calls[0])
+
+    def test_locked_phone_retries_quickly_then_backs_off(self):
+        sysfs = self.sysfs_device(
+            os.path.join(self.temp, "sysfs"), interface_class="06",
+            subclass="01", protocol="01", description="MTP")
+        attempts = []
+
+        def runner(argv, timeout=0):
+            if argv[1:2] == ["-l"]:
+                return completed()
+            attempts.append(list(argv))
+            return completed(returncode=1, stderr="jmtpfs: Unable to open MTP device")
+
+        manager = gba_usb.MtpManager(
+            auto_mount=True, mounts_path=self.mounts, sysfs_root=sysfs,
+            mount_root=os.path.join(self.temp, "fuse"), gvfs_roots=(),
+            runner=runner, command_exists=lambda name: name == "jmtpfs")
+        manager.poll()
+        self.assertEqual(len(attempts), 1)
+        identity = manager._devices[0].identity
+        first_delay = manager._failed_until[identity] - time.monotonic()
+        self.assertLessEqual(first_delay, gba_usb.MTP_QUICK_RETRY + 0.5)
+        # The retry gate keeps a locked phone from being re-mounted every tick.
+        manager.poll()
+        self.assertEqual(len(attempts), 1)
+        for _ in range(gba_usb.MTP_QUICK_RETRIES + 1):
+            manager._backoff(identity, failed=True)
+        steady = manager._failed_until[identity] - time.monotonic()
+        self.assertGreaterEqual(steady, gba_usb.MTP_RETRY_INTERVAL - 0.5)
+        # Unlocking the phone and pressing R retries immediately.
+        manager.refresh()
+        manager.poll()
+        self.assertEqual(len(attempts), 2)
+
+    def test_mount_error_is_translated_into_actionable_status(self):
+        sysfs = self.sysfs_device(
+            os.path.join(self.temp, "sysfs"), interface_class="06",
+            subclass="01", protocol="01", description="MTP")
+
+        def runner(argv, timeout=0):
+            if argv[1:2] == ["-l"]:
+                return completed()
+            return completed(returncode=1,
+                             stderr="jmtpfs: Unable to open MTP device")
+
+        manager = gba_usb.MtpManager(
+            auto_mount=True, mounts_path=self.mounts, sysfs_root=sysfs,
+            mount_root=os.path.join(self.temp, "fuse"), gvfs_roots=(),
+            runner=runner, command_exists=lambda name: name == "jmtpfs")
+        manager.poll()
+        status = manager.status()
+        self.assertIn("Unlock", status)
+        self.assertIn("MTP", status)
+
+    def test_locked_phone_prompts_once_it_unlocks(self):
+        """Mounted while locked (no files) -> later unlock must still prompt."""
+        sysfs = self.sysfs_device(
+            os.path.join(self.temp, "sysfs"), interface_class="06",
+            subclass="01", protocol="01", description="MTP")
+        mount_root = os.path.join(self.temp, "fuse")
+        unlocked = {"value": False}
+
+        def runner(argv, timeout=0):
+            if argv[1:2] == ["-l"]:
+                return completed("Available devices (busLocation, devNum, "
+                                 "productId, vendorId, product, vendor):\n"
+                                 "2, 19, 0x6860, 0x04e8, Pixel 7, Google\n")
+            root = argv[-1]
+            os.makedirs(os.path.join(root, "Internal storage"), exist_ok=True)
+            if unlocked["value"]:
+                path = os.path.join(root, "Internal storage", "Download", "late.gba")
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(b"LATE ROM".ljust(512, b"\0"))
+            return completed()
+
+        manager = gba_usb.MtpManager(
+            auto_mount=True, mounts_path=self.mounts, sysfs_root=sysfs,
+            mount_root=mount_root, gvfs_roots=(), runner=runner,
+            command_exists=lambda name: name == "jmtpfs")
+        watcher = gba_usb.VolumeWatcher(
+            interval=0.05, mounts_path=self.mounts, media_roots=(self.temp,),
+            mtp_provider=manager.poll)
+        self.assertEqual(watcher.poll_once(), [])          # locked: nothing to offer
+        self.assertFalse(watcher.seen)                     # ... so it is re-checked
+        # The user unlocks the phone: the FUSE view now shows the storage.
+        (locked_volume,) = manager.poll()
+        path = os.path.join(locked_volume.mountpoint, "Download", "late.gba")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"LATE ROM".ljust(512, b"\0"))
+        unlocked["value"] = True
+        pending = watcher.poll_once()
+        self.assertEqual(len(pending), 1)
+        self.assertTrue(pending[0].is_mtp)
+        self.assertEqual([os.path.basename(p) for p, _ in pending[0].new_roms],
+                         ["late.gba"])
+
+    def test_mtp_rom_with_unknown_size_is_offered_and_copied(self):
+        self.rom("Internal storage/Download/quirky.gba", "QUIRKY")
+        source = os.path.join(self.phone, "Internal storage", "Download", "quirky.gba")
+        real_getsize = os.path.getsize
+
+        def getsize(path, *args, **kwargs):
+            # This FUSE backend reports 0 until the file is read.
+            if os.path.abspath(path) == os.path.abspath(source):
+                return 0
+            return real_getsize(path, *args, **kwargs)
+
+        device = gba_usb.MtpDevice(bus=2, dev=19, serial="XYZ")
+        volume = gba_usb.MtpVolume(device, os.path.dirname(os.path.dirname(source)),
+                                   "Internal storage")
+        with patch("gba_usb.os.path.getsize", side_effect=getsize):
+            roms = volume.scan_roms()
+        self.assertEqual([os.path.basename(p) for p, _ in roms], ["quirky.gba"])
+        result = gba_usb.import_roms(volume, self.games, True)
+        self.assertEqual(len(result.copied), 1)
+        self.assertEqual(result.failed, [])
+        with open(result.copied[0], "rb") as f:
+            self.assertGreater(len(f.read()), 0)
+
+    def test_mounted_only_listing_never_runs_a_command(self):
+        self.rom("Internal storage/quiet.gba", "QUIET")
+        with patch("gba_usb.subprocess.run",
+                   side_effect=AssertionError("must not run a command")):
+            volumes = gba_usb.list_mounted_mtp_volumes(
+                self.mounts, roots=[self.phone], extra_roots=None)
+        self.assertEqual(len(volumes), 1)
+        self.assertTrue(volumes[0].is_mtp)
+
+    def test_diagnostics_report_every_stage(self):
+        sysfs = self.sysfs_device(
+            os.path.join(self.temp, "sysfs"), interface_class="06",
+            subclass="01", protocol="01", description="MTP")
+
+        def runner(argv, timeout=0):
+            return completed(returncode=1, stderr="jmtpfs: unable to open device")
+
+        manager = gba_usb.MtpManager(
+            auto_mount=True, mounts_path=self.mounts, sysfs_root=sysfs,
+            mount_root=os.path.join(self.temp, "fuse"), gvfs_roots=(),
+            runner=runner, command_exists=lambda name: name == "jmtpfs")
+        manager.poll()
+        report = manager.diagnose()
+        self.assertEqual(report["sysfs_mtp_interfaces"], 1)
+        self.assertTrue(report["jmtpfs"])
+        self.assertFalse(report["gio"])
+        self.assertIn("unable to open", report["last_error"])
+        text = gba_usb.mtp_diagnostics(manager=manager)
+        for needle in ("sysfs MTP interfaces", "tools", "mount root",
+                       "devices", "import volumes", "hint"):
+            self.assertIn(needle, text)
+        self.assertIn("Pixel 7", text)
+
+
+class TestIsoDependencies(unittest.TestCase):
+    """The image must ship the MTP tools the detection chain actually uses."""
+
+    def read(self, relative):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            relative)
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def iso_packages(self) -> list:
+        iso = self.read("scripts/build_iso.sh")
+        for line in iso.splitlines():
+            if "--include=" in line:
+                return line.split("--include=", 1)[1].split()[0].split(",")
+        return []
+
+    def test_iso_ships_the_libmtp_tools_the_detection_chain_uses(self):
+        packages = self.iso_packages()
+        self.assertIn("jmtpfs", packages)      # FUSE mount backend
+        self.assertIn("mtp-tools", packages)   # mtp-detect (libmtp probing)
+
+    def test_installer_diagnoses_missing_mtp_and_fuse(self):
+        installer = self.read("scripts/install.sh")
+        self.assertTrue("jmtpfs" in installer, "installer must mention jmtpfs")
+        self.assertTrue("mtp-tools" in installer, "installer must name mtp-tools")
+        self.assertTrue("gb_warn" in installer, "MTP must stay a warning, not a failure")
+        # jmtpfs can be installed and still unable to mount: /dev/fuse and the
+        # FUSE userland are checked explicitly.
+        self.assertTrue("/dev/fuse" in installer, "installer must check /dev/fuse")
+        self.assertTrue("fusermount" in installer,
+                        "installer must check the fusermount userland")
+
+    def test_no_extra_python_dependency_was_added(self):
+        requirements = self.read("requirements.txt")
+        for forbidden in ("pyudev", "dbus", "pymtp", "libmtp"):
+            self.assertNotIn(forbidden, requirements.lower())
 
 
 class TestMtpShellLabels(unittest.TestCase):

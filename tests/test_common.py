@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 import common
@@ -57,6 +58,65 @@ class TestCommonHelpers(unittest.TestCase):
         with open(os.path.join(self.test_dir, "config", "keybindings.json")) as f:
             self.assertEqual(json.load(f)["keyR"], 113)
         self.assertEqual(common.load_keybindings()["keyR"], 113)
+
+    def load_isolated(self):
+        """load_keybindings() with an empty HOME (no mGBA ini from another run)."""
+        with patch.dict(os.environ, {"HOME": self.test_dir}):
+            return common.load_keybindings()
+
+    def test_default_gba_buttons_are_z_a_and_x_b(self):
+        """The shipped mapping is Z -> A and X -> B (SDL 122 / 120)."""
+        self.assertEqual(common.DEFAULT_KEYBINDINGS["keyA"], 122)   # Z
+        self.assertEqual(common.DEFAULT_KEYBINDINGS["keyB"], 120)   # X
+        bindings = self.load_isolated()
+        self.assertEqual((bindings["keyA"], bindings["keyB"]), (122, 120))
+        # A fresh profile is exactly the shipped one.
+        self.assertEqual(bindings, common.sanitize_keybindings({}))
+
+    def test_a_stock_old_profile_is_migrated_without_being_asked(self):
+        path = os.path.join(self.test_dir, "config", "keybindings.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        legacy = dict(common.LEGACY_DEFAULT_KEYBINDINGS)
+        self.assertEqual((legacy["keyA"], legacy["keyB"]), (120, 122))
+        with open(path, "w") as f:
+            json.dump(legacy, f)
+        bindings = self.load_isolated()
+        self.assertEqual((bindings["keyA"], bindings["keyB"]), (122, 120))
+
+    def test_custom_bindings_survive_the_default_change(self):
+        path = os.path.join(self.test_dir, "config", "keybindings.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        custom = dict(common.DEFAULT_KEYBINDINGS)
+        custom["keyA"] = 113            # the user chose F2
+        custom["keyR"] = 114
+        with open(path, "w") as f:
+            json.dump(custom, f)
+        bindings = self.load_isolated()
+        self.assertEqual(bindings["keyA"], 113)
+        self.assertEqual(bindings["keyR"], 114)
+        # A profile that also changed another button keeps its Z/X choice,
+        # even when that choice looks like the old shipped pair.
+        custom = dict(common.LEGACY_DEFAULT_KEYBINDINGS, keyR=114)
+        with open(path, "w") as f:
+            json.dump(custom, f)
+        bindings = self.load_isolated()
+        self.assertEqual((bindings["keyA"], bindings["keyB"]), (120, 122))
+
+    def test_save_keybindings_records_a_profile_version(self):
+        common.save_keybindings(common.DEFAULT_KEYBINDINGS)
+        with open(os.path.join(self.test_dir, "config", "keybindings.json")) as f:
+            payload = json.load(f)
+        self.assertEqual(payload["version"], common.KEYBINDINGS_PROFILE_VERSION)
+        # ... and the loader ignores it instead of treating it as a button.
+        self.assertEqual(common.load_keybindings(), common.DEFAULT_KEYBINDINGS)
+
+    def test_legacy_default_profile_detection_is_exact(self):
+        self.assertTrue(common.is_legacy_default_profile(
+            dict(common.LEGACY_DEFAULT_KEYBINDINGS)))
+        self.assertFalse(common.is_legacy_default_profile(
+            dict(common.DEFAULT_KEYBINDINGS)))
+        self.assertFalse(common.is_legacy_default_profile(
+            dict(common.LEGACY_DEFAULT_KEYBINDINGS, keyR=113)))
 
     def test_display_config_roundtrip_and_alias(self):
         """D2: scaling choice persists; legacy labels still resolve."""

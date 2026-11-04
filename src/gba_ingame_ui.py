@@ -2,14 +2,20 @@
 Pygame renderer for the mGBA handler's in-game overlays.
 
 This is the same UI/input approach the launcher already uses: one event loop,
-`Theme` design units scaled to the native display, no new GUI framework.  The
-handler pauses mGBA, shows its last gameplay frame (captured with mGBA's
-native screenshot action) behind a dimmed panel, and resumes the *same*
-process on close.  Keyboard, gamepad hat/buttons and mouse all navigate.
+`Theme` design units scaled to the native display, no new GUI framework.
 
-If a display cannot be shared with the running emulator (e.g. a KMS/DRM
-session that already owns the DRM master), opening fails gracefully: the game
-is resumed immediately instead of crashing the handler.
+The handler performs a *display handoff* before this renderer is called: it
+captures the last gameplay frame (mGBA's native screenshot action) and a
+temporary native save state, then stops mGBA so its SDL/KMS/DRM surface is
+released.  This renderer therefore gets the display to itself, draws the
+captured frame behind a dimmed panel, and on close releases the window
+*before* the handler restarts mGBA from that state.  Keyboard, gamepad
+hat/buttons and mouse all navigate.
+
+If a display cannot be opened (a driver that refuses to initialise, or a
+KMS/DRM session another process still owns), opening fails gracefully: the
+overlay is closed and gameplay is restored immediately instead of crashing or
+freezing the handler.
 """
 
 import os
@@ -97,7 +103,19 @@ class InGameOverlayRenderer:
         except Exception as exc:
             self._log("In-game overlay display unavailable: %s", exc)
             self._display_ready = False
+            try:
+                self.session.status_message = f"Overlay display unavailable: {exc}"
+            except Exception:
+                pass
             return False
+        if not self.screenshot_path:
+            # The handler captured this frame just before the handoff.
+            getter = getattr(self.session.backend, "overlay_screenshot", None)
+            if callable(getter):
+                try:
+                    self.screenshot_path = getter()
+                except Exception:
+                    self.screenshot_path = None
         self._load_background()
         try:
             pygame.joystick.init()
@@ -132,9 +150,15 @@ class InGameOverlayRenderer:
         self.joysticks = []
 
     def run(self) -> None:
-        """Blocks only while an overlay is open; always releases the display."""
+        """Blocks only while an overlay is open; always releases the display.
+
+        The order matters for the display handoff: the overlay window is
+        closed *before* gameplay is restarted, otherwise mGBA would have to
+        create its SDL/KMS surface while Pygame still owns the screen.
+        """
         if not self.open():
             self.session.close_overlay()
+            self.session.finish_overlay()
             return
         try:
             while self.session.overlay is not None:
@@ -156,6 +180,10 @@ class InGameOverlayRenderer:
                 self.clock.tick(60)
         finally:
             self.close()
+            try:
+                self.session.finish_overlay()   # restart mGBA from the state
+            except Exception as exc:
+                self._log("Gameplay restart failed: %s", exc)
 
     # -------------------------------------------------------------------- input
     def handle(self, event) -> None:

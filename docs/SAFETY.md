@@ -121,7 +121,11 @@ Uninstalling restores `/etc/inittab` from `/etc/inittab.gba-backup` and keeps
 | pygame | The launcher prints what to install and exits `103`; the supervisor goes straight to the recovery console instead of looping |
 | mGBA | The game does not start; the adapter prints "mGBA is not installed" with the install command; saves are untouched |
 | mGBA crashes mid-game | Saves are backed up before the session and restored if the session dies (`restore_backup_if_needed`) |
-| `jmtpfs`/GVfs missing, locked phone, or charging-only USB | No Android MTP source is offered; pendrive import, games and boot are unaffected. MTP is read through a FUSE path — nothing on the phone is written, mounted as a disk, partitioned or formatted |
+| `jmtpfs`/GVfs missing, locked phone, or charging-only USB | No Android MTP source is offered; pendrive import, games and boot are unaffected. MTP is read through a FUSE path — nothing on the phone is written, mounted as a disk, partitioned or formatted. `gba-selftest --mtp` names the failing stage, and a phone mounted while locked is retried (quickly, then with backoff) so unlocking it later still prompts |
+| `/dev/fuse` missing or no `fusermount` | MTP import is disabled with a hint (`sudo modprobe fuse`, `apt install fuse3`); nothing else changes |
+| An in-game overlay fails to open (no display, no input injection, capture timeout) | The emulator keeps running or is resumed before the error is reported; a game is never left stopped, paused or orphaned behind a window that did not open |
+| The overlay renderer crashes while an overlay is open | The handler's safety net closes the overlay and resumes gameplay from the state it captured; if that fails it exits normally so the supervisor restarts the launcher rather than leaving a stopped emulator |
+| `mgba` accepts no native hotkeys (`/dev/uinput` unusable) | Overlays still open and close; save-state capture/load and speed changes report a readable error and the game continues |
 | X11 / Wayland | The shell runs directly on KMS/DRM, then on the dummy driver for headless checks |
 | `gba-supervisor` missing | `gba_init.sh` starts a rescue shell, never a black screen |
 | python3 missing | The init prints one line saying so, then starts the rescue shell |
@@ -131,6 +135,28 @@ Uninstalling restores `/etc/inittab` from `/etc/inittab.gba-backup` and keeps
 
 `make selftest` (or `gba-selftest`) checks a machine against this table and
 reports pass / warn / fail per row, with the exact fix for each failure.
+
+---
+
+### 6.1 Stopping an emulator is not "pausing" it
+
+An overlay needs the display, and a `SIGSTOP`ped emulator keeps its SDL/KMS surface: a second pygame
+window cannot acquire it, which is how an overlay used to draw a black screen over a frozen game.
+GBA OS therefore captures a native save state and a screenshot *first*, then stops mGBA, then draws
+the overlay with the launcher's own pygame/`Theme` code, and finally starts a new mGBA from the
+captured state. Three rules follow, and all three are enforced in code:
+
+1. **No key events to a stopped process.** Native hotkeys (`F1`–`F9`, `Shift+F1`–`F9`, `F12`) are
+   only ever sent to a running emulator; a capture request against a stopped/exited emulator is
+   refused immediately instead of waiting out a timeout.
+2. **Never two display owners.** The emulator is released before the overlay window is created, and
+   the overlay is closed before the replacement emulator is started.
+3. **Never leave the game stopped.** Every failure path (capture failed, overlay init failed,
+   renderer died, user quit mid-overlay) resumes or restarts gameplay, or ends the session cleanly so
+   the supervisor restarts the launcher.
+
+`Ctrl+Alt+Delete`-style hardware kills still apply: if the renderer is killed with `SIGKILL` the
+handler sees the overlay gone, resumes, and otherwise exits — it does not leave an orphaned emulator.
 
 ---
 

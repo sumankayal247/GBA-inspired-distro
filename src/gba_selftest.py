@@ -223,17 +223,36 @@ def check_config_roundtrip(data_dir: str) -> Check:
 
 
 def check_mtp() -> Check:
-    """Android phones need a libmtp/GVfs FUSE backend; USB sticks do not."""
-    if shutil.which("jmtpfs"):
-        return Check("android:mtp", PASS, "jmtpfs available (MTP FUSE import)")
-    if shutil.which("gio"):
-        return Check("android:mtp", PASS, "GVfs/GIO MTP backend available")
-    if shutil.which("mtp-detect"):
-        return Check("android:mtp", WARN, "libmtp detection present, no FUSE backend",
-                     "Install jmtpfs: sudo apt install jmtpfs (USB stick import still works).")
-    return Check("android:mtp", WARN, "no MTP backend installed",
-                 "Android File Transfer import needs jmtpfs or GVfs; "
-                 "install with: sudo apt install jmtpfs mtp-tools")
+    """Android phones need a libmtp/GVfs FUSE backend; USB sticks do not.
+
+    A phone also needs `/dev/fuse` and a working `fusermount`: jmtpfs can be
+    installed and still be unable to mount anything, which looks exactly like
+    "the phone is not detected". Both are reported.
+    """
+    tools = {name: bool(shutil.which(name))
+             for name in ("jmtpfs", "mtp-detect", "gio", "fusermount3", "fusermount")}
+    fuse_device = os.path.exists("/dev/fuse")
+    fuse = tools["fusermount3"] or tools["fusermount"]
+    if not (tools["jmtpfs"] or tools["gio"]):
+        if tools["mtp-detect"]:
+            return Check("android:mtp", WARN,
+                         "libmtp detection present, no FUSE backend",
+                         "Install jmtpfs: sudo apt install jmtpfs "
+                         "(USB stick import still works).")
+        return Check("android:mtp", WARN, "no MTP backend installed",
+                     "Android File Transfer import needs jmtpfs or GVfs; "
+                     "install with: sudo apt install jmtpfs mtp-tools")
+    backend = "jmtpfs" if tools["jmtpfs"] else "GVfs/GIO"
+    if not fuse_device:
+        return Check("android:mtp", WARN, f"{backend} present but /dev/fuse is missing",
+                     "Load the fuse module (sudo modprobe fuse) or boot the "
+                     "appliance kernel with FUSE enabled; USB stick import still works.")
+    if not fuse:
+        return Check("android:mtp", WARN, f"{backend} present but fusermount is missing",
+                     "Install fuse3/fuse: sudo apt install fuse3")
+    summary = f"{backend} backend ready (jmtpfs={int(tools['jmtpfs'])}, "
+    summary += f"mtp-tools={int(tools['mtp-detect'])}, fusermount=yes)"
+    return Check("android:mtp", PASS, summary)
 
 
 def check_native_hotkeys() -> Check:
@@ -246,6 +265,23 @@ def check_native_hotkeys() -> Check:
                  "no /dev/uinput and no xdotool on X11",
                  "In-game save states, overlays and fast-forward will open but "
                  "native capture/load cannot run; add uinput access or xdotool.")
+
+
+def mtp_report(attempt_mount: bool = True) -> str:
+    """Full MTP detection-chain report for `gba-selftest --mtp`.
+
+    `attempt_mount` is what makes this useful on hardware: it really runs
+    `jmtpfs -l`/`mtp-detect`/`gio mount -l` and, if a phone is visible,
+    attempts the same auto-mount the watcher would.
+    """
+    try:
+        import gba_usb
+    except Exception as exc:  # pragma: no cover - broken install
+        return f"MTP diagnostics unavailable: {exc}"
+    try:
+        return gba_usb.mtp_diagnostics(auto_mount=attempt_mount)
+    except Exception as exc:  # pragma: no cover - diagnostics never fatal
+        return f"MTP diagnostics failed: {exc}"
 
 
 def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
@@ -275,6 +311,9 @@ def main() -> int:
                                                              os.environ.get("DATA_DIR", "/data")))
     parser.add_argument("--games-dir", default=os.environ.get("GBA_GAMES_DIR",
                                                               os.environ.get("GAMES_DIR", "/games")))
+    parser.add_argument("--mtp", action="store_true",
+                        help="report the Android MTP detection chain "
+                             "(sysfs, libmtp, GVfs, FUSE mount root) and exit")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--quiet", action="store_true", help="only print problems")
     args = parser.parse_args()
@@ -282,6 +321,15 @@ def main() -> int:
     if args.installed and not args.src:
         args.src = os.environ.get("GBA_INSTALL_DIR", "/opt/gba-distro")
         args.src = os.path.join(args.src, "src")
+
+    if args.mtp:
+        try:
+            _import(args.src)
+        except Exception as exc:
+            print(f"cannot import the shell: {exc}")
+            return 2
+        print(mtp_report())
+        return 0
 
     checks = run_all(args.src, args.data_dir, args.games_dir)
     failures = [c for c in checks if c.status == FAIL]
