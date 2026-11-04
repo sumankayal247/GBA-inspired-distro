@@ -178,6 +178,12 @@ check_dependencies() {
     if ! command -v jmtpfs >/dev/null 2>&1 && ! command -v gio >/dev/null 2>&1; then
         gb_warn "Android MTP import needs jmtpfs (or GVfs): sudo apt install jmtpfs mtp-tools"
         gb_warn "USB pendrive import is unaffected."
+    elif [ ! -e /dev/fuse ]; then
+        # jmtpfs can be installed and still be unable to mount anything.
+        gb_warn "jmtpfs is installed but /dev/fuse is missing: sudo modprobe fuse"
+        gb_warn "Android MTP import will not work until FUSE is available."
+    elif ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
+        gb_warn "No fusermount found; install the FUSE userland: sudo apt install fuse3"
     fi
 
     if [ ${#missing[@]} -gt 0 ]; then

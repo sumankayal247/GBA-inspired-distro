@@ -137,7 +137,38 @@ class TestCheatsOverlay(SessionTestCase):
         self.assertIn("No cheats", model.message)
 
 
+class NoOverlayBackend(FakeBackend):
+    """A backend that cannot take the display for an overlay (no injection)."""
+
+    def suspend_for_overlay(self, kind=""):
+        return False
+
+
 class TestFastForward(SessionTestCase):
+    def test_no_badge_falls_back_to_a_speed_reload(self):
+        """A speed change must still reach the game when no overlay can open."""
+        session, backend = self.session(backend=NoOverlayBackend())
+        self.combo(session, "keyL", "keyR")
+        self.assertEqual(session.speed, 2)
+        self.assertIsNone(session.overlay)          # nothing was drawn
+        self.assertTrue(backend.alive)              # and the game is still up
+        self.assertFalse(backend.terminated)
+        # The runner is asked to reload the emulator instead, and the model is
+        # not claiming a speed the emulator never got.
+        self.assertTrue(session.take_relaunch())
+        self.assertFalse(session.take_relaunch())
+        self.assertEqual(session.indicator, "2x")
+
+    def test_a_failed_reload_returns_the_model_to_normal(self):
+        """`_restart_for_speed` failure is reported by resetting the cycle."""
+        session, backend = self.session(backend=NoOverlayBackend())
+        self.combo(session, "keyL", "keyR")
+        session.take_relaunch()
+        # This is what the runner calls when the reload cannot capture a state.
+        session.note_speed_reload_failed()
+        self.assertEqual(session.speed, 1)
+        self.assertEqual(session.indicator, "Normal")
+        self.assertIsNone(session.overlay)
     def test_cycle_is_exactly_1x_2x_3x_1x(self):
         controller = FastForwardController()
         self.assertEqual(controller.multiplier, 1)
@@ -379,6 +410,14 @@ class TestInputMapping(SessionTestCase):
         shortcuts = dict(DEFAULTS, fast_forward=("keyL", "keyL"))
         router = ComboRouter(shortcuts)
         self.assertEqual(router.shortcuts[ACTION_FAST_FORWARD], ("keyL", "keyR"))
+
+    def test_default_keyboard_profile_is_z_a_x_b(self):
+        """Z is A and X is B in the shipped profile (the old pair was reversed)."""
+        import common
+        bindings = dict(common.DEFAULT_KEYBINDINGS)
+        self.assertEqual(button_from_key(122, bindings), "keyA")   # Z
+        self.assertEqual(button_from_key(120, bindings), "keyB")   # X
+        self.assertNotEqual(button_from_key(120, bindings), "keyA")
 
     def test_keyboard_and_controller_map_to_the_same_buttons(self):
         bindings = {"keyUp": 1073741906, "keyL": 97, "keyR": 115}

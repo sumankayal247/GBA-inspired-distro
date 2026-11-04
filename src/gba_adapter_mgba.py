@@ -328,7 +328,7 @@ class InputMonitor(threading.Thread):
 
     def __init__(self, target_proc: subprocess.Popen, escape_keys=None,
                  shortcuts=None, action_queue=None, keybindings=None,
-                 on_consumed=None):
+                 on_consumed=None, alive_check=None, on_exit_requested=None):
         super().__init__(daemon=True, name="gba-input-monitor")
         self.proc = target_proc
         self.running = True
@@ -336,20 +336,45 @@ class InputMonitor(threading.Thread):
         self.shortcuts = shortcuts
         self.action_queue = action_queue
         self.on_consumed = on_consumed
+        # During a display handoff the emulator process is stopped on purpose
+        # while the overlay is open. The watcher must keep running through
+        # that window (otherwise the combo that closes the overlay is never
+        # seen), so liveness comes from the session, not from the child.
+        self.alive_check = alive_check
+        self.on_exit_requested = on_exit_requested
         self._evdev_map = evdev_button_map(keybindings or load_keybindings())
 
     def stop(self):
         self.running = False
-        # Before a speed relaunch, make sure the old watcher has stopped
-        # reading /dev/input and cannot terminate the freshly spawned child.
+        # Before a relaunch, make sure the old watcher has stopped reading
+        # /dev/input and cannot terminate the freshly spawned child.
         try:
             if self.is_alive() and threading.current_thread() is not self:
                 self.join(timeout=0.6)
         except Exception:
             pass
 
+    def alive(self) -> bool:
+        """True while the game session still owns input (overlay included)."""
+        if not self.running:
+            return False
+        if self.alive_check is not None:
+            try:
+                return bool(self.alive_check())
+            except Exception:
+                return False
+        try:
+            return self.proc.poll() is None
+        except Exception:
+            return False
+
     def _trigger(self, reason: str) -> None:
         logger.info("%s - sending SIGTERM to emulator", reason)
+        if self.on_exit_requested is not None:
+            try:
+                self.on_exit_requested()
+            except Exception:
+                pass
         try:
             self.proc.terminate()
         except Exception:
@@ -432,7 +457,7 @@ class InputMonitor(threading.Thread):
                     held.add(new)
                 axis_buttons[key] = new
 
-            while self.running and self.proc.poll() is None:
+            while self.alive():
                 try:
                     readable, _, _ = select.select(list(fds.keys()), [], [], 0.2)
                 except Exception:
@@ -628,12 +653,37 @@ class MgbaNativeController(InGameBackend):
     F12 hotkey; they are only ever visual thumbnails.  Speed changes use
     mGBA's `fpsTarget` config (60/120/180), applied with a state-preserving
     in-session reload.  Nothing here writes outside the handler's save dir.
+
+    Display handoff
+    ---------------
+    A Pygame overlay cannot take over a KMS/DRM or SDL display that a
+    suspended (SIGSTOP) mGBA still owns, which is why overlays used to show a
+    black screen with a frozen game.  ``suspend_for_overlay`` therefore:
+
+    1. captures a gameplay screenshot (F12) and a temporary native save state
+       (Shift+F9) **while mGBA is still running**,
+    2. asks the handler's ``handoff`` (the session runner) to stop mGBA
+       cleanly so the display is released,
+    3. lets the overlay renderer open its own window.
+
+    ``resume_from_handoff`` restarts mGBA with ``-t <captured state>`` and the
+    current ``fpsTarget``, so gameplay continues on the exact frame it left —
+    optionally at a new speed, and with the freshly written cheat file.
+
+    Hotkeys are never sent to a stopped process: every capture above happens
+    before the stop, and everything afterwards uses files plus a relaunch.
     """
 
     supports_runtime_speed = True
+    supports_display_handoff = True
+
+    #: Native slot used only for the private handoff/speed captures. It lives
+    #: in the runtime folder, never in the user's nine archived slots.
+    TRANSIENT_SLOT = 9
 
     def __init__(self, proc, content_path: str, save_dir: str,
-                 injector=None, fps_target: float = BASE_FPS):
+                 injector=None, fps_target: float = BASE_FPS,
+                 handoff=None, capture_timeout: float = 1.6):
         self.proc = proc
         self.content_path = content_path
         self.save_dir = save_dir
@@ -647,6 +697,13 @@ class MgbaNativeController(InGameBackend):
         self.last_screenshot = None
         self._button_to_evdev = {button: code for code, button in
                                  evdev_button_map(load_keybindings()).items()}
+        # Set by the session runner (the only owner of the child process).
+        self.handoff = handoff
+        self.capture_timeout = float(capture_timeout)
+        self._suspended = False
+        #: Native state that gameplay will be restarted from.
+        self.resume_state: Optional[str] = None
+        self.last_error = ""
 
     # -- process control -----------------------------------------------
     def _signal(self, sig) -> bool:
@@ -659,9 +716,7 @@ class MgbaNativeController(InGameBackend):
         return False
 
     def pause(self) -> bool:
-        # Capture the last gameplay frame *before* stopping mGBA: the overlay
-        # shows it behind the panel so the game appears preserved.  The short
-        # timeout keeps a missing screenshot from stalling the whole overlay.
+        """Legacy SIGSTOP pause (only used when no process handoff exists)."""
         self.last_screenshot = self.capture_screenshot(0, timeout=0.6)
         self._paused = self._signal(signal.SIGSTOP)
         return self._paused
@@ -672,11 +727,92 @@ class MgbaNativeController(InGameBackend):
         self._paused = False
         return self._signal(signal.SIGCONT)
 
+    # -- display handoff ------------------------------------------------
+    @property
+    def suspended(self) -> bool:
+        return self._suspended
+
+    def suspend_for_overlay(self, kind: str = "") -> bool:
+        """Captures the game, then releases the display for an overlay."""
+        if self._suspended:
+            return True
+        if self.handoff is None:
+            # No process owner to restart us: the only safe thing left is the
+            # old pause, and the renderer resumes on failure.
+            logger.info("No display handoff available; falling back to pause")
+            return self.pause()
+        logger.info("Display handoff for overlay '%s': capturing frame + state", kind)
+        # Step 1: both captures happen while mGBA is still executing.
+        self.last_screenshot = self.capture_screenshot(0, timeout=self.capture_timeout)
+        state = self.capture_runtime_state("handoff")
+        if not state:
+            self.last_error = "could not capture a native save state"
+            logger.warning("Display handoff aborted: %s (game keeps running)",
+                           self.last_error)
+            return False
+        # Step 2: stop mGBA so it releases SDL/KMS/DRM, keeping the state.
+        self.resume_state = state
+        if not self.handoff.stop_emulator():
+            self.last_error = "mGBA did not stop"
+            logger.error("Display handoff failed: %s", self.last_error)
+            self.resume_state = None
+            self._resume_if_needed()
+            return False
+        self._paused = False
+        self._suspended = True
+        logger.info("Gameplay suspended at %s; overlay owns the display now",
+                    os.path.basename(state))
+        return True
+
+    def resume_from_handoff(self) -> bool:
+        """Restarts mGBA from the captured state (new speed/cheats applied)."""
+        if self.handoff is None:
+            return self.resume()
+        if not self._suspended:
+            return False
+        self._suspended = False
+        state = self.resume_state
+        ok = self.handoff.start_emulator(state, self.fps_target)
+        if not ok:
+            self.last_error = "mGBA could not be restarted"
+            logger.error("Resume failed (%s); retrying without the state",
+                         self.last_error)
+            # A failed resume must never leave the user without a game.
+            ok = self.handoff.start_emulator(None, self.fps_target)
+        else:
+            logger.info("Gameplay resumed from %s at fpsTarget=%g",
+                        os.path.basename(state or ""), self.fps_target)
+        self.resume_state = None
+        return ok
+
+    def _resume_if_needed(self) -> None:
+        """Safety net for a half-applied handoff."""
+        if not self._suspended:
+            return
+        try:
+            self.resume_from_handoff()
+        except Exception:
+            pass
+
+    def overlay_state(self):
+        """The state captured before the handoff (None when not suspended)."""
+        return self.resume_state
+
+    def overlay_screenshot(self):
+        return self.last_screenshot
+
     def set_speed(self, multiplier: int, fps_target: float) -> bool:
         self.fps_target = float(fps_target)
-        # mGBA SDL reads fpsTarget when the core starts; request the
-        # state-preserving reload only when hotkeys are actually deliverable.
+        # With a handoff the overlay-driven restart picks the new fpsTarget up
+        # (mGBA SDL reads it at core start), so no separate relaunch is
+        # requested. Without one, ask the runner for the legacy reload.
+        if self.handoff is not None:
+            return False
         return self.injector.available()
+
+    def reload_cheats(self) -> bool:
+        """Cheat toggles are applied by the handoff restart reading `-c`."""
+        return self.handoff is not None
 
     def suppress_combo(self, buttons) -> None:
         """Best effort: release consumed keys so they do not reach gameplay."""
@@ -724,12 +860,20 @@ class MgbaNativeController(InGameBackend):
             pass
 
     def save_state(self, slot: int):
-        """Asks mGBA for a native state; returns a staged copy or None."""
+        """Asks mGBA for a native state; returns a staged copy or None.
+
+        Requires a *running* emulator: mGBA only produces a state when its own
+        Shift+F<N> action is processed. A stopped (or handed-off) emulator
+        never sees the hotkey, so this refuses instead of hanging on a timeout.
+        """
         try:
             slot = int(slot)
         except (TypeError, ValueError):
             return None
         if not 1 <= slot <= 9:
+            return None
+        if self._suspended or self._paused:
+            logger.warning("Not capturing a native state while the emulator is stopped")
             return None
         path = self.native_state_path(slot)
         backup = path + ".previous"
@@ -755,6 +899,9 @@ class MgbaNativeController(InGameBackend):
 
     def capture_screenshot(self, slot: int = 0, timeout: float = 1.6):
         """Asks mGBA for a native PNG frame; a visual thumbnail, never state."""
+        if self._suspended or self._paused:
+            # F12 to a stopped process would only burn the timeout.
+            return self.last_screenshot
         pattern = os.path.join(self.runtime_dir, "*.png")
         before = set(glob.glob(pattern))
         if not self.injector.tap([KEY_F12]):
@@ -782,31 +929,78 @@ class MgbaNativeController(InGameBackend):
             except OSError:
                 pass
 
+    def prepare_resume_state(self, state_path: str) -> Optional[str]:
+        """Copies a slot's state to a scratch file mGBA can be restarted from.
+
+        The archived slot itself is never handed to mGBA, so a failed load can
+        neither corrupt nor rewrite it; the copy is atomic.
+        """
+        if not state_path or not os.path.isfile(state_path):
+            return None
+        target = os.path.join(self.runtime_dir, "resume_state.ss")
+        tmp = target + ".tmp"
+        try:
+            if os.path.getsize(state_path) <= 0:
+                return None
+            shutil.copyfile(state_path, tmp)
+            os.replace(tmp, target)
+            return target
+        except Exception as exc:
+            logger.warning("Could not stage %s for resume: %s", state_path, exc)
+            for path in (tmp, target):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+            return None
+
     def load_state(self, slot: int, state_path: str) -> bool:
-        """Restores the *actual* mGBA state with its native F<N> hotkey."""
+        """Restores the actual mGBA state.
+
+        During a handoff the emulator is *not running*, so no F-key is sent:
+        the state is staged and the restart at overlay close loads it with
+        ``-t``. Only a live emulator without a handoff uses the native F<N>
+        hotkey.
+        """
         try:
             slot = int(slot)
         except (TypeError, ValueError):
             return False
         if not 1 <= slot <= 9 or not state_path or not os.path.isfile(state_path):
             return False
+        if self._suspended or (self.handoff is not None and self.resume_state):
+            staged = self.prepare_resume_state(state_path)
+            if not staged:
+                return False
+            self.resume_state = staged
+            logger.info("Slot %d staged as the resume state for the restart", slot)
+            return True
         try:
             shutil.copyfile(state_path, self.native_state_path(slot))
         except Exception:
             return False
         return self.injector.tap([KEY_F1 + slot - 1])
 
-    def capture_ephemeral_state(self):
-        """Native state used only to resume at the exact frame after a reload."""
-        staged = self.save_state(9)
+    def capture_runtime_state(self, name: str = "handoff") -> Optional[str]:
+        """Native state used only to resume at the exact frame after a reload.
+
+        The capture must happen while mGBA is running (it is mGBA's own
+        Shift+F<N> action); the returned file is a private runtime copy.
+        """
+        staged = self.save_state(self.TRANSIENT_SLOT)
         if not staged:
             return None
-        target = os.path.join(self.runtime_dir, "speed_state.ss")
+        target = os.path.join(self.runtime_dir, f"{name}.ss")
         try:
             shutil.copyfile(staged, target)
             return target
         except Exception:
             return None
+
+    def capture_ephemeral_state(self):
+        """Backwards-compatible alias for the fast-forward capture."""
+        return self.capture_runtime_state("speed_state")
 
 
 def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
@@ -913,15 +1107,23 @@ class MgbaSessionRunner:
     """Runs mGBA, streams its log, watches input and serves in-game actions.
 
     With no session this is exactly the old behaviour (one child, one input
-    watcher).  With a session the same child is kept alive across overlays;
-    only a fast-forward speed change performs a *state-preserving* relaunch so
-    mGBA can pick up its native `fpsTarget` override (1x/2x/3x), which its SDL
-    frontend reads at core start.
+    watcher).  With a session this runner is also the *process owner* for the
+    display handoff: overlays ask it to stop mGBA (``stop_emulator``) so the
+    overlay can own the screen, and to restart it from the captured native
+    state (``start_emulator``) when the overlay closes.  A fast-forward speed
+    change uses the same relaunch, because mGBA SDL reads `fpsTarget` at core
+    start.
+
+    The runner is the only place that spawns or terminates mGBA, so no code
+    path can leave a stopped or orphaned emulator behind: every stop is paired
+    with either a restart or the end of the session, and ``run()`` clears any
+    remaining suspension in its ``finally`` block.
     """
 
     def __init__(self, cmd: list, env: dict, session=None, action_queue=None,
                  native=None, build_command=None, overlay_size=None,
-                 theme_name: str = "indigo", windowed: bool = False):
+                 theme_name: str = "indigo", windowed: bool = False,
+                 stop_timeout: float = 4.0):
         self.cmd = cmd
         self.env = env
         self.session = session
@@ -931,14 +1133,75 @@ class MgbaSessionRunner:
         self.overlay_size = overlay_size
         self.theme_name = theme_name
         self.windowed = windowed
+        self.stop_timeout = float(stop_timeout)
         self.child = None
         self.monitor = None
         self.bindings = load_keybindings()
+        self.exit_requested = False
+        self.shutting_down = False
+        self.spawn_count = 0
+        if self.native is not None:
+            # The controller uses this to stop/start the emulator around an
+            # overlay without ever signalling a stopped process.
+            self.native.handoff = self
 
+    # -- handoff interface (used by MgbaNativeController) -----------------
+    def stop_emulator(self, timeout: Optional[float] = None) -> bool:
+        """Stops mGBA cleanly so its SDL/KMS/DRM display is released."""
+        child = self.child
+        if child is None:
+            return True
+        if child.poll() is not None:
+            return True
+        timeout = self.stop_timeout if timeout is None else float(timeout)
+        logger.info("Stopping mGBA (pid %s) for a display handoff", getattr(child, "pid", -1))
+        try:
+            child.terminate()
+        except Exception as exc:
+            logger.warning("Could not send SIGTERM to mGBA: %s", exc)
+        try:
+            child.wait(timeout=timeout)
+        except Exception:
+            logger.warning("mGBA did not exit in %.1fs; killing it", timeout)
+            try:
+                child.kill()
+                child.wait(timeout=2.0)
+            except Exception:
+                pass
+        # The input watcher deliberately keeps running: it is what delivers
+        # the combo that closes the overlay, and it lives as long as the
+        # session (`_session_alive`), not as long as this child.
+        stopped = child.poll() is not None
+        if not stopped:
+            logger.error("mGBA is still running after the handoff stop")
+        return stopped
+
+    def start_emulator(self, state_path: Optional[str] = None,
+                       fps_target: Optional[float] = None) -> bool:
+        """Restarts mGBA, optionally resuming a native state and speed."""
+        if self.shutting_down or self.exit_requested or not self.build_command:
+            logger.info("Not restarting mGBA (session ending)")
+            return False
+        try:
+            cmd = self.build_command(fps_target=fps_target, savestate=state_path)
+            logger.info("Restarting mGBA%s at fpsTarget=%s",
+                        " from saved state" if state_path else "",
+                        f"{float(fps_target):g}" if fps_target else "default")
+            self._spawn(cmd)
+        except Exception as exc:
+            logger.error("Restarting mGBA failed: %s", exc)
+            return False
+        return self.child is not None and self.child.poll() is None
+
+    # -- process plumbing -------------------------------------------------
     def _spawn(self, cmd: list) -> None:
+        if self.monitor is not None:
+            self.monitor.stop()
+            self.monitor = None
         self.child = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                       stderr=subprocess.STDOUT, text=True,
                                       bufsize=1, env=self.env)
+        self.spawn_count += 1
         if self.native is not None:
             self.native.proc = self.child
         self.monitor = InputMonitor(
@@ -948,10 +1211,24 @@ class MgbaSessionRunner:
             action_queue=self.action_queue,
             keybindings=self.bindings,
             on_consumed=(self.native.suppress_combo if self.native else None),
+            alive_check=self._session_alive,
+            on_exit_requested=self._request_exit,
         )
         self.monitor.start()
         threading.Thread(target=self._pump_stdout, args=(self.child,),
                          daemon=True, name="gba-mgba-log").start()
+
+    def _session_alive(self) -> bool:
+        """Liveness for the input watcher: the session, not the child.
+
+        During a handoff the child is deliberately stopped, but the watcher
+        must keep delivering the shortcut that closes the overlay.
+        """
+        return not (self.shutting_down or self.exit_requested)
+
+    def _request_exit(self) -> None:
+        self.exit_requested = True
+        logger.info("Exit gesture requested; ending the session after the overlay")
 
     @staticmethod
     def _pump_stdout(child) -> None:
@@ -966,46 +1243,27 @@ class MgbaSessionRunner:
             pass
 
     def _terminate_child(self) -> None:
-        child = self.child
-        if child is None:
-            return
-        try:
-            if child.poll() is None:
-                child.terminate()
-                try:
-                    child.wait(timeout=3.0)
-                except Exception:
-                    child.kill()
-                    child.wait()
-        except Exception:
-            pass
+        self.stop_emulator()
 
     def _restart_for_speed(self, fps_target: float) -> bool:
-        """Applies mGBA's fpsTarget natively, resuming at the exact frame."""
+        """Applies mGBA's fpsTarget natively, resuming at the exact frame.
+
+        Only used when the controller has no handoff; the normal path applies
+        the speed while resuming from the overlay.
+        """
         if self.native is None or not self.build_command:
             return False
         state = None
         try:
-            state = self.native.capture_ephemeral_state()
+            state = self.native.capture_runtime_state("speed_state")
         except Exception as exc:
             logger.warning("Could not capture a state for speed change: %s", exc)
         if not state:
             logger.warning("Speed change needs a native state; keeping current speed")
             return False
-        try:
-            self.monitor.stop()
-            self._terminate_child()
-            cmd = self.build_command(fps_target=fps_target, savestate=state)
-            logger.info("Applying mGBA fpsTarget=%g with native state resume", fps_target)
-            self._spawn(cmd)
-            return True
-        except Exception as exc:
-            logger.error("Speed reload failed (%s); restarting normally", exc)
-            try:
-                self._spawn(self.build_command())
-            except Exception:
-                pass
+        if not self.stop_emulator():
             return False
+        return self.start_emulator(state, fps_target)
 
     def _drain_actions(self) -> None:
         if self.action_queue is None or self.session is None:
@@ -1020,6 +1278,7 @@ class MgbaSessionRunner:
     def _serve_overlay(self) -> None:
         if self.session is None or self.session.overlay is None:
             return
+        overlay_kind = getattr(self.session.overlay, "kind", "")
         try:
             from gba_ingame_ui import InGameOverlayRenderer
             renderer = InGameOverlayRenderer(
@@ -1035,8 +1294,11 @@ class MgbaSessionRunner:
         except Exception as exc:
             logger.warning("In-game overlay unavailable: %s", exc)
         finally:
-            # Never leave the emulator paused if the display/UI failed.
+            # Always close the model: closing resumes gameplay from the
+            # captured state, so a failed display cannot freeze the game.
             self.session.close_overlay()
+            logger.info("Overlay '%s' closed; gameplay %s", overlay_kind,
+                        "resumed" if not self.exit_requested else "ending")
 
     def run(self) -> int:
         try:
@@ -1072,20 +1334,32 @@ class MgbaSessionRunner:
                     # change queued while a badge was showing), so serve and
                     # check for a pending reload on every tick, not only when
                     # this thread dequeued the action itself.
-                    self._serve_overlay()
+                    if self.session.overlay is not None:
+                        self._serve_overlay()
                     if self.session.take_relaunch():
-                        self._restart_for_speed(
-                            self.session.fast_forward.fps_target)
+                        if not self._restart_for_speed(
+                                self.session.fast_forward.fps_target):
+                            self.session.note_speed_reload_failed()
                 else:
                     time.sleep(0.1)
+                if self.exit_requested:
+                    break
                 child = self.child
                 if child is None or child.poll() is not None:
                     break
             child = self.child
             ret = child.wait() if child is not None else 0
         finally:
+            self.shutting_down = True
+            # Rule: never leave mGBA stopped, running, or half-relaunched.
+            if self.session is not None:
+                try:
+                    self.session.release_display()
+                except Exception:
+                    pass
             if self.monitor:
                 self.monitor.stop()
+            self._terminate_child()
             for sig, handler in previous.items():
                 try:
                     signal.signal(sig, handler)
@@ -1177,9 +1451,26 @@ def main():
     session = None
     actions = None
     native = None
-    cheat_file = None
+    cheat_store = None
     cheats_dir = None
     runtime_dir = None
+
+    def current_cheat_file():
+        """Re-renders mGBA's native cheat file for every emulator start.
+
+        The Cheats overlay only edits the per-game list; the file mGBA reads
+        with `-c` is rewritten here, so a cheat enabled in the overlay is
+        active in the restarted session without a launcher restart. A game
+        with no cheats at all must not get an empty `-c` argument.
+        """
+        if cheat_store is None:
+            return None
+        try:
+            return cheat_store.write_native()
+        except Exception as exc:
+            logger.warning("Could not write the native cheat file: %s", exc)
+            return None
+
     if valid_game_id(game_id):
         try:
             cheat_store = CheatStore(game_id, content_path)
@@ -1191,14 +1482,14 @@ def main():
                                     state_store, native)
             actions = queue.Queue()
             cheats_dir = cheat_store.cheats_dir
-            cheat_file = cheat_store.write_native()
+            current_cheat_file()
             logger.info("In-game features ready for %s (cheats=%d, shortcuts=%s)",
                         game_id, len(cheat_store.cheats()), shortcuts)
         except Exception as exc:
             # A broken optional feature must never stop a game from starting.
             logger.warning("In-game features unavailable: %s", exc)
             session, actions, native = None, None, None
-            cheat_file, cheats_dir, runtime_dir = None, None, None
+            cheat_store, cheats_dir, runtime_dir = None, None, None
     else:
         logger.warning("Invalid game identity; in-game features disabled")
 
@@ -1207,7 +1498,7 @@ def main():
             mgba_bin, content_path, save_dir,
             is_windowed if windowed is None else windowed,
             display_scaling, screen if size is None else size,
-            cheat_file=cheat_file, cheats_dir=cheats_dir,
+            cheat_file=current_cheat_file(), cheats_dir=cheats_dir,
             savestate=savestate, fps_target=fps_target,
             runtime_dir=runtime_dir)
 

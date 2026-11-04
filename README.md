@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Contract](https://img.shields.io/badge/Contract-Draft%202%20(V1)-purple.svg)](docs/CONTRACT.md)
-[![Tests](https://img.shields.io/badge/Tests-370%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/Tests-412%20passing-brightgreen.svg)](tests)
 [![Safe by default](https://img.shields.io/badge/install-safe%20by%20default-blue.svg)](docs/SAFETY.md)
 
 **GBA OS** is an appliance-style Linux operating system experience designed to turn any PC or laptop into a dedicated Game Boy Advance console.
@@ -182,6 +182,7 @@ Check any machine before or after an install:
 ```bash
 gba-selftest              # PASS/WARN/FAIL per component, with the fix for each FAIL
 gba-selftest --json       # same, for scripts
+gba-selftest --mtp        # the whole Android MTP chain, link by link, with one hint
 ```
 
 The installer:
@@ -206,6 +207,9 @@ The installer:
 | **Open the terminal** | — | `Ctrl+Alt+T` (toggles, works from any tab or dialog) |
 | **Launch / Select (A)** | `A` Button (Button 0) | `Enter` / `Z` / `Space` |
 | **Back / Cancel (B)** | `B` Button (Button 1) | `Esc` / `X` / `Backspace` |
+
+In a game the shipped keyboard profile is straight GBA: `Z` = **A**, `X` = **B**, arrows = D-pad,
+`A` / `S` = **L** / **R**, `Enter` = **START**, `Backspace` = **SELECT**.
 | **Search library** | — | just start typing (`Backspace` edits, `Esc` clears) |
 | **Toggle cartridge/list view** | — | `Ctrl+V` |
 | **Help / screenshot** | — | `F1` / `F12` (saved to `DATA/screenshots/`) |
@@ -214,19 +218,33 @@ The installer:
 Browser: `Ctrl+L` types an address, `Tab` / `1`–`9` pick a link, `Enter` opens it, `Alt+Left` /
 `Alt+Right` walk history, `R` reloads, `Up`/`Down`/`PgUp`/`PgDn` scroll.
 
-All ten GBA buttons are remappable under **SETTINGS → Controls → Remap buttons**; the same profile drives both the
-shell and mGBA, so a gamepad behaves identically in the two. Reserved shell keys (Esc, Tab, arrows,
-Ctrl/Alt) and duplicate assignments are rejected with an inline explanation.
+All ten GBA buttons are remappable under **SETTINGS → Controls → Remap buttons**; the same profile
+drives both the shell and mGBA (written into the handler's `config.ini`), so a gamepad behaves
+identically in the two. Reserved shell keys (Esc, Tab, arrows, Ctrl/Alt) and duplicate assignments
+are rejected with an inline explanation. The default profile changed in this release: `Z` is now
+**A** and `X` is **B** (they were swapped). A profile you customised is never overwritten — only a
+stored profile that is still exactly the old stock pair is migrated.
 
 ---
 
 ## 🎛️ In-Game Overlays & Shortcuts
 
-These live in the mGBA handler, not in a second application: mGBA keeps running, is paused while an
-overlay is open and is resumed on close. The overlays reuse the launcher's `Theme`/pygame approach —
-no new GUI toolkit, no second display stack. Navigation is controller-first (D-pad/hat/buttons) with
-keyboard and mouse fallback. Combos are edge-triggered: holding them does not fire again, and the
-consumed buttons are released so they cannot also act as gameplay input.
+These live in the mGBA handler, not in a second application and not in a second GUI toolkit. An
+overlay needs the screen, and a *stopped* mGBA still owns its SDL/KMS surface, so opening one is a
+four-step handoff:
+
+1. while the game is still running, the handler captures a **native mGBA save state** and a
+   **screenshot** of the current frame;
+2. mGBA is stopped and releases the display;
+3. the overlay is drawn with the launcher's existing `Theme`/pygame code;
+4. on close the overlay gives the display back and a **new mGBA is started from the captured state**
+   (`-t`), at the current fast-forward speed.
+
+If step 1 fails, the overlay does not open and the game keeps running — a game is never left frozen
+behind a window that failed to appear, and no key is ever sent to a stopped emulator. Navigation is
+controller-first (D-pad/hat/buttons) with keyboard and mouse fallback. Combos are edge-triggered:
+holding them does not fire again, and the consumed buttons are released so they cannot also act as
+gameplay input.
 
 | Action | Default combo | Behaviour |
 | :--- | :--- | :--- |
@@ -254,11 +272,14 @@ DATA/config/favorites.json       # content ids, stable favorites-first ordering
 ```
 
 Cheats are loaded through mGBA's own `-c <file>` mechanism (`cheatAutoload=0` when a game has none,
-so no global list leaks in). Save/load use mGBA's native state hotkeys; screenshots are separate PNGs.
-Speed uses mGBA's real `fpsTarget` (60/120/180) rather than skipped frames or hand-written timing.
-State files, thumbnails and JSON are written atomically, verified by size + SHA-256 on load, and
-rolled back to the previous good save if a later write fails; missing/corrupt data never crashes the
-emulator or supervisor.
+so no global list leaks in); toggling one persists immediately and the restart above picks it up, so
+the change is active in the running game. Save/load use mGBA's native state hotkeys — sent only while
+mGBA is *running*, which is exactly the moment the handoff captures them. Screenshots are separate
+PNGs. Speed uses mGBA's real `fpsTarget` (60/120/180) rather than skipped frames or hand-written
+timing. Slots are written atomically (temp file + `os.replace`), verified by size + SHA-256 on load,
+and rolled back to the previous good state if a later write fails; missing/corrupt data never
+crashes the emulator or supervisor, and the user's nine slots never include the handler's private
+handoff slot.
 
 **SETTINGS → Game Management** lists imported games and offers `Delete Selected Games` (multi-select,
 confirmation) and `Delete All Imported Games` (confirmation plus a two-second hold). Deletion removes
@@ -269,11 +290,11 @@ is duplicated.
 
 > **Real-hardware caveats.** Native hotkeys are delivered through `/dev/uinput` (or `xdotool` on
 > X11); without either, overlays still open/close but native capture, load and speed reload degrade
-> gracefully. `gba-selftest` reports this. Cheat enable/disable changes are persisted immediately but
-> mGBA applies them on the next launch — closing the overlay never restarts the game. Speed changes
-> use a state-preserving in-session reload (`-t` with a freshly captured native state) because
-> mgba-sdl has no runtime speed IPC; the exact audio pacing and display sharing on KMS/DRM need
-> verification on the appliance. None of this is verifiable in the headless test suite.
+> gracefully. `gba-selftest` reports this. Each overlay open/close costs one emulator restart
+> (≈0.3–1 s), and audio may click across it. Speed changes use the same state-preserving reload
+> (`-t` with a freshly captured native state) because mgba-sdl has no runtime speed IPC; the exact
+> DRM release latency, audio pacing at 2x/3x and restart cost need verification on the appliance.
+> None of this is verifiable in the headless test suite.
 
 ---
 
@@ -296,8 +317,12 @@ is duplicated.
   existing GVfs `mtp://` mount). It is shown as `ANDROID MTP`, never as a removable disk. The same
   extension filter, confirmation prompt, content-ID deduplication, size verification and `(n)` clash
   rule apply. Install `sudo apt install jmtpfs mtp-tools` on a system image built without them;
-  normal USB sticks work without MTP support. A locked screen or charging-only mode simply yields no
-  phone source.
+  normal USB sticks work without MTP support. A locked screen or charging-only mode yields no phone
+  source, but the import screen says *why* and keeps retrying (three quick attempts, then every
+  15 s), so unlocking the phone in the same session still produces the prompt. MTP storages that
+  report `0`-byte file sizes are scanned and imported normally. `gba-selftest --mtp` prints every
+  link of the chain (sysfs interface, `jmtpfs`/`mtp-detect`, GVfs, FUSE mount root, devices,
+  volumes, last error) with one actionable hint.
 - **Settings:** `DATA/config/settings.json` is the single store (scaling, theme, clock, view mode,
   volume, USB behaviour, launch confirmation). `keybindings.json` and `history.json` live beside it;
   a legacy `display.json` is migrated automatically on first run.
@@ -307,7 +332,7 @@ is duplicated.
 ## 🧪 Testing & Development
 
 ```bash
-make test       # 370 tests (headless, no display needed)
+make test       # 412 tests (headless, no display needed)
 make lint       # byte-compile Python + syntax-check every shell script
 make selftest   # check *this* machine: interpreter, fonts, pty, display, mGBA, storage, config
 make iso-check  # what is missing to build a bootable ISO here
@@ -319,7 +344,14 @@ handler environment isolation (H1), outcome classification (H10), crash-loop han
 cleanup (S8), save durability and restoration (SV2–SV4), log rotation (ST5), input-profile validation
 (I3), ROM import safety (ST7, ST8), the settings store and theme system, the ANSI terminal emulator, the
 browser's HTML extractor/layout/history, and shell behaviour (tabs, `Alt+Tab`, `Ctrl+Alt+T`, search,
-empty state, confirmation-gated launches).
+empty state, confirmation-gated launches). The in-game suites cover the display handoff end to end
+(`tests/test_ingame_handoff.py`: mGBA is dead while the overlay renders and a *new* child starts from
+the captured state, at the inherited speed), all nine save-state slots
+(`tests/test_game_data.py`), cheat persistence and application after the overlay closes, the
+`1x → 2x → 3x → 1x` cycle and its edge-triggering, and the `Z`→`A` / `X`→`B` defaults with migration
+for stock profiles only. `tests/test_mtp.py` covers each link of the phone chain separately (sysfs
+protocol 0, quoted `jmtpfs -l`, PTP-camera exclusion, GVfs URI derivation, locked-phone re-prompt,
+0-byte storages, mount-only listing with no subprocess, and `gba-selftest --mtp`).
 
 Installer safety has its own suites: `tests/test_installer.py` (every refusal rule, the
 copy → verify → bootloader order, dry runs, confirmation gating), `tests/test_setup.py` (which
@@ -344,7 +376,8 @@ make screenshots   # regenerates the four README images
 | Game starts to a black screen | The adapter now resolves the display session itself (a stale `DISPLAY` or a KMS/DRM driver inside a live desktop is the usual cause) and retries once in a window. Check `/data/logs/latest.log` for `Display session=...` and `[mgba]` lines. |
 | Game exits immediately | Check `/data/logs/latest.log` for `[handler]` lines; verify `mgba` is installed (`which mgba`). |
 | Pendrive not detected | The filesystem must be mounted (any desktop does that automatically). Open **SETTINGS → Library → Import from USB / MTP** and press `R` to rescan. |
-| Android phone not detected | Unlock it, choose **File Transfer / MTP** (not charging only), and press `R` in the import screen. Install `sudo apt install jmtpfs mtp-tools` if `gba-selftest` reports no MTP backend. GVfs `mtp://` mounts are reused automatically. |
+| Android phone not detected | Unlock it, choose **File Transfer / MTP** (not charging only), and press `R` in the import screen. Run `gba-selftest --mtp`: it names the failing link. Install `sudo apt install jmtpfs mtp-tools` when the tools are missing, `sudo modprobe fuse` when `/dev/fuse` is missing, and `fuse3` when no `fusermount` is found. GVfs `mtp://` mounts are reused automatically. |
+| Overlay does not open | The game keeps running on purpose: the native state/frame capture failed (usually `/dev/uinput` unavailable). `gba-selftest` reports input injection; overlay save/load then degrades but never freezes gameplay. |
 | Terminal is unavailable | The shell needs a PTY; check that `/dev/pts` is mounted (`SHELL=/bin/sh src/gba_launcher.py` still works for a quick test). |
 | Xbox-style pad exits games | The SELECT+START, Guide, and `Esc` combinations are the system exit gestures — see the launch screen. |
 | Everything is broken | At the GRUB menu pick `GBA OS (safe graphics / recovery)`, or add `gba_mode=0` to the kernel line for a normal login prompt. The recovery console (option 4) exports your saves first. |

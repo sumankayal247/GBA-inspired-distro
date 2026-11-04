@@ -5,6 +5,7 @@ Contract Tests for GBA OS mGBA Adapter (Rules H1, H5, SV1-SV4).
 import os
 import sys
 import unittest
+from unittest import mock
 import tempfile
 import shutil
 
@@ -153,6 +154,25 @@ class TestAdapterContract(unittest.TestCase):
             if old_home is not None:
                 os.environ["HOME"] = old_home
             shutil.rmtree(home, ignore_errors=True)
+
+    def test_mgba_config_keeps_z_a_and_x_b(self):
+        """I3/Z->A: the file mGBA reads must carry the shipped mapping."""
+        config_dir = os.path.join(self.test_dir, "config", "handlers", "mgba-adapter")
+        home = tempfile.mkdtemp()
+        # Isolated HOME and data dir: no profile from the developer's machine
+        # and no keybindings.json left behind by another test.
+        with mock.patch.dict(os.environ, {"HOME": home}), \
+                mock.patch.object(common, "get_data_dir", lambda: home):
+            try:
+                common.save_keybindings(dict(common.DEFAULT_KEYBINDINGS))
+                from gba_adapter_mgba import ensure_mgba_config
+                ensure_mgba_config(config_dir)
+                with open(os.path.join(config_dir, "config.ini"), "r") as f:
+                    content = f.read()
+                self.assertIn("keyA=122", content)     # Z
+                self.assertIn("keyB=120", content)     # X
+            finally:
+                shutil.rmtree(home, ignore_errors=True)
 
     def test_find_mgba_binary_or_clear_error(self):
         try:

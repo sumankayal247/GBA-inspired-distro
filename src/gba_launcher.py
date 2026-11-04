@@ -76,7 +76,8 @@ from gba_browser import Browser
 from gba_ingame import button_from_key, button_from_joy_button, buttons_from_hat
 from gba_terminal import TerminalScreen, TerminalSession, TerminalView, key_to_bytes
 from gba_usb import (MtpManager, VolumeWatcher, import_roms, list_import_sources,
-                     list_mounted_volumes, list_mtp_volumes)
+                     list_mounted_mtp_volumes, list_mounted_volumes,
+                     mtp_diagnostics)
 from library import Library
 from theme import THEME_ORDER, Theme
 
@@ -1187,9 +1188,9 @@ class UsbManagerOverlay(Overlay):
         elif shell is not None and callable(getattr(shell, "import_sources", None)):
             self.volumes = shell.import_sources()
         else:
-            # No shell/watcher: never auto-mount on a bare constructor.
-            self.volumes = list_mounted_volumes() + list_mtp_volumes(
-                auto_mount=False, command_exists=lambda _name: False)
+            # No shell/watcher: list what is already mounted. Never mount and
+            # never run `jmtpfs -l` here — this can be the UI thread.
+            self.volumes = list_mounted_volumes() + list_mounted_mtp_volumes()
         self.index = 0
         self.message = ""
 
@@ -1956,17 +1957,19 @@ class GBALauncher:
             logger.warning("Could not list block import sources: %s", exc)
             block = []
         manager = getattr(watcher, "mtp_manager", None) if watcher is not None else None
-        cached = getattr(manager, "cached_volumes", None)
-        if callable(cached):
+        mtp = self._cached_mtp_volumes(manager)
+        if not mtp:
             try:
-                mtp = list(cached())
-            except Exception:
-                mtp = []
-        else:
-            try:
-                # No command execution here: auto-mount is an explicit R action.
-                mtp = list_mtp_volumes(auto_mount=False,
-                                       command_exists=lambda _name: False)
+                # Already-mounted MTP/GVfs roots only: listing must never run
+                # `jmtpfs -l` or a mount attempt on the UI thread (a locked
+                # phone would freeze the shell for seconds). Mounting is the
+                # watcher's job; `R` triggers an explicit rescan.
+                mtp = list_mounted_mtp_volumes()
+                if manager is not None and getattr(manager, "cached_volumes", None):
+                    merged = {v.key: v for v in mtp}
+                    for volume in self._cached_mtp_volumes(manager):
+                        merged.setdefault(volume.key, volume)
+                    mtp = list(merged.values())
             except Exception as exc:
                 logger.warning("Could not list mounted MTP sources: %s", exc)
                 mtp = []

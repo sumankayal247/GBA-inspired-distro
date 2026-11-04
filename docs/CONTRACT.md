@@ -141,6 +141,22 @@ GAMES   (optional)   user-visible content, readable from other operating systems
     copied again;
   - a missing MTP/FUSE backend, locked screen or charging-only USB mode MUST degrade to no MTP
     source without affecting pendrive import or boot.
+- **ST8a** [TEST: T-LIBRARY-4, T-LIBRARY-5] Every link of the MTP chain MUST be individually
+  observable, and no single link MAY veto the others:
+  - device discovery MUST accept a USB interface class 6 / subclass 1 with protocol **0 or 1**
+    (vendor stacks that do not advertise PTP-only), MUST accept a `"MTP"`/`"mtp"` interface name as
+    a fallback, and MUST NOT claim a PTP camera as an MTP volume;
+  - `jmtpfs -l` MUST be parsed with quoted and unquoted fields, and rows that cannot be parsed MUST
+    be logged rather than dropped silently;
+  - a mount attempt MUST record which stage failed (tool, mount, or storage enumeration) and MUST
+    be retried quickly a few times before backing off, so unlocking a phone is picked up without
+    restarting the session;
+  - a phone that mounts while locked, i.e. yields zero readable ROMs, MUST NOT be remembered as
+    "already offered": unlocking it later in the same session MUST produce the import prompt;
+  - an MTP storage that reports a file size of `0` MUST NOT be excluded from scanning or importing
+    (FUSE backends report 0 for unknown size); a *failed* `stat` still skips the file;
+  - `gba-selftest --mtp` MUST print the state of each stage (sysfs, tools, mount root, GVfs,
+    devices, volumes, last error) plus one actionable hint.
 
 ---
 
@@ -243,6 +259,35 @@ observed, and counts against `GRACE` when it follows a termination request.
 
 - `GRACE` = 3 seconds.
 
+
+### 5.6 In-game overlays and display handoff
+
+Cheats, nine save-state slots and the fast-forward cycle are handler-side features (see
+`docs/DECISIONS.md` D-050, D-052). mGBA is *stopped* while an overlay is drawn, because a stopped
+process keeps its SDL/KMS surface and a second pygame window cannot acquire it.
+
+- **IG1** [TEST: T-INGAME-1] An overlay MUST NOT be opened until a native mGBA save state and a
+  screenshot of the live game have been captured, in that order, while mGBA is still running. If
+  either capture fails, the overlay MUST NOT open and the game MUST keep running.
+- **IG2** [TEST: T-INGAME-1, T-INGAME-5] The emulator MUST be released before the overlay window is
+  created, and the overlay MUST be closed before a new emulator process is started: never two
+  foreground display owners.
+- **IG3** [TEST: T-INGAME-2] Closing an overlay MUST resume gameplay from the state captured for
+  that handoff (or, when no state exists, by restarting the same command) and MUST restore the
+  current fast-forward speed. Resume MUST be idempotent: repeated close/resume calls restart one
+  emulator process, not several.
+- **IG4** [TEST: T-INGAME-3] No key event, hotkey or signal MAY be sent to a stopped or exited
+  emulator. State capture MUST be refused while the emulator is stopped instead of waiting for a
+  timeout.
+- **IG5** [TEST: T-INGAME-4] Cheat toggles MUST persist immediately and MUST reach the restarted
+  emulator through its own `-c` cheat file; a cheat change alone MUST NOT restart the emulator
+  before the overlay has closed.
+- **IG6** [TEST: T-INGAME-3] The fast-forward cycle (`1x → 2x → 3x → 1x`) MUST be edge-triggered:
+  holding `L + R` MUST produce exactly one transition, and every transition MUST preserve gameplay
+  state.
+- **IG7** [TEST: T-INGAME-1] If the overlay cannot be initialised at all (no display), the handler
+  MUST resume the emulator and report the failure instead of leaving it stopped.
+
 ---
 
 ## 6. Supervisor Contract
@@ -291,6 +336,11 @@ Parameters (provisional): N = 3, M = 30.
   bundled handlers MUST derive their bindings from it. A pad MUST behave consistently in both.
 - **I4** [TEST: T-INPUT-3] Controllers MUST be usable when connected after boot.
 - **I5** [REVIEW] USB controllers are in scope for Phase 1. Bluetooth is not.
+- **I6** [TEST: T-INPUT-1, T-INPUT-4] The shipped keyboard profile MUST map `Z` to the GBA `A`
+  button and `X` to `B` (`DEFAULT_KEYBINDINGS` = 122/120, and the same values written into the
+  mGBA `config.ini`). Changing that default MUST NOT overwrite a profile the user customised: a
+  stored profile identical to the legacy reversed pair (and nothing else changed) is migrated, any
+  other stored profile is left alone.
 
 ---
 
@@ -334,6 +384,17 @@ Parameters (provisional): N = 3, M = 30.
 - **SV6** [TEST: T-STORE-5] The system MUST NOT overwrite or reformat DATA in response to detected
   corruption without explicit user confirmation.
 - **SV7** [REVIEW] `sync` is a final safeguard and MUST NOT be relied on as the durability mechanism.
+- **SV8** [TEST: T-INGAME-2] Save states MUST be native emulator states stored per entry, in nine
+  fixed slots:
+  - slot content is written atomically (temp file + `os.replace`) with size and SHA-256 recorded in
+    the entry's metadata file; a slot MUST NOT be replaced by a partial or unverifiable state;
+  - overwriting an occupied slot MUST keep the previous state recoverable until the new one has been
+    verified, so a failed save never destroys a good slot;
+  - loading MUST verify the state before use and MUST report a corrupt/missing slot instead of
+    crashing the emulator;
+  - slots MUST be isolated per game, and MUST persist across sessions and reboots;
+  - the handler MAY keep one private slot for its own display handoff, which MUST NOT be visible as
+    one of the user's nine slots.
 
 ---
 
@@ -458,7 +519,8 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 |---|---|---|---|
 | T-LIBRARY-1 | Add game A without any manual step; record its entry ID; rename the file; rescan. | Entry appears automatically; ID and save directory unchanged after the rename. | L2, L3 |
 | T-LIBRARY-3 | Plug in a stick with 10 ROMs, decline the prompt, re-plug, accept; import twice. | Nothing copied before confirmation; 10 files appear inside GAMES; the second import copies nothing; no partial files remain. | ST7 |
-| T-LIBRARY-4 | Unlock an Android phone in File Transfer/MTP mode containing the same 10 ROMs plus two new ones; accept the prompt, then re-import. | The phone appears as one or more MTP storages, not a removable disk; only two new files are offered/copied; normal USB detection still works; no partial files remain. | ST8 |
+| T-LIBRARY-4 | Unlock an Android phone in File Transfer/MTP mode containing the same 10 ROMs plus two new ones; accept the prompt, then re-import. | The phone appears as one or more MTP storages, not a removable disk; only two new files are offered/copied; normal USB detection still works; no partial files remain. | ST8, ST8a |
+| T-LIBRARY-5 | Plug in a locked phone; wait for the mount attempt; unlock it while the import screen is open; press `R`. Then repeat on a phone whose storage reports 0-byte sizes. | The first attempt reports "unlock the phone" instead of failing silently; the unlock produces the prompt in the same session; the 0-byte storage is still scanned and imported; `gba-selftest --mtp` names the failing stage. | ST8a |
 | T-MANIFEST-1 | Create manifests omitting `network`, `input` and `display`; create one with `contract = 999`. | Omitted needs resolve to `false`, gamepad-only and direct; the unsupported manifest is rejected without crashing the launcher. | L7, L8 |
 
 ### Input
@@ -475,6 +537,22 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 |---|---|---|---|
 | T-HANDLER-1 | Use a diagnostic handler to produce each outcome class and to dump its environment. | Supervisor classifies each correctly, including the SIGTERM race; environment variables and directories match H1. | H1, H10, S6 |
 | T-HANDLER-2 *(spike)* | Send SIGTERM to mGBA mid-game after an in-game save. | Documented: does it flush and exit cleanly, or die with `terminated`? If not clean, a remedy is chosen. | H7 |
+
+### In-game overlays, save states, cheats, fast-forward
+
+| ID | Procedure | Pass criteria | Verifies |
+|---|---|---|---|
+| T-INGAME-1 | Open the cheats and the save-state overlay 20 times each on the appliance; also run once with the display deliberately unavailable. | Overlay is drawn over a still frame every time; gameplay resumes at the same point; with no display the game keeps running and a failure is logged. | IG1, IG2, IG7 |
+| T-INGAME-2 | Save into all nine slots, overwrite one, load each in turn, then exit and re-enter the game. | Nine slots, each with thumbnail and timestamp; load restores that exact state; slots are per game and survive a restart; a failed save leaves the previous slot intact. | IG3, SV8 |
+| T-INGAME-3 | Toggle a cheat, close the overlay, re-open; then cycle speed with `L + R` and hold the combo. | Toggled cheat is active in the running game after the restart and still enabled after a re-open; one speed step per deliberate press, state preserved, never frozen. | IG4, IG5, IG6 |
+| T-INGAME-4 | Open each overlay with no `/dev/uinput` access (chmod 000 as a test user). | Overlays still open and close; capture/load report a clear error; the emulator is never left stopped. | IG1, IG2, IG4 |
+| T-INGAME-5 | Kill the overlay renderer (`SIGKILL`) while an overlay is open. | The handler resumes or exits, never leaving a stopped/orphaned mGBA process behind. | IG2, IG7, H8 |
+
+### Keyboard defaults
+
+| ID | Procedure | Pass criteria | Verifies |
+|---|---|---|---|
+| T-INPUT-4 | Fresh install: press `Z` then `X` in a game; then import a legacy profile and a customised one. | `Z` acts as `A`, `X` as `B`; the untouched legacy profile is migrated; a customised profile keeps every custom binding. | I6 |
 
 ### Saves
 
