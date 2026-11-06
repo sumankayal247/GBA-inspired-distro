@@ -4,6 +4,32 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — Cartridge card and wordmark visual fixes
+
+Three defects reported from a photo of the real shelf, all in the theme's cartridge painter and the
+header wordmark. Suite: **490 passing, 1 skipped** (`make test`); `ui_preview_*.png` regenerated.
+
+### Fixed
+
+- **Square plastic corners on cartridge cards** (`src/theme.py`). The shell gradient was painted as
+  plain square bands under a rounded 1px outline, so the corner pixels of the fill poked out of the
+  curve. The gradient is now composited inside a rounded SRCALPHA silhouette
+  (`BLEND_RGBA_MIN`), matching the outline, shadow and selection ring radius.
+- **"GBA" seal text bleeding out of its circle.** The ring had a fixed radius smaller than the
+  rendered word. The ring is now sized from the measured wordmark (new `seal` type size) and sat
+  inside the sticker; the bottom row's height reservation follows the ring so titles keep their
+  lines on the smallest grid tile.
+- **Header wordmark overlap ("GBA OS").** The second word's x was hard-coded; `Theme.wordmark()`
+  now places "OS" from the measured width of "GBA", at every scale.
+- **Truncated titles dotted every line** ("Pocket.. / Rally.."). The ".." suffix belongs to the
+  last shown line only; wrapping moved into a testable `_wrap_lines()`.
+
+### Added
+
+- Pixel-level regressions in `tests/test_theme_config.py` (`TestCartridgeVisuals`): corner cuts
+  stay background/shadow, the seal bounding box stays square (text inside the ring) and on the
+  sticker, wordmark rects never collide, and elision dots land on the last line only.
+
 ## [Unreleased] — Verbose boot diagnostics: evidence for a black screen
 
 No behaviour change and no new dependency. Every stage of an emulator session — load, windowing,

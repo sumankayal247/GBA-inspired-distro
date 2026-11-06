@@ -197,6 +197,86 @@ class TestTheme(ConfigTestCase):
                          "Super Long Game Title Here", "GB", "deadbeef")
 
 
+class TestCartridgeVisuals(ConfigTestCase):
+    """Pixel-level regressions for the cartridge card and the wordmark.
+
+    These pin the three defects reported from real hardware: square plastic
+    corners poking out of the rounded shell, the "GBA" seal text bleeding out
+    of its circle, and the header wordmark's "A" sitting on top of the "O".
+    """
+
+    def _draw(self, scale):
+        th = theme_module.Theme("indigo", scale)
+        surface = pygame.Surface((th.px(120), th.px(120)))
+        sentinel = (1, 2, 3)
+        surface.fill(sentinel)
+        rect = pygame.Rect(th.px(10), th.px(10), th.px(72), th.px(88))
+        th.cartridge(surface, rect, "Pocket Rally Advance", "gba", ident="9f13ce44")
+        return th, surface, rect, sentinel
+
+    def test_shell_corners_follow_the_rounded_silhouette(self):
+        for scale in (1.0, 2.0, 3.0):
+            th, surface, rect, sentinel = self._draw(scale)
+            # Top corners and bottom-left sit on bare background; the
+            # bottom-right corner cut shows the (rounded) drop shadow.
+            for point in ((rect.x + 1, rect.y + 1), (rect.right - 2, rect.y + 1),
+                          (rect.x + 1, rect.bottom - 2)):
+                self.assertEqual(surface.get_at(point)[:3], sentinel,
+                                 f"scale {scale}: square plastic at {point}")
+            self.assertEqual(surface.get_at((rect.right - 2, rect.bottom - 2))[:3],
+                             tuple(th.colors.shadow),
+                             f"scale {scale}: square plastic over the shadow")
+            # ...while the shell itself is painted between the corners.
+            self.assertNotEqual(surface.get_at((rect.centerx, rect.y + 2))[:3], sentinel)
+            self.assertNotEqual(surface.get_at((rect.centerx, rect.bottom - 3))[:3], sentinel)
+
+    def test_seal_ring_contains_its_wordmark(self):
+        for scale in (1.0, 2.0, 3.0):
+            th, surface, rect, _sentinel = self._draw(scale)
+            highlight = tuple(th.colors.highlight)
+            xs, ys = [], []
+            for yy in range(rect.bottom - th.px(22), rect.bottom):
+                for xx in range(rect.right - th.px(34), rect.right):
+                    if surface.get_at((xx, yy))[:3] == highlight:
+                        xs.append(xx)
+                        ys.append(yy)
+            self.assertTrue(xs, f"scale {scale}: no seal pixels found")
+            width = max(xs) - min(xs) + 1
+            height = max(ys) - min(ys) + 1
+            # A circle containing its text is (near) square in bounding box;
+            # text wider than the ring makes the box wider than tall.
+            self.assertLessEqual(abs(width - height), 3,
+                                 f"scale {scale}: seal text escapes the ring "
+                                 f"({width}x{height})")
+            # ...and the whole seal stays on the sticker with a margin.
+            self.assertLess(max(xs), rect.right - th.px(5))
+            self.assertLess(max(ys), rect.bottom - th.px(5))
+
+    def test_wordmark_words_never_overlap(self):
+        for scale in (1.0, 1.5, 2.0, 3.0):
+            th = theme_module.Theme("indigo", scale)
+            surface = pygame.Surface((320, 40))
+            first, second = th.wordmark(surface, (22, 6))
+            self.assertFalse(first.colliderect(second), f"scale {scale}")
+            self.assertGreater(second.left, first.right, f"scale {scale}")
+            self.assertLess(second.left - first.right, th.px(4), f"scale {scale}")
+
+    def test_wrap_elides_only_the_truncated_line(self):
+        th = theme_module.Theme("indigo", 2.0)
+        font = th.font("body_bold")
+        width = th.px(54)
+        self.assertEqual(
+            theme_module._wrap_lines(font, "Pocket Rally Advance", width, 3),
+            ["Pocket", "Rally", "Advance"])
+        two = theme_module._wrap_lines(font, "Pocket Rally Advance", width, 2)
+        self.assertEqual(two[0], "Pocket")
+        self.assertTrue(two[-1].endswith(".."))
+        single = theme_module._wrap_lines(font, "Superlongwordthatneverfits", width, 2)
+        self.assertEqual(len(single), 1)
+        self.assertTrue(single[0].endswith(".."))
+        self.assertLessEqual(font.size(single[0])[0], width)
+
+
 class TestDisplayModeSize(ConfigTestCase):
     """
     Reading the physical display mode from DRM sysfs (never acquiring the

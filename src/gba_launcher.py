@@ -3174,8 +3174,7 @@ class GBALauncher:
                          (glyph.x + theme.px(2), glyph.y + theme.px(1.5)),
                          (glyph.right - theme.px(2), glyph.y + theme.px(1.5)),
                          max(1, theme.px(1)))
-        theme.text(self.surface, "GBA", (22, 6), "header", c.highlight)
-        theme.text(self.surface, "OS", (44, 6), "header", c.accent)
+        theme.wordmark(self.surface, (22, 6))
 
         # --- right cluster, laid out first so the tabs can never run into it.
         right = self.design_w - 7
