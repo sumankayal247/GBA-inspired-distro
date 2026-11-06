@@ -2027,37 +2027,23 @@ def main():
         else:
             logger.info("Bare X11: SDL fullscreen (display size unknown)")
 
-    # Bare-X11 GL workaround: without a compositor, SDL2/Mesa's DRI3
-    # direct-rendering page-flipping fails silently on AMD Radeon integrated
-    # graphics (and occasionally on Intel).  The emulator window maps and
-    # emulation runs, but glXSwapBuffers never presents frames to the screen,
-    # producing a black screen with no error.
+    # Bare-X11 workaround: without a compositor, mGBA's OpenGL via GLX
+    # (even llvmpipe software GL) can't present frames to bare X11.
+    # Additionally, Matchbox doesn't send SDL_WINDOWEVENT_EXPOSED or focus
+    # events, so SDL2 pauses rendering.
     #
-    # Mesa 25 on AMD radeonsi ignores LIBGL_DRI3_DISABLE under X11 and forces
-    # DRI3 regardless, so the DRI2 fallback path does not work on modern
-    # drivers.  Software rendering (llvmpipe) is the reliable option: for GBA
-    # at 240x160 scaled to 1920x1080 it is fast enough on any modern CPU.
+    # The fix is a lightweight compositor in the session (see gba_session.sh).
+    # If no compositor is available, we try SDL2 software renderer as fallback.
     #
-    # Set GBA_HARDWARE_GL=1 to opt back into hardware acceleration at your own
-    # risk (it may still black-screen on bare X11 without a compositor).
-    # Set GBA_SOFTWARE_GL=0 to explicitly opt out of software rendering.
+    # Set GBA_HARDWARE_GL=1 to skip software fallback (will likely black-screen
+    # if no compositor is running).
     if bare_x11:
-        opt_out = env.get("GBA_SOFTWARE_GL") == "0"
         force_hw = env.get("GBA_HARDWARE_GL") == "1"
-        if force_hw:
-            # Explicit opt-in to hardware GL: also try DRI3 disable as a belt-
-            # and-braces, though modern Mesa may ignore it.
-            env["LIBGL_DRI3_DISABLE"] = "1"
-            logger.info("Bare X11 GL workaround: hardware GL forced "
-                        "(GBA_HARDWARE_GL=1); also set LIBGL_DRI3_DISABLE=1 "
-                        "(may be ignored by Mesa 25+ on AMD radeonsi)")
-        elif not opt_out:
-            # Default: software rendering is the reliable path on bare X11.
-            env["LIBGL_ALWAYS_SOFTWARE"] = "1"
-            logger.info("Bare X11 GL workaround: software rendering enabled "
-                        "(LIBGL_ALWAYS_SOFTWARE=1) because hardware DRI3 fails "
-                        "to present frames without a compositor. Set "
-                        "GBA_HARDWARE_GL=1 to try hardware acceleration.")
+        if not force_hw:
+            # Try SDL2 software renderer as fallback (bypasses OpenGL/GLX)
+            env["SDL_RENDER_DRIVER"] = "software"
+            logger.info("Bare X11: SDL_RENDER_DRIVER=software set as fallback. "
+                        "If compositor is running, this is ignored.")
     logger.info("Display session=%s driver=%s windowed=%s scaling=%s screen=%s",
                 display_session(), env.get("SDL_VIDEODRIVER", "auto"),
                 is_windowed, display_scaling,

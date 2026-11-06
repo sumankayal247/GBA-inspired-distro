@@ -4,6 +4,23 @@
 if [ -n "${DISPLAY:-}" ]; then
     export GBA_BARE_X11=1
     xhost +local: >/dev/null 2>&1 || true
+
+    # Start a lightweight compositor if available. This fixes:
+    # 1. GLX presentation: mGBA's OpenGL (even llvmpipe) can't present frames
+    #    to bare X11 without a compositor. The compositor handles the blit.
+    # 2. Window focus/expose: Matchbox doesn't send proper SDL_WINDOWEVENT_EXPOSED
+    #    or focus events, so SDL2 pauses rendering. The compositor manages windows.
+    # picom is modern and actively maintained; compton is its predecessor.
+    if command -v picom >/dev/null 2>&1; then
+        picom --daemon --backend xrender --vsync none 2>/dev/null &
+        echo "[session] compositor: picom started" >&2
+    elif command -v compton >/dev/null 2>&1; then
+        compton --daemon --backend xrender --vsync none 2>/dev/null &
+        echo "[session] compositor: compton started" >&2
+    else
+        echo "[session] no compositor found; install picom or compton for bare X11" >&2
+        echo "[session]   without a compositor, mGBA may show a black screen" >&2
+    fi
 fi
 
 # --- verbose subsystem diagnostics -------------------------------------------
