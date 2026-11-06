@@ -28,6 +28,11 @@ PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
 
 OK_MARK = {"PASS": "ok  ", "WARN": "warn", "FAIL": "FAIL"}
 
+# Read-only tools the adapter uses to prove an emulator window reached the
+# screen (see docs/MGBA_APPLIANCE.md). Both are optional: without them the
+# window-mapping evidence is simply absent from the boot log.
+DIAGNOSTIC_TOOLS = (("xwininfo", "x11-utils"), ("xrandr", "x11-server-utils"))
+
 
 class Check:
     def __init__(self, name: str, status: str, detail: str, hint: str = ""):
@@ -284,6 +289,39 @@ def mtp_report(attempt_mount: bool = True) -> str:
         return f"MTP diagnostics failed: {exc}"
 
 
+def check_diagnostics() -> Check:
+    """Will a black screen actually leave evidence in the boot log?
+
+    The verbose capture depends on three things being present at once: the
+    GBA_DEBUG switch, mGBA's own `-l` mask, and the read-only X11 tools that
+    prove whether the emulator's window mapped. Missing tools are a warning,
+    never a failure: games run fine without them, only the diagnosis is poorer.
+    """
+    try:
+        import gba_adapter_mgba as adapter
+    except Exception as exc:  # pragma: no cover - broken install
+        return Check("diagnostics", WARN, f"adapter unavailable: {exc}")
+
+    if not adapter.diagnostics_enabled():
+        return Check("diagnostics", WARN, "GBA_DEBUG=0: the verbose capture is off",
+                     "Export GBA_DEBUG=1 to record SDL/Mesa, mGBA and "
+                     "window-mapping detail in the boot log.")
+
+    mask = adapter.mgba_log_level() or 0
+    detail = [f"mGBA log mask -l {mask} ({adapter.describe_log_mask(mask)})"]
+    for name in ("SDL_LOG_PRIORITY", "LIBGL_DEBUG", "MESA_DEBUG"):
+        detail.append(f"{name}={os.environ.get(name, '(unset)')}")
+    for tool, _ in DIAGNOSTIC_TOOLS:
+        detail.append(f"{tool}={'yes' if shutil.which(tool) else 'MISSING'}")
+
+    missing = [package for tool, package in DIAGNOSTIC_TOOLS if not shutil.which(tool)]
+    if missing:
+        return Check("diagnostics", WARN, "; ".join(detail),
+                     "Window-mapping evidence needs: sudo apt install "
+                     + " ".join(sorted(set(missing))))
+    return Check("diagnostics", PASS, "; ".join(detail))
+
+
 def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
     try:
         _import(src_hint)
@@ -293,7 +331,7 @@ def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
 
     checks: List[Check] = [check_python(), check_fonts(), check_pty(),
                            check_display(), check_mgba(), check_mtp(),
-                           check_native_hotkeys()]
+                           check_native_hotkeys(), check_diagnostics()]
     checks.extend(check_modules())
     checks.extend(check_pygame())
     checks.extend(check_storage(data_dir, games_dir))
