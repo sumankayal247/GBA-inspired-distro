@@ -181,6 +181,13 @@ check_dependencies() {
         missing+=("picom")
     fi
 
+    # X11 window manager: required for SDL2 fullscreen windows to receive
+    # focus/expose events. Without it, windows don't render frames.
+    if ! command -v matchbox-window-manager >/dev/null 2>&1 && \
+       ! command -v openbox >/dev/null 2>&1; then
+        missing+=("matchbox-window-manager")
+    fi
+
     # Optional: Android phones in File Transfer/MTP mode are not block disks.
     # Normal USB stick import and game launching work without this package.
     if ! command -v jmtpfs >/dev/null 2>&1 && ! command -v gio >/dev/null 2>&1; then
@@ -197,8 +204,8 @@ check_dependencies() {
     if [ ${#missing[@]} -gt 0 ]; then
         gb_warn "Missing packages: ${missing[*]}"
         gb_warn "Install them first (the appliance can still be installed, but games"
-        gb_warn "will not start until mGBA, pygame, and a compositor are present):"
-        gb_warn "    sudo apt install python3 python3-pygame mgba-sdl picom"
+        gb_warn "will not start until mGBA, pygame, a compositor, and a window manager are present):"
+        gb_warn "    sudo apt install python3 python3-pygame mgba-sdl picom matchbox-window-manager"
         if [ "$APPLY" = "1" ] && [ "${GBA_ALLOW_MISSING_DEPS:-0}" != "1" ]; then
             gb_die "Refusing to touch the boot configuration with incomplete runtime deps.
 Set GBA_ALLOW_MISSING_DEPS=1 to override (the installer will write a working
@@ -206,7 +213,7 @@ recovery-first setup, but games will not launch until you install them)."
         fi
         return 1
     fi
-    gb_ok "python3, pygame, mGBA, and compositor are present."
+    gb_ok "python3, pygame, mGBA, compositor, and window manager are present."
     return 0
 }
 
@@ -214,18 +221,23 @@ recovery-first setup, but games will not launch until you install them)."
 install_x11_dependencies() {
     gb_step "Installing X11 session dependencies"
     if gb_is_dry_run; then
-        gb_dim "  (dry-run) would install picom x11-utils x11-server-utils without recommends"
+        gb_dim "  (dry-run) would install picom matchbox-window-manager x11-utils x11-server-utils without recommends"
         return 0
     fi
     if ! command -v apt-get >/dev/null 2>&1; then
-        gb_die "Install picom, x11-utils, and x11-server-utils with your package manager,
+        gb_die "Install picom, matchbox-window-manager, x11-utils, and x11-server-utils with your package manager,
 then retry. Automatic dependency installation currently supports Debian/Ubuntu."
     fi
-    apt-get install -y --no-install-recommends picom x11-utils x11-server-utils
+    apt-get install -y --no-install-recommends picom matchbox-window-manager x11-utils x11-server-utils
     if command -v picom >/dev/null 2>&1; then
         gb_ok "picom compositor installed"
     else
         gb_warn "picom installation failed; games will show a black screen on bare X11"
+    fi
+    if command -v matchbox-window-manager >/dev/null 2>&1; then
+        gb_ok "matchbox-window-manager installed"
+    else
+        gb_warn "matchbox-window-manager installation failed; SDL2 windows may not render"
     fi
 }
 

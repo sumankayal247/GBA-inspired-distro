@@ -5,22 +5,36 @@ if [ -n "${DISPLAY:-}" ]; then
     export GBA_BARE_X11=1
     xhost +local: >/dev/null 2>&1 || true
 
-    # Start a lightweight compositor if available. This fixes:
-    # 1. GLX presentation: mGBA's OpenGL (even llvmpipe) can't present frames
-    #    to bare X11 without a compositor. The compositor handles the blit.
-    # 2. Window focus/expose: Matchbox doesn't send proper SDL_WINDOWEVENT_EXPOSED
-    #    or focus events, so SDL2 pauses rendering. The compositor manages windows.
+    # Start a minimal window manager. SDL2 fullscreen windows need focus/expose
+    # events to render frames. Without a WM, windows never get these events.
+    # matchbox-window-manager is lightweight and designed for embedded/appliance use.
+    if command -v matchbox-window-manager >/dev/null 2>&1; then
+        matchbox-window-manager -use_titlebar no -use_cursor no &
+        echo "[session] window manager: matchbox-window-manager started" >&2
+    elif command -v openbox >/dev/null 2>&1; then
+        openbox --sm-disable &
+        echo "[session] window manager: openbox started" >&2
+    else
+        echo "[session] WARNING: no window manager found; SDL2 windows may not render" >&2
+        echo "[session]   Install: sudo apt install matchbox-window-manager" >&2
+    fi
+
+    # Start a compositor with GLX backend. The xrender backend cannot composite
+    # GLX surfaces; only --backend glx works with OpenGL windows.
     # picom is modern and actively maintained; compton is its predecessor.
     if command -v picom >/dev/null 2>&1; then
-        picom --daemon --backend xrender --vsync none 2>/dev/null &
-        echo "[session] compositor: picom started" >&2
+        picom --daemon --backend glx --vsync none 2>/dev/null &
+        echo "[session] compositor: picom started (glx backend)" >&2
     elif command -v compton >/dev/null 2>&1; then
-        compton --daemon --backend xrender --vsync none 2>/dev/null &
-        echo "[session] compositor: compton started" >&2
+        compton --daemon --backend glx --vsync none 2>/dev/null &
+        echo "[session] compositor: compton started (glx backend)" >&2
     else
-        echo "[session] no compositor found; install picom or compton for bare X11" >&2
-        echo "[session]   without a compositor, mGBA may show a black screen" >&2
+        echo "[session] WARNING: no compositor found; OpenGL windows may not display" >&2
+        echo "[session]   Install: sudo apt install picom" >&2
     fi
+
+    # Give WM and compositor time to initialize before apps start
+    sleep 0.5
 fi
 
 # --- verbose subsystem diagnostics -------------------------------------------
