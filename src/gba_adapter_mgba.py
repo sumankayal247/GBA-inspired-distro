@@ -1564,11 +1564,14 @@ def retry_strategy(session: str, ret: int, elapsed: float, windowed: bool,
     A "black screen then back to the library" is almost always a video backend
     that could not present. The fallback depends on where we are running:
 
-    * bare X11: DRI3 page-flipping may have failed silently; first try windowed
-      (which lets SDL negotiate), and if that also fails, software rendering;
-    * desktop (x11/wayland): retry once windowed with no driver pinning, so SDL
-      negotiates for itself;
+    * bare X11: software rendering is the default (LIBGL_ALWAYS_SOFTWARE),
+      so a crash here usually means something other than GL; retry once
+      windowed with no driver pinning, so SDL negotiates for itself;
+    * desktop (x11/wayland): retry once windowed with no driver pinning;
     * bare console: the first DRM card may drive no output, so try the others.
+
+    When the environment was explicitly set to hardware GL (GBA_HARDWARE_GL=1),
+    a windowed failure escalates to software rendering as a last resort.
 
     Returns ("windowed", None), ("software", None) or ("card", "/dev/dri/cardN").
     """
@@ -2027,25 +2030,33 @@ def main():
     # direct-rendering page-flipping fails silently on AMD Radeon integrated
     # graphics (and occasionally on Intel).  The emulator window maps and
     # emulation runs, but glXSwapBuffers never presents frames to the screen,
-    # producing a black screen with no error.  Disabling DRI3 forces Mesa to
-    # use DRI2 blit-based presentation, which goes through the X server and
-    # works without a compositor.  Hardware acceleration is preserved.
+    # producing a black screen with no error.
     #
-    # Set GBA_SOFTWARE_GL=1 in the environment to force full software rendering
-    # (LIBGL_ALWAYS_SOFTWARE=1) when DRI2 also fails.  This is slower but works
-    # on any GPU; for GBA at 240x160 -> 1920x1080 it is fast enough on modern
-    # CPUs.
+    # Mesa 25 on AMD radeonsi ignores LIBGL_DRI3_DISABLE under X11 and forces
+    # DRI3 regardless, so the DRI2 fallback path does not work on modern
+    # drivers.  Software rendering (llvmpipe) is the reliable option: for GBA
+    # at 240x160 scaled to 1920x1080 it is fast enough on any modern CPU.
+    #
+    # Set GBA_HARDWARE_GL=1 to opt back into hardware acceleration at your own
+    # risk (it may still black-screen on bare X11 without a compositor).
+    # Set GBA_SOFTWARE_GL=0 to explicitly opt out of software rendering.
     if bare_x11:
-        if env.get("GBA_SOFTWARE_GL") == "1":
+        opt_out = env.get("GBA_SOFTWARE_GL") == "0"
+        force_hw = env.get("GBA_HARDWARE_GL") == "1"
+        if force_hw:
+            # Explicit opt-in to hardware GL: also try DRI3 disable as a belt-
+            # and-braces, though modern Mesa may ignore it.
+            env["LIBGL_DRI3_DISABLE"] = "1"
+            logger.info("Bare X11 GL workaround: hardware GL forced "
+                        "(GBA_HARDWARE_GL=1); also set LIBGL_DRI3_DISABLE=1 "
+                        "(may be ignored by Mesa 25+ on AMD radeonsi)")
+        elif not opt_out:
+            # Default: software rendering is the reliable path on bare X11.
             env["LIBGL_ALWAYS_SOFTWARE"] = "1"
-            logger.info("Bare X11 GL workaround: full software rendering forced "
-                        "(GBA_SOFTWARE_GL=1 -> LIBGL_ALWAYS_SOFTWARE=1)")
-        else:
-            # Disable DRI3: fall back to DRI2 blit presentation, which the X
-            # server handles directly without a compositor.
-            env.setdefault("LIBGL_DRI3_DISABLE", "1")
-            logger.info("Bare X11 GL workaround: DRI3 disabled -> DRI2 blit "
-                        "presentation (avoids page-flip failure on AMD/Intel)")
+            logger.info("Bare X11 GL workaround: software rendering enabled "
+                        "(LIBGL_ALWAYS_SOFTWARE=1) because hardware DRI3 fails "
+                        "to present frames without a compositor. Set "
+                        "GBA_HARDWARE_GL=1 to try hardware acceleration.")
     logger.info("Display session=%s driver=%s windowed=%s scaling=%s screen=%s",
                 display_session(), env.get("SDL_VIDEODRIVER", "auto"),
                 is_windowed, display_scaling,
