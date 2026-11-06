@@ -13,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
@@ -118,6 +119,33 @@ class TestDisplayModel(ShellTestCase):
         self.assertGreater(launcher.surface.get_width(), 480)
         self.assertEqual(launcher.current_tab, 0)
 
+    def test_bare_x11_shelf_uses_no_mode_switching_fullscreen(self):
+        launcher = self.make_launcher(appliance_mode=True)
+        with patch.dict(os.environ, {"GBA_BARE_X11": "1"}), \
+                patch.object(pygame.display, "get_driver", return_value="x11"), \
+                patch.object(pygame.display, "set_mode", wraps=pygame.display.set_mode) as mode, \
+                patch.object(pygame.event, "set_keyboard_grab", create=True) as grab:
+            launcher._init_display()
+        self.assertEqual(mode.call_args.args[1], pygame.NOFRAME)
+        self.assertFalse(mode.call_args.args[1] & pygame.FULLSCREEN)
+        self.assertEqual(launcher.window.get_size(), (launcher.screen_w, launcher.screen_h))
+        grab.assert_called_once_with(True)
+
+    def test_resize_keeps_requested_geometry_and_scaling_rebuild_keeps_it(self):
+        launcher = self.make_launcher(windowed=True)
+        launcher._handle_global(pygame.event.Event(pygame.VIDEORESIZE,
+                                                    w=800, h=600, size=(800, 600)))
+        self.assertEqual(launcher.window.get_size(), (800, 600))
+        self.assertEqual(launcher.surface.get_size(), (800, 600))
+        launcher._rebuild_surface()
+        self.assertEqual(launcher.window.get_size(), (800, 600))
+
+    def test_windowed_test_does_not_grab_desktop_keyboard(self):
+        launcher = self.make_launcher(windowed=True)
+        with patch.object(pygame.event, "set_keyboard_grab", create=True) as grab:
+            launcher._grab_shortcuts()
+        grab.assert_not_called()
+
     def test_ui_scale_tracks_height(self):
         launcher = self.make_launcher()
         expected = config.ui_scale_for(launcher.surface.get_height())
@@ -153,6 +181,39 @@ class TestTabsAndShortcuts(ShellTestCase):
             pygame.KEYDOWN, key=pygame.K_TAB, mod=pygame.KMOD_ALT | pygame.KMOD_SHIFT,
             unicode="\t"))
         self.assertEqual(launcher.current_tab, len(TABS) - 1)
+
+    def test_alt_tab_uses_physical_modifier_events_and_key_release(self):
+        launcher = self.make_launcher()
+        launcher._handle_global(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_LALT, mod=0))
+        launcher._handle_global(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_TAB, mod=0))
+        self.assertEqual(launcher.current_tab, 1)
+        launcher._handle_global(pygame.event.Event(pygame.KEYUP, key=pygame.K_LALT, mod=0))
+        consumed = launcher._handle_global(pygame.event.Event(pygame.KEYDOWN,
+                                                              key=pygame.K_TAB, mod=0))
+        self.assertFalse(consumed)
+        self.assertEqual(launcher._shortcut_mods, 0)
+
+    def test_focus_loss_resets_modifier_state(self):
+        launcher = self.make_launcher()
+        launcher._handle_global(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_LALT, mod=0))
+        launcher.held_keys[pygame.K_DOWN] = 0
+        launcher._handle_global(pygame.event.Event(pygame.WINDOWFOCUSLOST))
+        self.assertEqual(launcher._shortcut_mods, 0)
+        self.assertFalse(launcher.held_keys)
+
+    def test_alt_tab_is_global_on_every_tab_and_not_repeated(self):
+        launcher = self.make_launcher()
+        with patch.object(launcher, "ensure_browser"), patch.object(launcher, "ensure_terminal"):
+            for tab in range(len(TABS)):
+                launcher.current_tab = tab
+                launcher.push_overlay(gba_launcher.TextOverlay("test", ["test"]))
+                self.assertTrue(launcher._handle_global(pygame.event.Event(
+                    pygame.KEYDOWN, key=pygame.K_TAB, mod=pygame.KMOD_ALT)))
+                self.assertEqual(launcher.current_tab, (tab + 1) % len(TABS))
+                self.assertFalse(launcher.overlays)
+                launcher._handle_global(pygame.event.Event(
+                    pygame.KEYDOWN, key=pygame.K_TAB, mod=pygame.KMOD_ALT, repeat=True))
+                self.assertEqual(launcher.current_tab, (tab + 1) % len(TABS))
 
     def test_ctrl_alt_t_toggles_the_terminal_from_any_tab(self):
         launcher = self.make_launcher()

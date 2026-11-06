@@ -390,3 +390,6 @@ make screenshots   # regenerates the four README images
 
 Apache 2.0 — see [LICENSE](LICENSE). Game Boy Advance is a trademark of Nintendo; this project ships
 no ROMs, BIOS files or proprietary assets.
+
+Headless pendrive mounting uses udiskie + udisks2, without GNOME. See
+[USB automount setup and verification](docs/USB_AUTOMOUNT.md).

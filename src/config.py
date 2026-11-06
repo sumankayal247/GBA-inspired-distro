@@ -416,17 +416,23 @@ def _parse_mode_line(line: str) -> Optional[Tuple[int, int]]:
 def display_mode_size(env: Optional[Dict[str, str]] = None,
                       drm_root: str = "/sys/class/drm") -> Optional[Tuple[int, int]]:
     """
-    The physical display resolution as (w, h), or None when unknown.
+    The active X11 size or preferred DRM size as (w, h), or None.
 
     This reads `/sys/class/drm/<card>-<connector>/{status,modes}` and never
     opens the display itself — the handler must not take a DRM master or an
-    X connection that the emulator needs next (D-031/D4). The first mode line
+    connection that becomes the emulator's render surface (D-031/D4). The first mode line
     of a connected connector is its preferred (native) mode. Internal panels
     win over external outputs, and only the card named by a pinned
     `SDL_VIDEO_KMSDRM_DEVICE` is considered when one is set (D8). Falls back
-    to xrandr's current mode under X11 when DRM sysfs says nothing.
+    to DRM sysfs when X11's active mode cannot be queried.
     """
     env = os.environ if env is None else env
+    # X11's active mode, not a connector's advertised preferred mode, is
+    # the geometry a screen-sized unmanaged window must actually cover.
+    if env.get("DISPLAY"):
+        current = _xrandr_mode_size()
+        if current:
+            return current
     pinned = os.path.basename(env.get("SDL_VIDEO_KMSDRM_DEVICE", "") or "")
     best: Optional[Tuple[int, int, Tuple[int, int]]] = None
     try:

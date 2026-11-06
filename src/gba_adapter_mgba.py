@@ -1010,7 +1010,8 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
                        cheats_dir: Optional[str] = None,
                        savestate: Optional[str] = None,
                        fps_target: Optional[float] = None,
-                       runtime_dir: Optional[str] = None) -> list:
+                       runtime_dir: Optional[str] = None,
+                       bare_x11: bool = False) -> list:
     """
     Builds the mGBA argv with save routing (SV1), scaling (D2) and explicit
     video settings.
@@ -1028,24 +1029,21 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
     harmless while defaulting to the *wrong* fullscreen backend is what leaves
     the user staring at a black screen.
 
-    For fullscreen the window is explicitly sized to the physical display
-    (`-C width= -C height=`) when its mode is known. SDL2's X11 backend
-    implements FULLSCREEN_DESKTOP purely as a window-manager request, and the
-    appliance X session runs without a WM, so mGBA's default geometry (native
-    240x160 / 160x144 scaled once) would remain a tiny centred window on a
-    much larger screen. Screen-sized geometry fills the display with or
-    without a WM, and mGBA's lockAspectRatio/lockIntegerScaling viewport then
-    centres the largest correctly-proportioned image inside it (no crop, no
-    stretch). When the mode cannot be determined, `-4` requests 4x native
-    (960x640) instead of the useless 1x window.
+    Bare X11 has no WM to service SDL2 FULLSCREEN_DESKTOP requests. When
+    the active screen size is known, use an ordinary screen-sized window
+    instead (the caller places it at 0,0). With no WM it has no decorations.
+    Desktop and KMS fullscreen remain SDL-managed. Unknown-size X11 retains
+    the fullscreen fallback rather than pretending a 4x window fills a screen.
     """
+    screen_window = (bare_x11 and not windowed and display_size is not None
+                     and display_size[0] > 0 and display_size[1] > 0)
     native_dir = runtime_dir or save_dir
     cmd = [
         mgba_bin,
         "-C", f"savegamePath={save_dir}",
         "-C", f"savestatePath={native_dir}",
         "-C", f"screenshotPath={native_dir}",
-        "-C", f"fullscreen={0 if windowed else 1}",
+        "-C", f"fullscreen={0 if windowed or screen_window else 1}",
         # mgba-sdl enables rewind recording by default: a full core snapshot
         # every emulated frame plus a 600-second buffer, serialized on the
         # emulation thread. The appliance exposes no rewind control, so this
@@ -1066,7 +1064,8 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
     if windowed:
         cmd.extend(["-3"])
     else:
-        cmd.append("-f")
+        if not screen_window:
+            cmd.append("-f")
         cmd.extend(["-C", "lockAspectRatio=1"])
         cmd.extend(["-C", f"lockIntegerScaling={1 if display_scaling == 'integer' else 0}"])
         if display_size and int(display_size[0]) > 0 and int(display_size[1]) > 0:
@@ -1092,7 +1091,8 @@ def retry_strategy(session: str, ret: int, elapsed: float, windowed: bool,
 
     Returns ("windowed", None) or ("card", "/dev/dri/cardN").
     """
-    if ret == 0 or windowed or elapsed >= 5.0:
+    if ret in (0, -signal.SIGTERM, -signal.SIGINT, -signal.SIGHUP, -signal.SIGKILL) \
+            or windowed or elapsed >= 5.0:
         return None
     if session in ("x11", "wayland"):
         return ("windowed", None)
@@ -1123,7 +1123,7 @@ class MgbaSessionRunner:
     def __init__(self, cmd: list, env: dict, session=None, action_queue=None,
                  native=None, build_command=None, overlay_size=None,
                  theme_name: str = "indigo", windowed: bool = False,
-                 stop_timeout: float = 4.0):
+                 stop_timeout: float = 2.0):
         self.cmd = cmd
         self.env = env
         self.session = session
@@ -1155,19 +1155,30 @@ class MgbaSessionRunner:
             return True
         timeout = self.stop_timeout if timeout is None else float(timeout)
         logger.info("Stopping mGBA (pid %s) for a display handoff", getattr(child, "pid", -1))
-        try:
-            child.terminate()
-        except Exception as exc:
-            logger.warning("Could not send SIGTERM to mGBA: %s", exc)
-        try:
-            child.wait(timeout=timeout)
-        except Exception:
-            logger.warning("mGBA did not exit in %.1fs; killing it", timeout)
+        # Every wait is bounded, including the final reap. SIGCONT lets a
+        # suspended child handle termination; SIGKILL also works if SDL is hung.
+        for sig, grace in ((signal.SIGCONT, 0), (signal.SIGTERM, timeout),
+                           (signal.SIGHUP, 0.5), (signal.SIGKILL, 2.0)):
             try:
-                child.kill()
-                child.wait(timeout=2.0)
-            except Exception:
-                pass
+                if sig == signal.SIGTERM:
+                    child.terminate()
+                elif sig == signal.SIGKILL:
+                    child.kill()
+                else:
+                    child.send_signal(sig)
+            except ProcessLookupError:
+                pass                 # exit raced with the signal
+            except OSError as exc:
+                logger.warning("Could not signal mGBA (%s): %s", sig, exc)
+            if not grace:
+                continue
+            try:
+                child.wait(timeout=grace)
+                break
+            except subprocess.TimeoutExpired:
+                logger.warning("mGBA did not exit after signal %s in %.1fs", sig, grace)
+            except OSError as exc:
+                logger.warning("Could not reap mGBA: %s", exc)
         # The input watcher deliberately keeps running: it is what delivers
         # the combo that closes the overlay, and it lives as long as the
         # session (`_session_alive`), not as long as this child.
@@ -1266,6 +1277,10 @@ class MgbaSessionRunner:
         return self.start_emulator(state, fps_target)
 
     def _drain_actions(self) -> None:
+        if self.exit_requested:
+            if self.session is not None:
+                self.session.close_overlay()
+            return
         if self.action_queue is None or self.session is None:
             return
         while True:
@@ -1305,9 +1320,16 @@ class MgbaSessionRunner:
             self._spawn(self.cmd)
         except Exception as exc:
             logger.error("Failed to launch mGBA: %s", exc)
+            self.shutting_down = True
+            if self.monitor:
+                self.monitor.stop()
+            self._terminate_child()
+            if self.child is not None and self.child.stdout is not None:
+                self.child.stdout.close()
             return 3
 
         def handle_signal(sig, frame):
+            self._request_exit()
             child = self.child
             logger.info("Adapter received signal %d, forwarding to child %d",
                         sig, getattr(child, "pid", -1))
@@ -1348,7 +1370,16 @@ class MgbaSessionRunner:
                 if child is None or child.poll() is not None:
                     break
             child = self.child
-            ret = child.wait() if child is not None else 0
+            if child is not None:
+                self.stop_emulator()
+                # poll reaps an exited child; never wait indefinitely even if
+                # the kernel cannot complete SIGKILL (e.g. uninterruptible I/O).
+                ret = child.poll()
+                if ret is None:
+                    logger.error("mGBA could not be reaped after SIGKILL")
+                    ret = -signal.SIGKILL
+            else:
+                ret = 0
         finally:
             self.shutting_down = True
             # Rule: never leave mGBA stopped, running, or half-relaunched.
@@ -1433,6 +1464,13 @@ def main():
     # bug. Resolve the session and hand mGBA a coherent environment (D4).
     env = prepare_child_environment()
     screen = display_mode_size(env)
+    bare_x11 = (env.get("GBA_BARE_X11") == "1"
+                and display_session() == "x11" and not is_windowed)
+    if bare_x11 and screen:
+        # No WM: SDL's undefined position is not guaranteed to be (0,0).
+        env["SDL_VIDEO_WINDOW_POS"] = "0,0"
+        logger.info("Bare X11: screen-sized window %sx%s at 0,0; SDL fullscreen disabled",
+                    *screen)
     logger.info("Display session=%s driver=%s windowed=%s scaling=%s screen=%s",
                 display_session(), env.get("SDL_VIDEODRIVER", "auto"),
                 is_windowed, display_scaling,
@@ -1500,7 +1538,7 @@ def main():
             display_scaling, screen if size is None else size,
             cheat_file=current_cheat_file(), cheats_dir=cheats_dir,
             savestate=savestate, fps_target=fps_target,
-            runtime_dir=runtime_dir)
+            runtime_dir=runtime_dir, bare_x11=bare_x11)
 
     def reload_command(**kwargs):
         return make_command(fps_target=kwargs.get("fps_target"),
