@@ -25,6 +25,7 @@ import pygame  # noqa: E402
 import common  # noqa: E402
 import config  # noqa: E402
 import gba_launcher  # noqa: E402
+import gba_updater  # noqa: E402
 import library  # noqa: E402
 from gba_launcher import GBALauncher, TABS  # noqa: E402
 
@@ -585,6 +586,137 @@ class TestOverlaysAndUsb(ShellTestCase):
         launcher.games = []
         launcher.render()
         self.assertTrue(True)
+
+
+class _StubUpdater:
+    """Deterministic stand-in for gba_updater inside overlay tests."""
+
+    def __init__(self, report, network=True, apply_result=(True, "applied cleanly")):
+        self.report = report
+        self.network = network
+        self.apply_result = apply_result
+        self.calls = []
+
+    def network_ok(self, *args, **kwargs):
+        return self.network
+
+    def installed_version(self, install_dir):
+        return "111111111111"
+
+    def default_install_dir(self):
+        return os.path.join(os.getcwd(), "nowhere-install")
+
+    def default_work_dir(self):
+        return os.path.join(os.getcwd(), "nowhere-work")
+
+    def check_for_updates(self, work_dir, local_sha):
+        self.calls.append(("check", local_sha))
+        return self.report
+
+    def apply_update(self, work_dir, install_dir):
+        self.calls.append(("apply",))
+        return self.apply_result
+
+
+class TestUpdateOverlay(ShellTestCase):
+    def _report(self, **kwargs):
+        base = dict(local_sha="111111111111", remote_sha="222222222222",
+                    behind=2, subjects=["aaa1111 second", "bbb2222 third"],
+                    up_to_date=False)
+        base.update(kwargs)
+        return gba_updater.UpdateReport(**base)
+
+    def test_system_menu_offers_the_update_action(self):
+        launcher = self.make_launcher()
+        labels = [row.get("label") for row in launcher._rows_system()]
+        self.assertIn("Check for updates", labels)
+
+        class _Record:
+            pass
+
+        original = gba_launcher.UpdateOverlay
+        gba_launcher.UpdateOverlay = _Record
+        try:
+            launcher.start_update_check()
+            self.assertIsInstance(launcher.overlays[-1], _Record)
+            launcher.start_update_check()          # never stacks twice
+            self.assertEqual(sum(isinstance(o, _Record) for o in launcher.overlays), 1)
+        finally:
+            gba_launcher.UpdateOverlay = original
+
+    def test_prompt_apply_restart_flow(self):
+        stub = _StubUpdater(self._report())
+        overlay = gba_launcher.UpdateOverlay(updater=stub)
+        overlay._worker.join(3)
+        self.assertEqual(overlay.phase, "prompt")
+        launcher = self.make_launcher()
+        launcher.push_overlay(overlay)
+        launcher.render()                          # draw smoke: prompt
+        accept = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN)
+        overlay.handle(accept, launcher)
+        overlay._worker.join(5)
+        self.assertEqual(overlay.phase, "done")
+        launcher.render()                          # draw smoke: done
+        overlay.handle(accept, launcher)
+        self.assertEqual(launcher.overlays, [])
+        self.assertTrue(launcher._restart_pending)
+        self.assertIn("Restarting", launcher.toast_text)
+        self.assertEqual(stub.calls, [("check", "111111111111"), ("apply",)])
+
+    def test_up_to_date_shows_info_and_toast(self):
+        stub = _StubUpdater(self._report(up_to_date=True, behind=0, subjects=[]))
+        overlay = gba_launcher.UpdateOverlay(updater=stub)
+        overlay._worker.join(3)
+        self.assertEqual(overlay.phase, "info")
+        launcher = self.make_launcher()
+        launcher.push_overlay(overlay)
+        launcher.render()
+        overlay.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN), launcher)
+        self.assertEqual(launcher.overlays, [])
+        self.assertIn("up to date", launcher.toast_text)
+        self.assertFalse(launcher._restart_pending)
+
+    def test_no_network_reports_error_without_apply(self):
+        stub = _StubUpdater(self._report(), network=False)
+        overlay = gba_launcher.UpdateOverlay(updater=stub)
+        overlay._worker.join(3)
+        self.assertEqual(overlay.phase, "error")
+        self.assertIn("github.com", overlay.message)
+        launcher = self.make_launcher()
+        launcher.push_overlay(overlay)
+        launcher.render()
+        overlay.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN), launcher)
+        self.assertEqual(launcher.overlays, [])
+        self.assertEqual(stub.calls, [])           # never reached the git step
+
+    def test_cancel_while_checking_never_applies(self):
+        import threading
+
+        class _BlockingUpdater(_StubUpdater):
+            def __init__(self, report):
+                super().__init__(report)
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def check_for_updates(self, work_dir, local_sha):
+                self.calls.append(("check", local_sha))
+                self.entered.set()
+                self.release.wait(5)
+                return self.report
+
+        stub = _BlockingUpdater(self._report())
+        overlay = gba_launcher.UpdateOverlay(updater=stub)
+        self.assertTrue(stub.entered.wait(3))
+        launcher = self.make_launcher()
+        launcher.push_overlay(overlay)
+        overlay.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE), launcher)
+        self.assertTrue(overlay.cancelled)
+        self.assertEqual(launcher.overlays, [])
+        stub.release.set()
+        overlay._worker.join(5)
+        self.assertFalse(launcher._restart_pending)
+        self.assertEqual(stub.calls[:1], [("check", "111111111111")])
+        self.assertNotIn(("apply",), stub.calls)
 
 
 if __name__ == "__main__":

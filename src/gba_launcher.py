@@ -25,6 +25,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,6 +48,7 @@ except Exception as _pygame_error:  # pragma: no cover - broken installs only
     sys.exit(103)  # common.EXIT_CODE_MISSING_DEPS (imported further down)
 
 import config as settings_store
+import gba_updater
 from common import (
     DEFAULT_KEYBINDINGS,
     EXIT_CODE_LAUNCH_REQUEST,
@@ -299,6 +301,163 @@ class ConfirmOverlay(Overlay):
                                                 rect.bottom - theme.px(30),
                                                 theme.px(66), theme.px(20)),
                      "[B] CANCEL", theme.colors.text_dim, filled=False)
+
+
+class UpdateOverlay(Overlay):
+    """SETTINGS -> System -> Check for updates (D-055).
+
+    Every network and git step runs on a worker thread so the shell keeps
+    drawing at 60 fps; the main thread only reads the phase flag and renders
+    it.  Phases: checking -> prompt -> applying -> done, or info/error.
+    """
+
+    def __init__(self, updater=None):
+        super().__init__()
+        self.title = "SYSTEM UPDATE"
+        self.width = 340.0
+        self.height = 138.0
+        self.updater = updater if updater is not None else gba_updater
+        self.phase = "checking"
+        self.report = None
+        self.message = ""
+        self.apply_tail = ""
+        self.cancelled = False
+        self._worker = threading.Thread(target=self._check, daemon=True)
+        self._worker.start()
+
+    # -- worker steps (never touch pygame here) -------------------------
+    def _check(self):
+        try:
+            if not self.updater.network_ok():
+                self._set_error("No route to github.com:443. Connect the console "
+                                "to Wi-Fi or Ethernet, then try again.")
+                return
+            local = self.updater.installed_version(self.updater.default_install_dir())
+            report = self.updater.check_for_updates(self.updater.default_work_dir(), local)
+            if report.error:
+                self._set_error(report.error)
+            elif report.up_to_date:
+                self.message = ("System is up to date "
+                                f"(commit {report.remote_sha or local or 'unknown'}).")
+                self.phase = "info"
+            else:
+                self.report = report
+                self.phase = "prompt"
+        except Exception as exc:  # pragma: no cover - defensive
+            self._set_error(f"Update check failed: {exc}")
+
+    def _apply(self):
+        try:
+            ok, tail = self.updater.apply_update(self.updater.default_work_dir(),
+                                                 self.updater.default_install_dir())
+            if self.cancelled:
+                return
+            self.apply_tail = tail
+            self.phase = "done" if ok else None
+            if not ok:
+                self._set_error("The update could not be applied:\n" + tail)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._set_error(f"Update failed: {exc}")
+
+    def _set_error(self, message: str) -> None:
+        if self.cancelled:
+            return
+        self.message = message
+        self.phase = "error"
+
+    # -- ui ---------------------------------------------------------------
+    def _buttons(self, shell):
+        theme = shell.theme
+        rect = self.rect(shell)
+        yes = pygame.Rect(rect.centerx - theme.px(74), rect.bottom - theme.px(30),
+                          theme.px(66), theme.px(20))
+        no = pygame.Rect(rect.centerx + theme.px(8), rect.bottom - theme.px(30),
+                         theme.px(66), theme.px(20))
+        return yes, no
+
+    def handle(self, event, shell) -> None:
+        if event.type == pygame.QUIT:
+            if not shell.appliance_mode:
+                self.close(shell)
+            return
+        mouse = event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+        accept = (event.type == pygame.KEYDOWN and event.key in
+                  (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_z, pygame.K_SPACE)) or \
+                 (event.type == pygame.JOYBUTTONDOWN and event.button == 0)
+        cancel = (event.type == pygame.KEYDOWN and event.key in
+                  (pygame.K_ESCAPE, pygame.K_BACKSPACE, pygame.K_x)) or \
+                 (event.type == pygame.JOYBUTTONDOWN and event.button == 1)
+        if mouse:
+            yes, no = self._buttons(shell)
+            if self.phase == "prompt":
+                if yes.collidepoint(event.pos):
+                    accept = True
+                elif no.collidepoint(event.pos):
+                    cancel = True
+                else:
+                    return
+            elif self.phase in ("info", "error"):
+                accept = True
+            else:
+                return
+        if cancel:
+            self.cancelled = True
+            self.close(shell)
+            return
+        if not accept or self.phase in ("checking", "applying"):
+            return
+        if self.phase == "prompt":
+            self.phase = "applying"
+            self._worker = threading.Thread(target=self._apply, daemon=True)
+            self._worker.start()
+            return
+        if self.phase == "done":
+            self.close(shell)
+            shell.toast("Updated successfully! Restarting launcher...", TOAST_OK, 4.0)
+            shell.schedule_restart()
+            return
+        message = self.message
+        self.close(shell)                       # info / error: acknowledge
+        if self.phase == "info":
+            shell.toast(message, TOAST_OK)
+
+    def draw_body(self, shell) -> None:
+        theme = shell.theme
+        rect = self.rect(shell)
+        font = theme.font("body")
+        y = rect.y + theme.px(36)
+        if self.phase == "checking":
+            lines = ["Contacting github.com (anonymous, read-only)...",
+                     "Comparing commits with this install."]
+        elif self.phase == "applying":
+            lines = ["Applying update... do not power off.",
+                     "Saves, ROMs and settings are untouched."]
+        elif self.phase == "prompt":
+            behind = self.report.behind if self.report else None
+            head = ("New version found!" if behind is None else
+                    f"New version found: {behind} new commit(s).")
+            lines = [head]
+            lines += [f"  {sub}" for sub in (self.report.subjects if self.report else [])[:3]]
+            lines.append("Pull from GitHub and update now?")
+        elif self.phase == "done":
+            lines = ["Update applied cleanly.",
+                     "Restart the launcher to run the new version?"]
+        else:
+            lines = wrap_text(font, self.message, rect.width - theme.px(24), max_lines=5)
+        for line in lines:
+            shell.surface.blit(font.render(line, True, theme.colors.text),
+                               (rect.x + theme.px(12), y))
+            y += font.get_linesize() + theme.px(1)
+        if self.phase == "prompt":
+            yes, no = self._buttons(shell)
+            theme.button(shell.surface, yes, "[A] UPDATE", theme.colors.primary)
+            theme.button(shell.surface, no, "[B] CANCEL", theme.colors.text_dim,
+                         filled=False)
+        elif self.phase in ("info", "error", "done"):
+            yes, _no = self._buttons(shell)
+            label = "[A] OK" if self.phase != "done" else "[A] RESTART"
+            color = theme.colors.danger if self.phase == "error" else theme.colors.primary
+            theme.button(shell.surface, yes, label, color)
 
 
 class TextOverlay(Overlay):
@@ -1618,6 +1777,7 @@ class GBALauncher:
         self.filter_text = ""
         self._focus_applied = False
         self.overlays: List[Overlay] = []
+        self._restart_pending = False
         self.toast_text = ""
         self.toast_kind = TOAST_INFO
         self.toast_until = 0.0
@@ -1885,6 +2045,9 @@ class GBALauncher:
 
     # ------------------------------------------------------------- update
     def update(self) -> None:
+        if self._restart_pending:
+            self._exec_updated_launcher()
+            return
         if self.scanner is not None and self.scanner.done:
             self.games = self.scanner.entries
             self._reorder_games(preserve=False)
@@ -2644,6 +2807,20 @@ class GBALauncher:
         except Exception:
             pass
 
+    def start_update_check(self) -> None:
+        if any(isinstance(o, UpdateOverlay) for o in self.overlays):
+            return
+        self.push_overlay(UpdateOverlay())
+
+    def schedule_restart(self) -> None:
+        """Re-exec the launcher binary after a successful in-place update."""
+        self._restart_pending = True
+
+    def _exec_updated_launcher(self) -> None:
+        self.release_display()
+        os.execv(sys.executable,
+                 [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+
     def confirm_system(self, message: str, code: int) -> None:
         def do_it():
             self.release_display()
@@ -2922,6 +3099,9 @@ class GBALauncher:
             {"type": "action", "label": "About GBA OS",
              "hint": "Version, shortcuts and credits.",
              "action": lambda shell: shell.show_about()},
+            {"type": "action", "label": "Check for updates",
+             "hint": "Pull the latest GBA OS from GitHub (anonymous, read-only).",
+             "action": lambda shell: shell.start_update_check()},
             {"type": "action", "label": "Reboot", "hint": "Return to the GRUB menu.",
              "action": lambda shell: shell.confirm_system("Reboot to the GRUB menu?",
                                                           EXIT_CODE_REBOOT)},

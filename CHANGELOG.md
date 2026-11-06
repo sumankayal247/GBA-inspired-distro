@@ -4,6 +4,33 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — In-shell self-update (SETTINGS → System → Check for updates)
+
+The console can now pull its own updates from GitHub without a terminal, a login or a second
+computer: an anonymous HTTPS check compares `origin/main` with the commit stamped in
+`/opt/gba-distro/VERSION`, a modal lists the new commits, and confirming re-runs the shipped
+`scripts/install.sh --apply --repair` from a shallow clone — the same code path as a manual
+install, so saves, ROMs and settings stay untouched by contract. Suite: **509 passing, 1 skipped**.
+
+### Added
+
+- **`src/gba_updater.py`**: `network_ok()` reachability probe, `installed_version()` (VERSION stamp
+  or local `.git`), `check_for_updates()` (`git ls-remote` + shallow clone for the commit list) and
+  `apply_update()` (reset the clone to `origin/<branch>`, run its installer with `sudo -n` when
+  unprivileged, `GIT_TERMINAL_PROMPT=0` everywhere so nothing can block on a credential prompt).
+- **`UpdateOverlay`** in `src/gba_launcher.py`: a modal state machine (checking → prompt →
+  applying → done / info / error) whose git and network work runs on a worker thread so the shell
+  keeps drawing; on success it toasts and re-execs the launcher into the new version.
+- **VERSION stamp**: `scripts/install.sh` now writes `$INSTALL_DIR/VERSION` (commit + timestamp)
+  during `install_files`, and ships `gba_updater.py` with the rest of the modules.
+
+### Tests
+
+- `tests/test_updater.py` (14): reachability, version stamp, behind/up-to-date/unreachable checks
+  and apply success/failure/missing-installer against throwaway `file://` git repositories.
+- `tests/test_shell.py` `TestUpdateOverlay` (5): menu wiring, prompt → apply → restart, up-to-date
+  toast, no-network error, and cancel-during-check never applying.
+
 ## [Unreleased] — Cartridge card and wordmark visual fixes
 
 Three defects reported from a photo of the real shelf, all in the theme's cartridge painter and the

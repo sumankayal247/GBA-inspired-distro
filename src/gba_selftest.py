@@ -75,7 +75,7 @@ def check_modules() -> List[Check]:
     results = []
     modules = ["common", "config", "theme", "library", "gba_terminal",
                "gba_browser", "gba_usb", "gba_mtp", "gba_launcher", "gba_supervisor",
-               "game_data", "gba_ingame", "gba_ingame_ui"]
+               "game_data", "gba_ingame", "gba_ingame_ui", "gba_updater"]
     for name in modules:
         try:
             __import__(name)

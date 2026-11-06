@@ -82,6 +82,7 @@ The shell itself is deliberately small and single-purpose per module:
 | `src/gba_mtp.py` | small MTP API facade over the shared `gba_usb` implementation |
 | `src/game_data.py` | per-content-id cheats, nine save-state slots, favorites, game deletion |
 | `src/gba_ingame.py` | shortcut router, fast-forward cycle, overlay models, session state (no GUI dependency) |
+| `src/gba_updater.py` | anonymous GitHub self-update: reachability probe, commit compare, shallow clone, installer hand-off |
 | `src/gba_ingame_ui.py` | pygame/Theme overlay renderer used *inside the mGBA handler* |
 
 ### Process Lifecycle
@@ -326,6 +327,11 @@ is duplicated.
 - **Settings:** `DATA/config/settings.json` is the single store (scaling, theme, clock, view mode,
   volume, USB behaviour, launch confirmation). `keybindings.json` and `history.json` live beside it;
   a legacy `display.json` is migrated automatically on first run.
+- **Updates:** SETTINGS → System → *Check for updates* asks github.com (anonymous HTTPS, no login)
+  whether `origin/main` is ahead of the commit stamped in `/opt/gba-distro/VERSION`, shows the new
+  commits, and on confirm shallow-clones them and re-runs the shipped `scripts/install.sh --apply
+  --repair` from the clone. Saves, ROMs and settings live in `DATA/` and `GAMES/` and are never
+  touched; the launcher re-execs itself into the new version afterwards.
 
 ---
 

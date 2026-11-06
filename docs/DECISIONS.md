@@ -796,3 +796,31 @@ than failing. A verbose mask could in principle cost frame time on very modest h
 `GBA_DEBUG=0` switches the capture off again, including a byte-identical argv, since
 `build_mgba_command` only adds `-l` when a level is passed; the lifecycle lines stay, because
 one line per spawn, signal and fsync is a session record rather than a capture.
+
+## D-055 The distro updates itself through its own installer, never around it
+
+**Status:** Accepted
+
+**Decision.** SETTINGS → System → *Check for updates* (`src/gba_updater.py`, `UpdateOverlay` in
+`src/gba_launcher.py`) is a three-step, network-read-only flow: a TCP probe to `github.com:443`,
+`git ls-remote` against `origin/main` compared with the commit stamped into
+`$GBA_INSTALL_DIR/VERSION` by `install.sh`, and — only after the user confirms a modal listing the
+new commits — a shallow clone into `<data>/update/work` plus `git reset --hard origin/<branch>` and
+an execution of *that checkout's* `scripts/install.sh --apply --repair` with `GBA_INSTALL_DIR` set.
+Every git/subprocess call runs with `GIT_TERMINAL_PROMPT=0` on a worker thread behind the modal;
+elevation is `sudo -n` when the shell is unprivileged, and a missing passwordless sudo surfaces the
+installer output instead of prompting. On success the launcher `os.execv`s itself.
+
+**Why.** The repository is public, so checking and downloading needs no credential of any kind —
+but *applying* touches `/opt`, `/usr/local/bin` and the boot entry, which is exactly what
+`install.sh` already does safely (it owns ownership, wrappers, self-test and the "never touch
+`/data` or `/games`" contract). Re-running the shipped installer from the new checkout keeps a
+button-press update byte-identical to a manual `sudo ./scripts/install.sh --apply --repair`, gives
+`--repair`'s recovery path for free, and means the updater can never drift from the install logic.
+Comparing against a `VERSION` stamp (written at install time, `commit unknown` tolerated) works on
+ISO installs that carry no `.git` directory at all.
+
+**Consequences.** No token, key or login ever exists on the appliance; the only write is the
+installer's own. The working clone is disposable and reset on every apply. If the network probe
+fails the modal says so in one line and nothing is cloned. Tests exercise check/apply against
+throwaway `file://` repositories and a stub updater drives every overlay phase headlessly.
