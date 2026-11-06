@@ -1640,6 +1640,7 @@ class GBALauncher:
         self.axis_gate = {"y": 0.0, "x": 0.0}
         self.axis_dir = {"y": 0, "x": 0}
         self.held_keys: Dict[int, float] = {}
+        self._shortcut_mods = 0
 
         # Display + theme
         self._init_display()
@@ -1667,24 +1668,33 @@ class GBALauncher:
         self.clock = pygame.time.Clock()
 
     # ------------------------------------------------------------ display
-    def _init_display(self) -> None:
+    def _init_display(self, size=None) -> None:
         """Creates the window and a canvas that matches it exactly."""
         if self.screenshot_path:
             size = (960, 640)
             self.window = pygame.display.set_mode(size)
         elif self.windowed:
-            size = (1152, 720)
+            size = size or (self.window.get_size() if hasattr(self, "window")
+                            else (1152, 720))
             self.window = pygame.display.set_mode(size, pygame.RESIZABLE)
         else:
             info = pygame.display.Info()
             width = info.current_w if getattr(info, "current_w", 0) > 0 else 1920
             height = info.current_h if getattr(info, "current_h", 0) > 0 else 1080
             size = (width, height)
-            self.window = pygame.display.set_mode(size, pygame.FULLSCREEN)
+            bare_x11 = (os.environ.get("GBA_BARE_X11") == "1"
+                        and pygame.display.get_driver() == "x11")
+            if bare_x11:
+                os.environ["SDL_VIDEO_WINDOW_POS"] = "0,0"
+            flags = pygame.NOFRAME if bare_x11 else pygame.FULLSCREEN
+            self.window = pygame.display.set_mode(size, flags)
 
         if not self.screenshot_path:
             pygame.display.set_caption("GBA OS")
+        # SDL can choose a different size; compose against the actual drawable.
+        size = self.window.get_size()
         self.screen_w, self.screen_h = size
+        self._grab_shortcuts()
         self.pixel_mode = self.settings.get("scaling") == "integer"
         if self.pixel_mode:
             # Retro mode: compose at 480x320 and upscale by a whole factor.
@@ -1696,14 +1706,23 @@ class GBALauncher:
         self.design_w = self.canvas_w / self.ui_scale
         self.design_h = self.canvas_h / self.ui_scale
 
+    def _grab_shortcuts(self) -> None:
+        # Capture Alt+Tab only on the dedicated appliance, never a desktop test.
+        grab = getattr(pygame.event, "set_keyboard_grab", None)
+        if grab is not None and self.appliance_mode and not self.screenshot_path:
+            try:
+                grab(True)
+            except pygame.error as exc:
+                logger.warning("Could not grab appliance shortcuts: %s", exc)
+
     def _init_theme(self) -> None:
         self.theme = Theme(self.settings.get("theme", "indigo"), self.ui_scale)
         if self.terminal_view is not None:
             self.terminal_view.theme = self.theme
 
-    def _rebuild_surface(self) -> None:
+    def _rebuild_surface(self, size=None) -> None:
         """Used after a resize or a scaling change."""
-        self._init_display()
+        self._init_display(size)
         self._init_theme()
         self.terminal_view = None  # rebuilt lazily with the new font metrics
         if self.browser:
@@ -2167,13 +2186,32 @@ class GBALauncher:
             self.refresh_joysticks()
             self.toast("Gamepad disconnected", TOAST_WARN)
             return True
+        if event.type == getattr(pygame, "WINDOWFOCUSLOST", -1):
+            self._shortcut_mods = 0
+            self.held_keys.clear()
+            return True
+        if event.type == getattr(pygame, "WINDOWFOCUSGAINED", -1):
+            self._grab_shortcuts()
+            return True
+        modifier_keys = {
+            pygame.K_LALT: pygame.KMOD_LALT, pygame.K_RALT: pygame.KMOD_RALT,
+            pygame.K_LSHIFT: pygame.KMOD_LSHIFT, pygame.K_RSHIFT: pygame.KMOD_RSHIFT,
+            pygame.K_LCTRL: pygame.KMOD_LCTRL, pygame.K_RCTRL: pygame.KMOD_RCTRL,
+        }
+        if event.type in (pygame.KEYDOWN, pygame.KEYUP) and event.key in modifier_keys:
+            bit = modifier_keys[event.key]
+            if event.type == pygame.KEYDOWN:
+                self._shortcut_mods |= bit
+            else:
+                self._shortcut_mods &= ~bit
         if event.type == pygame.VIDEORESIZE and self.windowed and not self.screenshot_path:
-            self._rebuild_surface()
+            size = (max(320, event.w), max(240, event.h))
+            self._rebuild_surface(size)
             return True
         if event.type != pygame.KEYDOWN:
             return False
 
-        mod = getattr(event, "mod", 0)
+        mod = getattr(event, "mod", 0) | self._shortcut_mods
         ctrl = bool(mod & pygame.KMOD_CTRL)
         alt = bool(mod & pygame.KMOD_ALT)
         shift = bool(mod & pygame.KMOD_SHIFT)
@@ -2191,6 +2229,8 @@ class GBALauncher:
         # Alt+Tab / Alt+Shift+Tab: cycle the main tabs (ISO_Left_Tab is what
         # X11 reports for Shift+Tab, and it is absent on some pygame builds).
         if alt and event.key in (pygame.K_TAB, getattr(pygame, "K_ISO_Left_Tab", -1)):
+            if getattr(event, "repeat", False):
+                return True
             self.close_overlays()
             if event.key == pygame.K_TAB and not shift:
                 self.switch_tab(1)

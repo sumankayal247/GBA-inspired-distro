@@ -96,7 +96,11 @@ class InGameOverlayRenderer:
             fullscreen = not (self.windowed or dummy)
             if fullscreen:
                 self._apply_size(self._fullscreen_size(self.size))
-            flags = pygame.FULLSCREEN if fullscreen else 0
+            bare_x11 = (os.environ.get("GBA_BARE_X11") == "1"
+                        and pygame.display.get_driver() == "x11")
+            if fullscreen and bare_x11:
+                os.environ["SDL_VIDEO_WINDOW_POS"] = "0,0"
+            flags = (pygame.NOFRAME if bare_x11 else pygame.FULLSCREEN) if fullscreen else 0
             self.surface = pygame.display.set_mode(self.size, flags)
             pygame.display.set_caption("GBA OS")
             self._display_ready = True

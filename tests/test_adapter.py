@@ -25,6 +25,11 @@ from gba_adapter_mgba import (
 class TestVideoRetry(unittest.TestCase):
     """The 'black screen then back to the library' fallback ladder."""
 
+    def test_user_signal_exit_never_relaunches_emulator(self):
+        import signal
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGKILL):
+            self.assertIsNone(retry_strategy("x11", -sig, 0.2, False, {}))
+
     def test_desktop_retries_windowed(self):
         self.assertEqual(retry_strategy("x11", 1, 0.4, False, {}), ("windowed", None))
         self.assertEqual(retry_strategy("wayland", 1, 0.4, False, {}), ("windowed", None))
@@ -228,6 +233,23 @@ class TestDisplayGeometry(unittest.TestCase):
         self.assertIn("lockAspectRatio=1", joined)
         self.assertIn("lockIntegerScaling=1", joined)
         self.assertEqual(cmd[-1], "/games/x.gba")  # ROM must stay last
+
+    def test_bare_x11_uses_screen_window_without_fullscreen_request(self):
+        for size in ((1920, 1080), (1366, 768)):
+            cmd = build_mgba_command("mgba", "/game.gba", self.save_dir,
+                                     False, "integer", size, bare_x11=True)
+            self.assertNotIn("-f", cmd)
+            self.assertIn("fullscreen=0", cmd)
+            self.assertIn(f"width={size[0]}", cmd)
+            self.assertIn(f"height={size[1]}", cmd)
+            self.assertIn("lockAspectRatio=1", cmd)
+            self.assertIn("lockIntegerScaling=1", cmd)
+
+    def test_unknown_bare_x11_size_keeps_fullscreen_fallback(self):
+        cmd = build_mgba_command("mgba", "/game.gba", self.save_dir,
+                                 False, "fit", None, bare_x11=True)
+        self.assertIn("-f", cmd)
+        self.assertIn("fullscreen=1", cmd)
 
     def test_fit_scaling_keeps_aspect_lock_without_integer_lock(self):
         joined = " ".join(self.cmd(display_size=(1920, 1080)))

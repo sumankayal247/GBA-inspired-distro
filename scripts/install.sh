@@ -140,6 +140,7 @@ do_repair() {
 Run '$0 --apply' to install it for the first time."
     fi
 
+    install_automount_dependencies
     install_files
     install_ownership
     install_wrappers
@@ -200,6 +201,28 @@ recovery-first setup, but games will not launch until you install them)."
     fi
     gb_ok "python3, pygame and mGBA are present."
     return 0
+}
+
+# Install only the headless automount stack, never desktop recommendations.
+install_automount_dependencies() {
+    gb_step "Installing lightweight USB automount support"
+    if gb_is_dry_run; then
+        gb_dim "  (dry-run) would install udiskie udisks2 dbus util-linux without recommends"
+        return 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        gb_die "Install udiskie, udisks2, dbus and util-linux with your package manager,
+then retry. Automatic dependency installation currently supports Debian/Ubuntu."
+    fi
+    apt-get install -y --no-install-recommends udiskie udisks2 dbus util-linux
+    # In an image/chroot there is no running service manager. The installed
+    # system starts dbus at boot and activates udisks2 on the system bus.
+    if [ -d /run/systemd/system ]; then
+        systemctl start dbus.service udisks2.service
+        systemctl is-active --quiet dbus.service udisks2.service
+    else
+        gb_info "No running systemd: ensure the system D-Bus is started by init; udisks2 is D-Bus activated."
+    fi
 }
 
 check_platform() {
@@ -303,14 +326,7 @@ install_wrappers() {
         return 0
     fi
 
-    cat > "$SESSION_RUNNER" << 'EOF_SESSION'
-#!/bin/bash
-# Minimal X11 session for mGBA's SDL backend. No desktop environment runs here:
-# the shell is the launcher and it hands the display to the emulator.
-export DISPLAY="${DISPLAY:-:0}"
-xhost +local: >/dev/null 2>&1 || true
-exec /opt/gba-distro/bin/gba-supervisor --appliance
-EOF_SESSION
+    install -m 0755 "$REPO_DIR/src/gba_session.sh" "$SESSION_RUNNER"
     chmod 0755 "$SESSION_RUNNER"
 
     cat > "$TTY_WRAPPER" << 'EOF_TTY'
@@ -365,7 +381,7 @@ if command -v xinit >/dev/null 2>&1 && command -v Xorg >/dev/null 2>&1; then
     EXIT_CODE=$?
 else
     echo "[boot] X11 not available; starting the shell directly on KMS/DRM"
-    /opt/gba-distro/bin/gba-supervisor --appliance
+    /usr/local/bin/gba-session
     EXIT_CODE=$?
 fi
 
@@ -681,6 +697,7 @@ main() {
         gb_confirm "Proceed with the install?" || { gb_info "Cancelled. Nothing was changed."; exit 0; }
     fi
 
+    install_automount_dependencies
     install_files
     install_ownership
     install_profile

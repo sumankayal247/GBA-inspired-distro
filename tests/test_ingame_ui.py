@@ -5,6 +5,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -60,6 +61,14 @@ class OverlayUITestCase(unittest.TestCase):
 
     def _event(self, kind, **kwargs):
         return pygame.event.Event(kind, **kwargs)
+
+    def test_bare_x11_overlay_matches_screen_window_strategy(self):
+        with patch.dict(os.environ, {"GBA_BARE_X11": "1", "SDL_VIDEODRIVER": "x11"}), \
+                patch.object(pygame.display, "get_driver", return_value="x11"), \
+                patch.object(pygame.display, "set_mode", wraps=pygame.display.set_mode) as mode:
+            self.assertTrue(self.renderer.open())
+            self.assertEqual(mode.call_args.args[1], pygame.NOFRAME)
+            self.assertEqual(os.environ["SDL_VIDEO_WINDOW_POS"], "0,0")
 
     def test_fullscreen_resolution_and_theme_scaling(self):
         self.assertTrue(self.renderer.open())

@@ -37,6 +37,7 @@ lint:
 	@bash -n scripts/build_iso.sh && echo "build_iso.sh: OK"
 	@bash -n scripts/lib/common.sh && echo "lib/common.sh: OK"
 	@bash -n scripts/launch_desktop.sh && echo "launch_desktop.sh: OK"
+	@bash -n src/gba_session.sh && echo "gba_session.sh: OK"
 	@sh -n src/gba_init.sh && echo "gba_init.sh: OK"
 
 run-window run-desktop:
