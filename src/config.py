@@ -329,7 +329,8 @@ def display_session(env: Optional[Dict[str, str]] = None) -> str:
 
 
 def prepare_child_environment(base: Optional[Dict[str, str]] = None,
-                              force_video: Optional[str] = None) -> Dict[str, str]:
+                              force_video: Optional[str] = None,
+                              drm_root: str = "/sys/class/drm") -> Dict[str, str]:
     """
     Builds an environment for a full-screen child (mGBA) that cannot end up on
     a driver with no display behind it.
@@ -339,6 +340,12 @@ def prepare_child_environment(base: Optional[Dict[str, str]] = None,
     `SDL_VIDEODRIVER=kmsdrm` inherited into a running desktop, which makes SDL
     take a DRM master it cannot present. Rather than inherit blindly we resolve
     the session first, then pin the matching driver (Rules D1, D4).
+
+    On a bare console the KMS/DRM card is chosen by `ranked_drm_cards`, which
+    prefers a card that actually has a connected output: pinning the first card
+    is how a hybrid-GPU machine ends up emulating perfectly onto a display that
+    does not exist (Rule D8, contract test T-DISPLAY-2). `drm_root` is only for
+    tests; it is the sysfs directory the ranking reads.
 
     Returns the new environment dict; the caller passes it to `Popen`.
     """
@@ -355,9 +362,11 @@ def prepare_child_environment(base: Optional[Dict[str, str]] = None,
         env["SDL_VIDEODRIVER"] = force_video or "kmsdrm"
         # Two GPUs (hybrid laptops, discrete cards) make SDL pick whichever it
         # finds first, which may be a card with no outputs: a black screen with
-        # a perfectly healthy machine. Pin the first card explicitly.
+        # a perfectly healthy machine - and healthy audio, because nothing in
+        # the emulator notices that no connector is wired to it. Pin a card
+        # that actually drives a display (T-DISPLAY-2 / D8).
         if not env.get("SDL_VIDEO_KMSDRM_DEVICE"):
-            cards = sorted(glob.glob("/dev/dri/card*"))
+            cards = ranked_drm_cards(drm_root=drm_root)
             if cards:
                 env["SDL_VIDEO_KMSDRM_DEVICE"] = cards[0]
     else:
@@ -397,6 +406,78 @@ def configure_sdl_audio() -> str:
 # Connector types that are built-in panels: on a laptop/handheld appliance the
 # internal screen is the one the emulator window must be measured against.
 INTERNAL_CONNECTORS = ("eDP", "LVDS", "DSI", "DPI")
+
+
+def _connector_entries(drm_root: str) -> List[Tuple[str, str]]:
+    """(card, connector) pairs from sysfs, e.g. ('card0', 'eDP-1')."""
+    try:
+        names = sorted(os.listdir(drm_root))
+    except OSError:
+        return []
+    entries = []
+    for name in names:
+        card, _, connector = name.partition("-")
+        if card and connector:
+            entries.append((card, connector))
+    return entries
+
+
+def _connector_connected(card: str, connector: str, drm_root: str) -> bool:
+    try:
+        with open(os.path.join(drm_root, f"{card}-{connector}", "status"),
+                  "r", encoding="utf-8") as f:
+            return f.read().strip() == "connected"
+    except OSError:
+        return False
+
+
+def ranked_drm_cards(drm_root: str = "/sys/class/drm",
+                     devices: Optional[List[str]] = None) -> List[str]:
+    """Every DRM card, best-first, for pinning SDL's KMS/DRM device (D8).
+
+    Pinning the *first* card is what produces the classic appliance black
+    screen: on a hybrid-GPU machine `card0` is usually the integrated card with
+    nothing wired to it, and an emulator on that card runs perfectly - audio,
+    input, frame timing all correct - while presenting nothing at all. It also
+    explains a shelf that renders and a game that does not: the pin is applied
+    only to the child, so the launcher keeps SDL's own (working) choice.
+
+    Contract test T-DISPLAY-2 requires "no black screen from an output-less
+    card", so the order is:
+
+      1. a card with a connected internal panel (eDP/LVDS/DSI/DPI);
+      2. any other card with a connected connector;
+      3. everything else in device order - the previous behaviour, so a machine
+         whose sysfs cannot be read is pinned exactly as it was before.
+    """
+    cards = sorted(glob.glob("/dev/dri/card*") if devices is None else devices)
+    if not cards:
+        return []
+    best: Dict[str, int] = {}
+    for card, connector in _connector_entries(drm_root):
+        if f"/dev/dri/{card}" not in cards:
+            continue
+        if not _connector_connected(card, connector, drm_root):
+            continue
+        rank = 0 if connector.startswith(INTERNAL_CONNECTORS) else 1
+        if rank < best.get(card, len(INTERNAL_CONNECTORS) + 1):
+            best[card] = rank
+    with_output = [path for path in cards if os.path.basename(path) in best]
+    with_output.sort(key=lambda path: (best[os.path.basename(path)], path))
+    without = [path for path in cards if os.path.basename(path) not in best]
+    return with_output + without
+
+
+def cards_without_output(drm_root: str = "/sys/class/drm",
+                         devices: Optional[List[str]] = None) -> List[str]:
+    """Cards that sysfs says drive nothing, for the log's benefit only."""
+    ranked = ranked_drm_cards(drm_root=drm_root, devices=devices)
+    entries = _connector_entries(drm_root)
+    if not entries:
+        return []                  # no evidence either way: claim nothing
+    connected = {card for card, connector in entries
+                 if _connector_connected(card, connector, drm_root)}
+    return [path for path in ranked if os.path.basename(path) not in connected]
 
 
 def _parse_mode_line(line: str) -> Optional[Tuple[int, int]]:
@@ -565,7 +646,10 @@ def storage_info(path: str) -> Optional[Dict[str, float]]:
         return None
 
 
-def other_drm_devices(exclude: str = "") -> List[str]:
-    """The remaining DRM cards, for retrying when the first one presents nothing."""
-    cards = sorted(glob.glob("/dev/dri/card*"))
-    return [card for card in cards if card != exclude]
+def other_drm_devices(exclude: str = "", drm_root: str = "/sys/class/drm") -> List[str]:
+    """The remaining DRM cards, best-first, for retrying when one presents nothing.
+
+    Ordered by `ranked_drm_cards`, so the D-047 ladder retries onto a card that
+    can actually present instead of onto a second output-less one.
+    """
+    return [card for card in ranked_drm_cards(drm_root=drm_root) if card != exclude]

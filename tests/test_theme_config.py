@@ -128,14 +128,17 @@ class TestDisplayEnvironment(ConfigTestCase):
         env = config.prepare_child_environment({"DISPLAY": ":4041", "PATH": "/bin"})
         self.assertNotIn("DISPLAY", env)
 
-    def test_console_pins_the_first_drm_card(self):
+    def test_console_pins_the_first_card_without_sysfs_evidence(self):
         """Two GPUs must not leave SDL on a card with no outputs."""
         fake_cards = ["/dev/dri/card1", "/dev/dri/card0"]
         real_glob = config.glob.glob
         config.glob.glob = lambda pattern: (fake_cards if "card" in pattern
                                             else real_glob(pattern))
         try:
-            env = config.prepare_child_environment({"PATH": "/bin"})
+            # An unreadable /sys/class/drm means no ranking evidence at all, so
+            # the device order is kept rather than a card being invented.
+            env = config.prepare_child_environment(
+                {"PATH": "/bin"}, drm_root=os.path.join(self.test_dir, "no-such-drm"))
             self.assertEqual(env["SDL_VIDEODRIVER"], "kmsdrm")
             self.assertEqual(env["SDL_VIDEO_KMSDRM_DEVICE"], "/dev/dri/card0")
         finally:
@@ -252,6 +255,93 @@ class TestDisplayModeSize(ConfigTestCase):
             "card0-DP-1": ("connected", ["3840x2160"]),
         })
         self.assertEqual(config.display_mode_size({}, drm_root=root), (3840, 2160))
+
+
+class TestDrmCardRanking(ConfigTestCase):
+    """T-DISPLAY-2 / D8: never pin SDL onto a card that drives no output.
+
+    An output-less card produces the worst kind of black screen — the emulator
+    runs correctly (audio, input, frame timing) and nothing is visible, so
+    there is no crash for the D-047 retry ladder to react to. It also explains
+    a shelf that renders and a game that does not: the pin is applied only to
+    the child, while the launcher keeps SDL's own working choice.
+    """
+
+    def make_drm(self, spec):
+        root = os.path.join(self.test_dir, "drm")
+        for name, status in spec.items():
+            connector_dir = os.path.join(root, name)
+            os.makedirs(connector_dir, exist_ok=True)
+            if status is not None:
+                with open(os.path.join(connector_dir, "status"), "w") as f:
+                    f.write(status + "\n")
+        return root
+
+    def with_cards(self, cards):
+        """Pretends /dev/dri contains exactly `cards`."""
+        real_glob = config.glob.glob
+        config.glob.glob = lambda pattern: (list(cards) if "card" in pattern
+                                            else real_glob(pattern))
+        self.addCleanup(setattr, config.glob, "glob", real_glob)
+
+    def test_a_card_with_no_connected_output_is_skipped(self):
+        self.with_cards(["/dev/dri/card0", "/dev/dri/card1"])
+        root = self.make_drm({"card0-HDMI-A-1": "disconnected",
+                              "card0-DP-1": "disconnected",
+                              "card1-HDMI-A-1": "connected"})
+        env = config.prepare_child_environment({"PATH": "/bin"}, drm_root=root)
+        self.assertEqual(env["SDL_VIDEODRIVER"], "kmsdrm")
+        self.assertEqual(env["SDL_VIDEO_KMSDRM_DEVICE"], "/dev/dri/card1")
+
+    def test_an_internal_panel_outranks_an_external_output(self):
+        self.with_cards(["/dev/dri/card0", "/dev/dri/card1"])
+        root = self.make_drm({"card0-HDMI-A-1": "connected",
+                              "card1-eDP-1": "connected"})
+        self.assertEqual(config.ranked_drm_cards(drm_root=root)[0], "/dev/dri/card1")
+
+    def test_without_sysfs_evidence_the_device_order_is_kept(self):
+        self.with_cards(["/dev/dri/card1", "/dev/dri/card0"])
+        missing = os.path.join(self.test_dir, "no-such-drm")
+        self.assertEqual(config.ranked_drm_cards(drm_root=missing),
+                         ["/dev/dri/card0", "/dev/dri/card1"])
+
+    def test_an_explicit_pin_is_never_overridden(self):
+        self.with_cards(["/dev/dri/card0", "/dev/dri/card1"])
+        root = self.make_drm({"card0-eDP-1": "connected",
+                              "card1-HDMI-A-1": "disconnected"})
+        env = config.prepare_child_environment(
+            {"PATH": "/bin", "SDL_VIDEO_KMSDRM_DEVICE": "/dev/dri/card1"},
+            drm_root=root)
+        self.assertEqual(env["SDL_VIDEO_KMSDRM_DEVICE"], "/dev/dri/card1")
+
+    def test_a_connector_for_a_missing_device_node_is_not_invented(self):
+        self.with_cards(["/dev/dri/card0"])
+        root = self.make_drm({"card0-HDMI-A-1": "disconnected",
+                              "card1-eDP-1": "connected"})
+        self.assertEqual(config.ranked_drm_cards(drm_root=root), ["/dev/dri/card0"])
+
+    def test_the_retry_ladder_prefers_a_card_that_can_present(self):
+        self.with_cards(["/dev/dri/card0", "/dev/dri/card1", "/dev/dri/card2"])
+        root = self.make_drm({"card0-HDMI-A-1": "disconnected",
+                              "card1-DP-1": "disconnected",
+                              "card2-HDMI-A-1": "connected"})
+        self.assertEqual(config.other_drm_devices("/dev/dri/card0", drm_root=root),
+                         ["/dev/dri/card2", "/dev/dri/card1"])
+
+    def test_output_less_cards_are_named_for_the_log(self):
+        self.with_cards(["/dev/dri/card0", "/dev/dri/card1"])
+        root = self.make_drm({"card0-HDMI-A-1": "disconnected",
+                              "card1-eDP-1": "connected"})
+        self.assertEqual(config.cards_without_output(drm_root=root), ["/dev/dri/card0"])
+        # No sysfs at all is not evidence that a card is blind.
+        self.assertEqual(config.cards_without_output(
+            drm_root=os.path.join(self.test_dir, "no-such-drm")), [])
+
+    def test_no_cards_at_all_leaves_the_choice_to_sdl(self):
+        self.with_cards([])
+        self.assertEqual(config.ranked_drm_cards(), [])
+        env = config.prepare_child_environment({"PATH": "/bin"})
+        self.assertNotIn("SDL_VIDEO_KMSDRM_DEVICE", env)
 
 
 if __name__ == "__main__":

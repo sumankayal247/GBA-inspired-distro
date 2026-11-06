@@ -40,10 +40,12 @@ from common import (
 )
 import config as settings_store
 from config import (
+    cards_without_output,
     display_mode_size,
     display_session,
     other_drm_devices,
     prepare_child_environment,
+    ranked_drm_cards,
 )
 from game_data import CheatStore, SaveStateStore, valid_game_id
 from gba_ingame import (
@@ -2008,6 +2010,15 @@ def main():
                 display_session(), env.get("SDL_VIDEODRIVER", "auto"),
                 is_windowed, display_scaling,
                 f"{screen[0]}x{screen[1]}" if screen else "unknown")
+    if display_session() == "console":
+        # A card with nothing wired to it emulates perfectly and shows nothing,
+        # so name the pin, the ranking behind it and every card that sysfs says
+        # drives no output (T-DISPLAY-2 / D8).
+        blind = cards_without_output()
+        logger.info("KMS/DRM pin: %s | ranked: %s%s",
+                    env.get("SDL_VIDEO_KMSDRM_DEVICE") or "(unset)",
+                    ", ".join(ranked_drm_cards()) or "no /dev/dri card found",
+                    f" | output-less: {', '.join(blind)}" if blind else "")
 
     # Stage 2 of the log: the subsystem verbosity actually in force. mGBA's own
     # mask is ours to set; SDL2/Mesa are configured by src/gba_session.sh, so
