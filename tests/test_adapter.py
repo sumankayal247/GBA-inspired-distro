@@ -55,7 +55,14 @@ class TestVideoRetry(unittest.TestCase):
         self.assertIsNone(retry_strategy("x11", 1, 30.0, False, {}))
 
     def test_windowed_runs_are_not_retried(self):
-        self.assertIsNone(retry_strategy("x11", 1, 0.2, True, {}))
+        # Windowed + software GL already set: nothing left to try.
+        self.assertIsNone(retry_strategy("x11", 1, 0.2, True,
+                                         {"LIBGL_ALWAYS_SOFTWARE": "1"}))
+
+    def test_windowed_failure_escalates_to_software(self):
+        # Windowed failure without software GL: offer software rendering.
+        self.assertEqual(retry_strategy("x11", 1, 0.2, True, {}),
+                         ("software", None))
 
     def test_headless_has_no_retry(self):
         self.assertIsNone(retry_strategy("headless", 1, 0.2, False, {}))
