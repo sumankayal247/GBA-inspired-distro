@@ -1501,26 +1501,24 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
     harmless while defaulting to the *wrong* fullscreen backend is what leaves
     the user staring at a black screen.
 
-    Bare X11 has no WM to service SDL2 FULLSCREEN_DESKTOP requests. When
-    the active screen size is known, use an ordinary screen-sized window
-    instead (the caller places it at 0,0). With no WM it has no decorations.
-    Desktop and KMS fullscreen remain SDL-managed. Unknown-size X11 retains
-    the fullscreen fallback rather than pretending a 4x window fills a screen.
+    Bare X11 uses SDL's fullscreen (`-f` flag) directly. With software rendering
+    (LIBGL_ALWAYS_SOFTWARE), fullscreen is just an X11 blit — no WM needed, no
+    DRI3 page-flipping. The original screen-sized window workaround
+    (fullscreen=0 with width/height) doesn't work because mGBA's SDL2 renderer
+    waits for WM events that never come in bare Matchbox.
 
     `log_level` is mgba-sdl's `-l` bitmask. With None (the default) the command
     line is untouched and mGBA logs only FATAL|ERROR|WARN; a diagnostic session
     passes 31 so the boot log also shows the ROM/BIOS load, save routing, audio
     buffer negotiation and frame timing.
     """
-    screen_window = (bare_x11 and not windowed and display_size is not None
-                     and display_size[0] > 0 and display_size[1] > 0)
     native_dir = runtime_dir or save_dir
     cmd = [
         mgba_bin,
         "-C", f"savegamePath={save_dir}",
         "-C", f"savestatePath={native_dir}",
         "-C", f"screenshotPath={native_dir}",
-        "-C", f"fullscreen={0 if windowed or screen_window else 1}",
+        "-C", f"fullscreen={0 if windowed else 1}",
         # mgba-sdl enables rewind recording by default: a full core snapshot
         # every emulated frame plus a 600-second buffer, serialized on the
         # emulation thread. The appliance exposes no rewind control, so this
@@ -1543,8 +1541,7 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
     if windowed:
         cmd.extend(["-3"])
     else:
-        if not screen_window:
-            cmd.append("-f")
+        cmd.append("-f")
         cmd.extend(["-C", "lockAspectRatio=1"])
         cmd.extend(["-C", f"lockIntegerScaling={1 if display_scaling == 'integer' else 0}"])
         if display_size and int(display_size[0]) > 0 and int(display_size[1]) > 0:
@@ -2020,11 +2017,15 @@ def main():
     screen = display_mode_size(env)
     bare_x11 = (env.get("GBA_BARE_X11") == "1"
                 and display_session() == "x11" and not is_windowed)
-    if bare_x11 and screen:
-        # No WM: SDL's undefined position is not guaranteed to be (0,0).
-        env["SDL_VIDEO_WINDOW_POS"] = "0,0"
-        logger.info("Bare X11: screen-sized window %sx%s at 0,0; SDL fullscreen disabled",
-                    *screen)
+    if bare_x11:
+        # Use SDL's fullscreen directly. With software rendering (LIBGL_ALWAYS_SOFTWARE),
+        # fullscreen is just an X11 blit — no WM needed, no DRI3 page-flipping.
+        # This avoids the "fullscreen=0 + screen-sized window" workaround which
+        # doesn't present frames in bare Matchbox.
+        if screen:
+            logger.info("Bare X11: SDL fullscreen with %sx%s display", *screen)
+        else:
+            logger.info("Bare X11: SDL fullscreen (display size unknown)")
 
     # Bare-X11 GL workaround: without a compositor, SDL2/Mesa's DRI3
     # direct-rendering page-flipping fails silently on AMD Radeon integrated
