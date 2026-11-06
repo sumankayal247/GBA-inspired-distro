@@ -759,3 +759,68 @@ what was missing was the *parser* (`jmtpfs -l` quotes its fields), the protocol 
 skipped entirely on the UI thread (`list_mounted_mtp_volumes()` reads the mount table only). A phone
 that is genuinely locked still produces no volume — now with a reason attached. Real phones and
 vendor stacks remain hardware-verification items.
+
+---
+
+## D-054 A silent failure gets a loud log, not a new code path
+
+**Status:** Accepted (extends D-047 and D-049)
+
+**Decision.** The appliance captures verbose evidence at every stage of an emulator session instead
+of adding more speculative fallbacks. `src/gba_session.sh` exports `SDL_LOG_PRIORITY=verbose` (plus
+the `_video`, `_audio` and `_render` categories), `LIBGL_DEBUG=verbose`, `MESA_DEBUG=1` and
+`GBA_DEBUG=1`, each as `${VAR:-default}` so a boot can raise or silence one. The adapter turns
+`GBA_DEBUG` into mGBA's own `-l 31` (`FATAL|ERROR|WARN|INFO|DEBUG`, from
+`include/mgba/core/log.h`; `GBA_MGBA_LOG_LEVEL` overrides and is clamped to `mLOG_ALL`), keeps
+`stderr=subprocess.STDOUT` so SDL2's and Mesa's output shares mGBA's pumped stream, and samples the
+display about 1.5 s after *every* spawn: `xrandr --current`, `xwininfo -root -tree`, then
+`xwininfo -id` for windows matching mGBA's title or SDL's WM_CLASS, reporting map state, size and
+position against the active mode. With no `DISPLAY` the same slot logs `/sys/class/drm` connector
+evidence for the pinned card.
+
+**Why.** The ladder in D-047 fixes a black screen only when the failure happens to be one of the
+guesses it retries, and D-049's screen-sized window is only correct if the window maps at all. Both
+were reasoned about for months with no way to *see* which stage failed: mgba-sdl logs
+`FATAL|ERROR|WARN` by default, so an emulator that quietly fails to present prints nothing, and the
+adapter had no evidence about the window it had just launched. Asking a user for a second terminal
+during a boot that owns the display is not a diagnostic strategy. Every stage now writes its own
+verdict into `/data/logs/latest.log`, which the recovery console and the shell's **View logs**
+overlay already read.
+
+**Trade-offs.** More log volume on every session, bounded three ways: the tree and xrandr output are
+truncated (`DIAG_MAX_TREE_LINES`), each tool call is time-bounded (`DIAG_TOOL_TIMEOUT`) on its own
+daemon thread so it can never delay a launch, and Rule ST5 rotation still caps the file at 2 MB with
+five archives. `xwininfo`/`xrandr` are optional and read-only; when absent the adapter names the
+packages, `gba-session` warns once at boot and `gba-selftest` reports a `diagnostics` warning rather
+than failing. A verbose mask could in principle cost frame time on very modest hardware, so
+`GBA_DEBUG=0` switches the capture off again, including a byte-identical argv, since
+`build_mgba_command` only adds `-l` when a level is passed; the lifecycle lines stay, because
+one line per spawn, signal and fsync is a session record rather than a capture.
+
+## D-055 The distro updates itself through its own installer, never around it
+
+**Status:** Accepted
+
+**Decision.** SETTINGS → System → *Check for updates* (`src/gba_updater.py`, `UpdateOverlay` in
+`src/gba_launcher.py`) is a three-step, network-read-only flow: a TCP probe to `github.com:443`,
+`git ls-remote` against `origin/main` compared with the commit stamped into
+`$GBA_INSTALL_DIR/VERSION` by `install.sh`, and — only after the user confirms a modal listing the
+new commits — a shallow clone into `<data>/update/work` plus `git reset --hard origin/<branch>` and
+an execution of *that checkout's* `scripts/install.sh --apply --repair` with `GBA_INSTALL_DIR` set.
+Every git/subprocess call runs with `GIT_TERMINAL_PROMPT=0` on a worker thread behind the modal;
+elevation is `sudo -n` when the shell is unprivileged, and a missing passwordless sudo surfaces the
+installer output instead of prompting. On success the launcher `os.execv`s itself.
+
+**Why.** The repository is public, so checking and downloading needs no credential of any kind —
+but *applying* touches `/opt`, `/usr/local/bin` and the boot entry, which is exactly what
+`install.sh` already does safely (it owns ownership, wrappers, self-test and the "never touch
+`/data` or `/games`" contract). Re-running the shipped installer from the new checkout keeps a
+button-press update byte-identical to a manual `sudo ./scripts/install.sh --apply --repair`, gives
+`--repair`'s recovery path for free, and means the updater can never drift from the install logic.
+Comparing against a `VERSION` stamp (written at install time, `commit unknown` tolerated) works on
+ISO installs that carry no `.git` directory at all.
+
+**Consequences.** No token, key or login ever exists on the appliance; the only write is the
+installer's own. The working clone is disposable and reset on every apply. If the network probe
+fails the modal says so in one line and nothing is cloned. Tests exercise check/apply against
+throwaway `file://` repositories and a stub updater drives every overlay phase headlessly.

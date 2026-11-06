@@ -82,6 +82,7 @@ The shell itself is deliberately small and single-purpose per module:
 | `src/gba_mtp.py` | small MTP API facade over the shared `gba_usb` implementation |
 | `src/game_data.py` | per-content-id cheats, nine save-state slots, favorites, game deletion |
 | `src/gba_ingame.py` | shortcut router, fast-forward cycle, overlay models, session state (no GUI dependency) |
+| `src/gba_updater.py` | anonymous GitHub self-update: reachability probe, commit compare, shallow clone, installer hand-off |
 | `src/gba_ingame_ui.py` | pygame/Theme overlay renderer used *inside the mGBA handler* |
 
 ### Process Lifecycle
@@ -326,6 +327,11 @@ is duplicated.
 - **Settings:** `DATA/config/settings.json` is the single store (scaling, theme, clock, view mode,
   volume, USB behaviour, launch confirmation). `keybindings.json` and `history.json` live beside it;
   a legacy `display.json` is migrated automatically on first run.
+- **Updates:** SETTINGS → System → *Check for updates* asks github.com (anonymous HTTPS, no login)
+  whether `origin/main` is ahead of the commit stamped in `/opt/gba-distro/VERSION`, shows the new
+  commits, and on confirm shallow-clones them and re-runs the shipped `scripts/install.sh --apply
+  --repair` from the clone. Saves, ROMs and settings live in `DATA/` and `GAMES/` and are never
+  touched; the launcher re-execs itself into the new version afterwards.
 
 ---
 
@@ -373,8 +379,10 @@ make screenshots   # regenerates the four README images
 | :--- | :--- |
 | Boots to a black screen | Wait for the 10 s GRUB menu, pick your primary OS, then check `/data/logs/latest.log`. |
 | Shell starts but no games | Copy ROMs into `/games/`, then **SETTINGS → Library → Rescan library**. |
-| Game starts to a black screen | The adapter now resolves the display session itself (a stale `DISPLAY` or a KMS/DRM driver inside a live desktop is the usual cause) and retries once in a window. Check `/data/logs/latest.log` for `Display session=...` and `[mgba]` lines. |
-| Game exits immediately | Check `/data/logs/latest.log` for `[handler]` lines; verify `mgba` is installed (`which mgba`). |
+| Game starts to a black screen | The adapter resolves the display session itself (a stale `DISPLAY` or a KMS/DRM driver inside a live desktop is the usual cause) and retries once in a window. `/data/logs/latest.log` now records the whole chain: `Display session=...`, the exact `Executing mGBA:` argv, `[mgba]`/SDL2/Mesa output, and an `[x11]` (or `[drm]`) verdict on whether the emulator's window actually mapped. |
+| Window is there but nothing shows | Read the `[x11] emulator window ...` line: `map-state=IsUnmapped` means SDL created it and something never mapped it, `lies entirely outside the active ... mode` means it is off-screen, `does not fill the display` means it is smaller than the screen. `NO emulator window in the X11 tree` means mGBA died first — the `[mgba]` lines above it say why. The window sample needs `sudo apt install x11-utils x11-server-utils`; without them the log says so and everything else still runs. |
+| Capturing a full diagnostic session | On by default: `gba-session` exports `SDL_LOG_PRIORITY=verbose`, `LIBGL_DEBUG=verbose`, `MESA_DEBUG=1` and `GBA_DEBUG=1`, and the adapter adds mGBA's `-l 31` log mask. Set `GBA_DEBUG=0` for the previous quiet behaviour, or `GBA_MGBA_LOG_LEVEL=127` for everything mGBA can print. `gba-selftest` reports what will and will not be captured. |
+| Game exits immediately | Check `/data/logs/latest.log` for `[handler]` lines, the `Stop sequence:` signal trail and `Teardown: exit status ...`; verify `mgba` is installed (`which mgba`). |
 | Pendrive not detected | The filesystem must be mounted (any desktop does that automatically). Open **SETTINGS → Library → Import from USB / MTP** and press `R` to rescan. |
 | Android phone not detected | Unlock it, choose **File Transfer / MTP** (not charging only), and press `R` in the import screen. Run `gba-selftest --mtp`: it names the failing link. Install `sudo apt install jmtpfs mtp-tools` when the tools are missing, `sudo modprobe fuse` when `/dev/fuse` is missing, and `fuse3` when no `fusermount` is found. GVfs `mtp://` mounts are reused automatically. |
 | Overlay does not open | The game keeps running on purpose: the native state/frame capture failed (usually `/dev/uinput` unavailable). `gba-selftest` reports input injection; overlay save/load then degrades but never freezes gameplay. |

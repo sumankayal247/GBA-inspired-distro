@@ -263,7 +263,7 @@ install_files() {
 
     local mod
     for mod in common.py library.py config.py theme.py gba_terminal.py gba_browser.py gba_usb.py \
-               gba_mtp.py game_data.py gba_ingame.py gba_ingame_ui.py; do
+               gba_mtp.py game_data.py gba_ingame.py gba_ingame_ui.py gba_updater.py; do
         [ -f "$REPO_DIR/src/$mod" ] || gb_die "missing source file: src/$mod"
         gb_run install -m 0644 "$REPO_DIR/src/$mod" "$INSTALL_DIR/src/$mod"
     done
@@ -281,7 +281,21 @@ install_files() {
         [ -f "$REPO_DIR/assets/fonts/$font" ] || continue
         gb_run install -m 0644 "$REPO_DIR/assets/fonts/$font" "$INSTALL_DIR/assets/fonts/$font"
     done
-    gb_ok "files copied (existing install upgraded in place)"
+    # Version stamp: the in-shell updater (SETTINGS -> Check for updates)
+    # compares this commit against origin/main before offering an update.
+    local src_sha="unknown"
+    if command -v git >/dev/null 2>&1; then
+        src_sha="$(git -C "$REPO_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+    fi
+    if { echo "GBA OS"
+         echo "commit $src_sha"
+         echo "installed $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+       } > "$INSTALL_DIR/VERSION" 2>/dev/null; then
+        gb_ok "files copied (existing install upgraded in place, commit $src_sha)"
+    else
+        gb_warn "Could not write $INSTALL_DIR/VERSION (non-fatal)."
+        gb_ok "files copied (existing install upgraded in place)"
+    fi
 }
 
 install_ownership() {

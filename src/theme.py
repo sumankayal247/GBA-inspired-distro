@@ -141,6 +141,7 @@ class Theme:
     # Type ramp in design units (multiplied by the UI scale at load time).
     TYPE = {
         "micro": 7,
+        "seal": 6,
         "small": 9,
         "body": 10,
         "body_bold": 10,
@@ -243,6 +244,19 @@ class Theme:
               key: str = "small", align: str = "left") -> pygame.Rect:
         return self.text(surface, value, pos, key, color, align)
 
+    def wordmark(self, surface, pos: Tuple[float, float] = (22, 6)
+                 ) -> Tuple[pygame.Rect, pygame.Rect]:
+        """The two-tone "GBA OS" wordmark, as (gba_rect, os_rect).
+
+        "OS" is placed from the *measured* width of "GBA" plus a small gap.
+        The original hard-coded x for the second word assumed a fixed width
+        for the first, so the "A" and the "O" overlapped in every real font.
+        """
+        first = self.text(surface, "GBA", pos, "header", self.colors.highlight)
+        second = self.text(surface, "OS", (first.right / self.scale + 2.5, pos[1]),
+                           "header", self.colors.accent)
+        return first, second
+
     def button(self, surface, rect: pygame.Rect, label: str, accent: Optional[Color] = None,
                filled: bool = True, text_color: Optional[Color] = None,
                key: str = "small") -> None:
@@ -276,12 +290,20 @@ class Theme:
         body_bottom = c.cart_body_dark if not dim else self.mix(c.cart_body_dark, c.panel, 0.55)
 
         # Drop shadow + shell with a vertical gradient for a plastic feel.
+        # The gradient must be painted *inside* the rounded silhouette: square
+        # gradient bands under a rounded 1px outline leave square plastic
+        # corners poking out of the curve, which reads as a broken radius.
         pygame.draw.rect(surface, c.shadow, (x + u(2), y + u(3), w, h), border_radius=u(6))
+        shell = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.rect(shell, (255, 255, 255, 255), shell.get_rect(), border_radius=u(6))
         steps = max(4, h // max(1, u(3)))
         for i in range(steps):
             t = i / float(steps - 1)
-            band = pygame.Rect(x, y + int(h * i / steps), w, int(h / steps) + 1)
-            pygame.draw.rect(surface, self.mix(body_top, body_bottom, t), band)
+            band = pygame.Rect(0, int(h * i / steps), w, int(h / steps) + 1)
+            # min(dest, src): keeps the gradient inside the silhouette and
+            # leaves the corners transparent.
+            shell.fill(self.mix(body_top, body_bottom, t), band, pygame.BLEND_RGBA_MIN)
+        surface.blit(shell, (x, y))
         pygame.draw.rect(surface, (0, 0, 0), (x, y, w, h), width=1, border_radius=u(6))
 
         # Notch + grip ribs along the top edge.
@@ -300,7 +322,7 @@ class Theme:
                          width=max(1, u(0.8)), border_radius=u(3))
 
         # Magenta banner with the platform name.
-        banner = pygame.Rect(label.x, label.y, label.width, u(12))
+        banner = pygame.Rect(label.x, label.y, label.width, u(11))
         pygame.draw.rect(surface, self.mix(c.accent_soft, c.primary_dark, 0.35), banner,
                          border_top_left_radius=u(3), border_top_right_radius=u(3))
         banner_font = self.font("micro")
@@ -310,10 +332,16 @@ class Theme:
             surf = banner_font.render(fmt.upper(), True, c.text)
         surface.blit(surf, (banner.x + u(3), banner.y + (banner.height - surf.get_height()) // 2))
 
-        # Title, wrapped inside the space left between banner and footer so the
-        # seal and the id chip can never sit on top of it.
-        footer = u(12) if h > u(52) else 0
-        title_area = label.height - banner.height - footer - u(5)
+        # Bottom row metrics come first: the seal ring must be big enough to
+        # *contain* its "GBA" lettering (a fixed ring smaller than the word
+        # made the text stick out of the circle), and the title area has to
+        # leave room for whatever size that turns out to be.
+        seal_font = self.font("seal")
+        seal_surf = seal_font.render("GBA", True, c.highlight)
+        seal_r = max(u(5.5), seal_surf.get_width() // 2 + u(1),
+                     seal_surf.get_height() // 2 + u(1))
+        footer = int(seal_r * 2) + u(2) if h > u(52) else 0
+        title_area = label.height - banner.height - footer - u(2)
         title_font = self.font("body_bold" if label.width > u(42) else "small")
         line_h = max(1, title_font.get_linesize())
         max_lines = max(1, title_area // line_h)
@@ -321,10 +349,10 @@ class Theme:
                       banner.bottom + u(2), label.width - u(6),
                       c.highlight, max_lines=max_lines)
 
+
         # Bottom row: id chip + seal.
         if h > u(52):
             id_font = self.font("micro")
-            seal_r = u(5.5)
             id_width = label.width - u(6) - int(seal_r * 2) - u(3)
             short = ident[:8]
             while short and id_font.size(short)[0] > id_width:
@@ -333,12 +361,12 @@ class Theme:
             surface.blit(id_surf, (label.x + u(3),
                                    label.bottom - u(9) - id_surf.get_height() // 2))
 
-            seal_center = (label.right - seal_r - u(3), label.bottom - u(6))
+            # Sat inside the sticker, not centred on its old fixed offset, so
+            # a ring that grew to fit the text can never cross the label edge.
+            seal_center = (label.right - seal_r - u(2), label.bottom - u(1.5) - seal_r)
             pygame.draw.circle(surface, c.highlight, seal_center, seal_r, width=max(1, u(0.9)))
-            seal_font = self.font("micro")
-            seal = seal_font.render("GBA", True, c.highlight)
-            surface.blit(seal, (seal_center[0] - seal.get_width() // 2,
-                                seal_center[1] - seal.get_height() // 2))
+            surface.blit(seal_surf, (seal_center[0] - seal_surf.get_width() // 2,
+                                     seal_center[1] - seal_surf.get_height() // 2))
 
         if badge:
             badge_font = self.font("micro")
@@ -353,14 +381,14 @@ class Theme:
                              width=max(2, u(1.6)), border_radius=u(6))
 
 
-def _blit_wrapped(surface, font, text: str, x: int, y: int, width: int,
-                  color: Color, max_lines: int = 2) -> int:
+def _wrap_lines(font, text: str, width: int, max_lines: int = 2) -> List[str]:
     """
-    Word-wraps `text` into at most `max_lines` lines.
+    Word-wraps `text` into at most `max_lines` display-ready lines.
 
     A word wider than the sticker is elided rather than allowed to bleed over
-    the plastic (long titles are common: "Pocket Rally Advance"). Returns the
-    next y.
+    the plastic (long titles are common: "Pocket Rally Advance"). When lines
+    are hidden only the *last* shown line carries the ".." suffix: dotting
+    every line made a truncated title read "Pocket.. / Rally..".
     """
     words = text.split()
     lines: List[str] = []
@@ -384,13 +412,24 @@ def _blit_wrapped(surface, font, text: str, x: int, y: int, width: int,
         else:
             hidden = True
 
-    line_h = font.get_linesize()
-    for index, line in enumerate(lines[:max_lines]):
-        elide = hidden or font.size(line)[0] > width
+    shown = lines[:max_lines]
+    out: List[str] = []
+    for index, line in enumerate(shown):
+        elide = (hidden and index == len(shown) - 1) or font.size(line)[0] > width
         if elide:
             suffix = ".."
             while line and font.size(line + suffix)[0] > width:
                 line = line[:-1]
             line = line.rstrip() + suffix if line else line
+        out.append(line)
+    return out
+
+
+def _blit_wrapped(surface, font, text: str, x: int, y: int, width: int,
+                  color: Color, max_lines: int = 2) -> int:
+    """Draws `_wrap_lines` output; returns the next y."""
+    lines = _wrap_lines(font, text, width, max_lines)
+    line_h = font.get_linesize()
+    for index, line in enumerate(lines):
         surface.blit(font.render(line, True, color), (x, y + index * line_h))
     return y + len(lines) * line_h

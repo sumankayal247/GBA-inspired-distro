@@ -128,14 +128,17 @@ class TestDisplayEnvironment(ConfigTestCase):
         env = config.prepare_child_environment({"DISPLAY": ":4041", "PATH": "/bin"})
         self.assertNotIn("DISPLAY", env)
 
-    def test_console_pins_the_first_drm_card(self):
+    def test_console_pins_the_first_card_without_sysfs_evidence(self):
         """Two GPUs must not leave SDL on a card with no outputs."""
         fake_cards = ["/dev/dri/card1", "/dev/dri/card0"]
         real_glob = config.glob.glob
         config.glob.glob = lambda pattern: (fake_cards if "card" in pattern
                                             else real_glob(pattern))
         try:
-            env = config.prepare_child_environment({"PATH": "/bin"})
+            # An unreadable /sys/class/drm means no ranking evidence at all, so
+            # the device order is kept rather than a card being invented.
+            env = config.prepare_child_environment(
+                {"PATH": "/bin"}, drm_root=os.path.join(self.test_dir, "no-such-drm"))
             self.assertEqual(env["SDL_VIDEODRIVER"], "kmsdrm")
             self.assertEqual(env["SDL_VIDEO_KMSDRM_DEVICE"], "/dev/dri/card0")
         finally:
@@ -192,6 +195,86 @@ class TestTheme(ConfigTestCase):
         for size in (40, 56, 72, 96):
             th.cartridge(surface, pygame.Rect(4, 4, size, int(size * 1.2)),
                          "Super Long Game Title Here", "GB", "deadbeef")
+
+
+class TestCartridgeVisuals(ConfigTestCase):
+    """Pixel-level regressions for the cartridge card and the wordmark.
+
+    These pin the three defects reported from real hardware: square plastic
+    corners poking out of the rounded shell, the "GBA" seal text bleeding out
+    of its circle, and the header wordmark's "A" sitting on top of the "O".
+    """
+
+    def _draw(self, scale):
+        th = theme_module.Theme("indigo", scale)
+        surface = pygame.Surface((th.px(120), th.px(120)))
+        sentinel = (1, 2, 3)
+        surface.fill(sentinel)
+        rect = pygame.Rect(th.px(10), th.px(10), th.px(72), th.px(88))
+        th.cartridge(surface, rect, "Pocket Rally Advance", "gba", ident="9f13ce44")
+        return th, surface, rect, sentinel
+
+    def test_shell_corners_follow_the_rounded_silhouette(self):
+        for scale in (1.0, 2.0, 3.0):
+            th, surface, rect, sentinel = self._draw(scale)
+            # Top corners and bottom-left sit on bare background; the
+            # bottom-right corner cut shows the (rounded) drop shadow.
+            for point in ((rect.x + 1, rect.y + 1), (rect.right - 2, rect.y + 1),
+                          (rect.x + 1, rect.bottom - 2)):
+                self.assertEqual(surface.get_at(point)[:3], sentinel,
+                                 f"scale {scale}: square plastic at {point}")
+            self.assertEqual(surface.get_at((rect.right - 2, rect.bottom - 2))[:3],
+                             tuple(th.colors.shadow),
+                             f"scale {scale}: square plastic over the shadow")
+            # ...while the shell itself is painted between the corners.
+            self.assertNotEqual(surface.get_at((rect.centerx, rect.y + 2))[:3], sentinel)
+            self.assertNotEqual(surface.get_at((rect.centerx, rect.bottom - 3))[:3], sentinel)
+
+    def test_seal_ring_contains_its_wordmark(self):
+        for scale in (1.0, 2.0, 3.0):
+            th, surface, rect, _sentinel = self._draw(scale)
+            highlight = tuple(th.colors.highlight)
+            xs, ys = [], []
+            for yy in range(rect.bottom - th.px(22), rect.bottom):
+                for xx in range(rect.right - th.px(34), rect.right):
+                    if surface.get_at((xx, yy))[:3] == highlight:
+                        xs.append(xx)
+                        ys.append(yy)
+            self.assertTrue(xs, f"scale {scale}: no seal pixels found")
+            width = max(xs) - min(xs) + 1
+            height = max(ys) - min(ys) + 1
+            # A circle containing its text is (near) square in bounding box;
+            # text wider than the ring makes the box wider than tall.
+            self.assertLessEqual(abs(width - height), 3,
+                                 f"scale {scale}: seal text escapes the ring "
+                                 f"({width}x{height})")
+            # ...and the whole seal stays on the sticker with a margin.
+            self.assertLess(max(xs), rect.right - th.px(5))
+            self.assertLess(max(ys), rect.bottom - th.px(5))
+
+    def test_wordmark_words_never_overlap(self):
+        for scale in (1.0, 1.5, 2.0, 3.0):
+            th = theme_module.Theme("indigo", scale)
+            surface = pygame.Surface((320, 40))
+            first, second = th.wordmark(surface, (22, 6))
+            self.assertFalse(first.colliderect(second), f"scale {scale}")
+            self.assertGreater(second.left, first.right, f"scale {scale}")
+            self.assertLess(second.left - first.right, th.px(4), f"scale {scale}")
+
+    def test_wrap_elides_only_the_truncated_line(self):
+        th = theme_module.Theme("indigo", 2.0)
+        font = th.font("body_bold")
+        width = th.px(54)
+        self.assertEqual(
+            theme_module._wrap_lines(font, "Pocket Rally Advance", width, 3),
+            ["Pocket", "Rally", "Advance"])
+        two = theme_module._wrap_lines(font, "Pocket Rally Advance", width, 2)
+        self.assertEqual(two[0], "Pocket")
+        self.assertTrue(two[-1].endswith(".."))
+        single = theme_module._wrap_lines(font, "Superlongwordthatneverfits", width, 2)
+        self.assertEqual(len(single), 1)
+        self.assertTrue(single[0].endswith(".."))
+        self.assertLessEqual(font.size(single[0])[0], width)
 
 
 class TestDisplayModeSize(ConfigTestCase):
@@ -252,6 +335,93 @@ class TestDisplayModeSize(ConfigTestCase):
             "card0-DP-1": ("connected", ["3840x2160"]),
         })
         self.assertEqual(config.display_mode_size({}, drm_root=root), (3840, 2160))
+
+
+class TestDrmCardRanking(ConfigTestCase):
+    """T-DISPLAY-2 / D8: never pin SDL onto a card that drives no output.
+
+    An output-less card produces the worst kind of black screen — the emulator
+    runs correctly (audio, input, frame timing) and nothing is visible, so
+    there is no crash for the D-047 retry ladder to react to. It also explains
+    a shelf that renders and a game that does not: the pin is applied only to
+    the child, while the launcher keeps SDL's own working choice.
+    """
+
+    def make_drm(self, spec):
+        root = os.path.join(self.test_dir, "drm")
+        for name, status in spec.items():
+            connector_dir = os.path.join(root, name)
+            os.makedirs(connector_dir, exist_ok=True)
+            if status is not None:
+                with open(os.path.join(connector_dir, "status"), "w") as f:
+                    f.write(status + "\n")
+        return root
+
+    def with_cards(self, cards):
+        """Pretends /dev/dri contains exactly `cards`."""
+        real_glob = config.glob.glob
+        config.glob.glob = lambda pattern: (list(cards) if "card" in pattern
+                                            else real_glob(pattern))
+        self.addCleanup(setattr, config.glob, "glob", real_glob)
+
+    def test_a_card_with_no_connected_output_is_skipped(self):
+        self.with_cards(["/dev/dri/card0", "/dev/dri/card1"])
+        root = self.make_drm({"card0-HDMI-A-1": "disconnected",
+                              "card0-DP-1": "disconnected",
+                              "card1-HDMI-A-1": "connected"})
+        env = config.prepare_child_environment({"PATH": "/bin"}, drm_root=root)
+        self.assertEqual(env["SDL_VIDEODRIVER"], "kmsdrm")
+        self.assertEqual(env["SDL_VIDEO_KMSDRM_DEVICE"], "/dev/dri/card1")
+
+    def test_an_internal_panel_outranks_an_external_output(self):
+        self.with_cards(["/dev/dri/card0", "/dev/dri/card1"])
+        root = self.make_drm({"card0-HDMI-A-1": "connected",
+                              "card1-eDP-1": "connected"})
+        self.assertEqual(config.ranked_drm_cards(drm_root=root)[0], "/dev/dri/card1")
+
+    def test_without_sysfs_evidence_the_device_order_is_kept(self):
+        self.with_cards(["/dev/dri/card1", "/dev/dri/card0"])
+        missing = os.path.join(self.test_dir, "no-such-drm")
+        self.assertEqual(config.ranked_drm_cards(drm_root=missing),
+                         ["/dev/dri/card0", "/dev/dri/card1"])
+
+    def test_an_explicit_pin_is_never_overridden(self):
+        self.with_cards(["/dev/dri/card0", "/dev/dri/card1"])
+        root = self.make_drm({"card0-eDP-1": "connected",
+                              "card1-HDMI-A-1": "disconnected"})
+        env = config.prepare_child_environment(
+            {"PATH": "/bin", "SDL_VIDEO_KMSDRM_DEVICE": "/dev/dri/card1"},
+            drm_root=root)
+        self.assertEqual(env["SDL_VIDEO_KMSDRM_DEVICE"], "/dev/dri/card1")
+
+    def test_a_connector_for_a_missing_device_node_is_not_invented(self):
+        self.with_cards(["/dev/dri/card0"])
+        root = self.make_drm({"card0-HDMI-A-1": "disconnected",
+                              "card1-eDP-1": "connected"})
+        self.assertEqual(config.ranked_drm_cards(drm_root=root), ["/dev/dri/card0"])
+
+    def test_the_retry_ladder_prefers_a_card_that_can_present(self):
+        self.with_cards(["/dev/dri/card0", "/dev/dri/card1", "/dev/dri/card2"])
+        root = self.make_drm({"card0-HDMI-A-1": "disconnected",
+                              "card1-DP-1": "disconnected",
+                              "card2-HDMI-A-1": "connected"})
+        self.assertEqual(config.other_drm_devices("/dev/dri/card0", drm_root=root),
+                         ["/dev/dri/card2", "/dev/dri/card1"])
+
+    def test_output_less_cards_are_named_for_the_log(self):
+        self.with_cards(["/dev/dri/card0", "/dev/dri/card1"])
+        root = self.make_drm({"card0-HDMI-A-1": "disconnected",
+                              "card1-eDP-1": "connected"})
+        self.assertEqual(config.cards_without_output(drm_root=root), ["/dev/dri/card0"])
+        # No sysfs at all is not evidence that a card is blind.
+        self.assertEqual(config.cards_without_output(
+            drm_root=os.path.join(self.test_dir, "no-such-drm")), [])
+
+    def test_no_cards_at_all_leaves_the_choice_to_sdl(self):
+        self.with_cards([])
+        self.assertEqual(config.ranked_drm_cards(), [])
+        env = config.prepare_child_environment({"PATH": "/bin"})
+        self.assertNotIn("SDL_VIDEO_KMSDRM_DEVICE", env)
 
 
 if __name__ == "__main__":

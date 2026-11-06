@@ -25,6 +25,7 @@ import select
 import glob
 import json
 import queue
+import re
 import threading
 import time
 from typing import Optional
@@ -35,14 +36,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common import (
     setup_logging, load_keybindings, load_display_config, DEFAULT_KEYBINDINGS,
-    compute_content_id,
+    compute_content_id, extract_gba_title,
 )
 import config as settings_store
 from config import (
+    cards_without_output,
     display_mode_size,
     display_session,
     other_drm_devices,
     prepare_child_environment,
+    ranked_drm_cards,
 )
 from game_data import CheatStore, SaveStateStore, valid_game_id
 from gba_ingame import (
@@ -234,8 +237,14 @@ def ensure_mgba_config(config_dir: str = None) -> None:
         logger.warning("Could not initialize mGBA config: %s", e)
 
 
-def sync_directory(dir_path: str) -> None:
-    """Performs fsync on save files and their containing directory (Rule SV2)."""
+def sync_directory(dir_path: str) -> int:
+    """Performs fsync on save files and their containing directory (Rule SV2).
+
+    Returns how many files were fsynced, and says so in the log: the closing
+    stage of a session must show that save data reached the disk rather than
+    only that the emulator exited.
+    """
+    synced = 0
     try:
         dir_fd = os.open(dir_path, os.O_RDONLY)
         try:
@@ -246,13 +255,17 @@ def sync_directory(dir_path: str) -> None:
                         fd = os.open(f_path, os.O_RDONLY)
                         os.fsync(fd)
                         os.close(fd)
-                    except Exception:
-                        pass
+                        synced += 1
+                    except Exception as exc:
+                        logger.warning("Could not fsync %s: %s", f_path, exc)
             os.fsync(dir_fd)
+            logger.info("Save fsync verified: %d file(s) plus the directory %s",
+                        synced, dir_path)
         finally:
             os.close(dir_fd)
     except Exception as e:
         logger.warning("Directory fsync warning: %s", e)
+    return synced
 
 
 def backup_saves(save_dir: str) -> int:
@@ -369,7 +382,9 @@ class InputMonitor(threading.Thread):
             return False
 
     def _trigger(self, reason: str) -> None:
-        logger.info("%s - sending SIGTERM to emulator", reason)
+        pid = getattr(self.proc, "pid", -1)
+        logger.info("Input: %s; ending the session (SIGTERM to emulator pid %s)",
+                    reason, pid)
         if self.on_exit_requested is not None:
             try:
                 self.on_exit_requested()
@@ -377,8 +392,9 @@ class InputMonitor(threading.Thread):
                 pass
         try:
             self.proc.terminate()
-        except Exception:
-            pass
+            logger.info("Input: SIGTERM delivered to emulator pid %s", pid)
+        except Exception as exc:
+            logger.warning("Input: SIGTERM to emulator pid %s failed: %s", pid, exc)
 
     # -- combo helpers -------------------------------------------------
     def _press(self, router, button) -> None:
@@ -407,6 +423,7 @@ class InputMonitor(threading.Thread):
 
     def run(self):
         fds = {}
+        watched = []
         try:
             for dev in sorted(os.listdir("/dev/input")) if os.path.isdir("/dev/input") else []:
                 if not (dev.startswith("event") or dev.startswith("js")):
@@ -429,11 +446,24 @@ class InputMonitor(threading.Thread):
                         if VIRTUAL_INPUT_NAME in name:
                             os.close(fd)
                             continue
+                        watched.append(f"{dev} ({name or 'unnamed'})")
+                    else:
+                        watched.append(f"{dev} (joystick)")
                     fds[fd] = dev.startswith("js")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # A permission error here is the usual reason an exit combo
+                    # "does nothing", so it is recorded rather than swallowed.
+                    logger.debug("Input: cannot open /dev/input/%s: %s", dev, exc)
             if not fds:
+                logger.warning(
+                    "Input: no readable /dev/input device; ESC and every in-game "
+                    "combo are undetectable in this session (escape keys=%s)",
+                    sorted(self.escape_keys or ()))
                 return
+            logger.info("Input: watching %d device(s): %s | escape-keys=%s | "
+                        "combos=%s", len(fds), ", ".join(watched) or "(none named)",
+                        sorted(self.escape_keys or ()),
+                        sorted(self.shortcuts) if self.shortcuts else "(none)")
 
             router = ComboRouter(self.shortcuts) if self.shortcuts else None
             held = set()                 # legacy gamepad exit combo
@@ -481,7 +511,7 @@ class InputMonitor(threading.Thread):
                                 combo = ((held & GAMEPAD_SELECT_BUTTONS) and
                                          (held & GAMEPAD_START_BUTTONS))
                                 if number in GAMEPAD_GUIDE_BUTTONS or combo:
-                                    self._trigger("Gamepad exit combo")
+                                    self._trigger(f"Gamepad exit combo (button {number}, held={sorted(held)})")
                                     return
                                 self._press(router, button)
                             else:
@@ -494,7 +524,7 @@ class InputMonitor(threading.Thread):
                             _s, _us, ev_t, code, value = struct.unpack("qqHHi", raw)
                             if ev_t == EV_KEY:
                                 if value == 1 and code in self.escape_keys:
-                                    self._trigger("Exit key detected")
+                                    self._trigger(f"Exit key detected (evdev code {code})")
                                     return
                                 button = self._evdev_map.get(code)
                                 if button is None:
@@ -1003,6 +1033,447 @@ class MgbaNativeController(InGameBackend):
         return self.capture_runtime_state("speed_state")
 
 
+# --- verbose diagnostics ----------------------------------------------------
+# Everything in this section exists to answer one question from the boot log
+# alone: did the emulator open a window that actually reached the screen?
+#
+# mgba-sdl's default log mask is FATAL|ERROR|WARN, so an emulator that quietly
+# fails to present prints nothing at all, and SDL2/Mesa only describe what they
+# did at `verbose`. src/gba_session.sh exports SDL_LOG_PRIORITY=verbose,
+# LIBGL_DEBUG=verbose and MESA_DEBUG=1 for the subsystem side; GBA_DEBUG
+# controls this side. GBA_DEBUG=0 restores the quiet, pre-diagnostics
+# behaviour, which is the escape hatch if a capture ever proves too chatty.
+
+# mgba-sdl `-l`/`--log-level` bitmask (include/mgba/core/log.h):
+#   FATAL 0x01, ERROR 0x02, WARN 0x04, INFO 0x08, DEBUG 0x10, STUB 0x20,
+#   GAME_ERROR 0x40; mLOG_ALL is 0x7F. 31 = FATAL|ERROR|WARN|INFO|DEBUG, which
+# adds the ROM/BIOS load, save routing, audio buffer negotiation and frame
+# timing without mGBA's per-call "unimplemented" stub spam.
+MGBA_LOG_MASK_DEFAULT = 31
+MGBA_LOG_MASK_ALL = 0x7F
+_LOG_MASK_BITS = ((0x01, "FATAL"), (0x02, "ERROR"), (0x04, "WARN"),
+                  (0x08, "INFO"), (0x10, "DEBUG"), (0x20, "STUB"),
+                  (0x40, "GAME_ERROR"))
+
+# `xwininfo -root -tree` under a compositor can list hundreds of windows, and
+# the boot log is size-capped (Rule ST5), so the evidence is truncated rather
+# than free. Map state costs one extra `xwininfo -id` per window, so it is only
+# ever queried for windows that look like the emulator.
+DIAG_MAX_TREE_LINES = 120
+DIAG_WINDOW_DETAIL_LIMIT = 8
+DIAG_TOOL_TIMEOUT = 4.0
+# mGBA's SDL2 window is titled with the project name ("mGBA") and carries SDL's
+# WM_CLASS ("SDL_app"), so either identifies it even if a build renames one.
+DIAG_WINDOW_HINTS = ("mgba", "sdl_app")
+# SDL creates the window, then maps and resizes it; sampling immediately after
+# Popen would report a healthy session as "no window".
+DIAG_SETTLE_SECONDS = 1.5
+# A window manager's frame offsets make a screen-sized window read a few pixels
+# off. Only larger disagreements are worth calling "off-screen".
+DIAG_EDGE_TOLERANCE = 8
+
+_XWININFO_TREE_LINE = re.compile(
+    r"^\s*(0x[0-9a-fA-F]+)\s+"
+    r"(?:\"(?P<name>[^\"]*)\":\s*\(\"(?P<instance>[^\"]*)\"\s*\"(?P<wmclass>[^\"]*)\"\)"
+    r"|\(has no name\):\s*\(\))"
+    r"\s*(?P<geometry>\d+x\d+[+-]\d+[+-]\d+)"
+)
+_MODE_SIZE = re.compile(r"^\s*(\d{2,5})x(\d{2,5})\b")
+
+
+def diagnostics_enabled() -> bool:
+    """True unless the operator silenced diagnostics with GBA_DEBUG=0."""
+    value = os.environ.get("GBA_DEBUG", "1").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
+def describe_log_mask(mask: int) -> str:
+    """31 -> 'FATAL|ERROR|WARN|INFO|DEBUG', for the log rather than for mGBA."""
+    names = [name for bit, name in _LOG_MASK_BITS if int(mask) & bit]
+    return "|".join(names) if names else "(silent)"
+
+
+def mgba_log_level() -> Optional[int]:
+    """The `-l` mask for this session, or None to leave mGBA's default.
+
+    GBA_MGBA_LOG_LEVEL raises the mask for a deeper capture (127 is mLOG_ALL:
+    it adds STUB and GAME_ERROR). An unusable value is reported and replaced
+    rather than passed on, because getopt_long would reject the whole command
+    line and turn a logging typo into a game that does not start.
+    """
+    if not diagnostics_enabled():
+        return None
+    raw = (os.environ.get("GBA_MGBA_LOG_LEVEL") or "").strip()
+    mask = MGBA_LOG_MASK_DEFAULT
+    if raw:
+        try:
+            mask = int(raw, 0)
+        except ValueError:
+            logger.warning("Ignoring GBA_MGBA_LOG_LEVEL=%r (not a number); using %d",
+                           raw, MGBA_LOG_MASK_DEFAULT)
+    return max(0, min(int(mask), MGBA_LOG_MASK_ALL))
+
+
+def _read_sysfs(path: str) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _tool(name: str, package: str) -> Optional[str]:
+    """Absolute path of a read-only diagnostic tool, or None with a hint."""
+    found = shutil.which(name)
+    if found:
+        return found
+    logger.info("[diag] %s is not installed (package: %s); that evidence is unavailable",
+                name, package)
+    return None
+
+
+def _capture_output(cmd: list, env: Optional[dict] = None) -> Optional[str]:
+    """Runs a read-only tool and returns its output; never raises.
+
+    Returns None when the tool could not be run *or* exited non-zero, because
+    "xwininfo failed" and "there is no emulator window" are opposite diagnoses
+    and must not be reported as the same thing.
+    """
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=DIAG_TOOL_TIMEOUT, check=False, env=env)
+    except Exception as exc:
+        logger.info("[diag] %s did not answer: %s", os.path.basename(cmd[0]), exc)
+        return None
+    out = proc.stdout.decode("utf-8", "ignore")
+    if proc.returncode != 0:
+        reason = next((line.strip() for line in out.splitlines() if line.strip()), "")
+        logger.info("[diag] %s exited with status %d%s", os.path.basename(cmd[0]),
+                    proc.returncode, f": {reason}" if reason else "")
+        return None
+    return out
+
+
+def _parse_mode_size(text: str) -> Optional[tuple]:
+    """'1920x1080  60.00*+' -> (1920, 1080)."""
+    match = _MODE_SIZE.match(text or "")
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def _matches_emulator(window: dict) -> bool:
+    fields = (window.get("name", ""), window.get("instance", ""),
+              window.get("wmclass", ""))
+    return any(hint in field.lower() for field in fields for hint in DIAG_WINDOW_HINTS)
+
+
+def _log_xrandr(env: dict) -> Optional[tuple]:
+    """Logs `xrandr --current`; returns the active ('*') mode as (w, h)."""
+    xrandr = _tool("xrandr", "x11-server-utils")
+    if not xrandr:
+        return None
+    out = _capture_output([xrandr, "--current"], env)
+    if not out:
+        logger.info("[x11] xrandr --current returned nothing; is DISPLAY=%s alive?",
+                    env.get("DISPLAY"))
+        return None
+    active = None
+    logged = 0
+    for line in out.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Output heads are unindented; their mode lines are indented and the
+        # active one carries '*'. Together they are the resolution and refresh
+        # rate mGBA is being asked to drive.
+        if not line.startswith((" ", "\t")) and (
+                " connected" in line or " disconnected" in line):
+            logger.info("[x11] output: %s", stripped)
+            logged += 1
+        elif "*" in stripped:
+            logger.info("[x11] active mode: %s", stripped)
+            logged += 1
+            if active is None:
+                active = _parse_mode_size(stripped)
+        if logged >= DIAG_MAX_TREE_LINES:
+            logger.info("[x11] xrandr output truncated at %d lines", logged)
+            break
+    if active is None:
+        logger.info("[x11] xrandr reports no active mode")
+    return active
+
+
+def _parse_window_tree(env: dict) -> Optional[list]:
+    """Parses `xwininfo -root -tree` into window dicts (id, name, geometry)."""
+    xwininfo = _tool("xwininfo", "x11-utils")
+    if not xwininfo:
+        return None
+    out = _capture_output([xwininfo, "-root", "-tree"], env)
+    if out is None:
+        return None
+    windows = []
+    for line in out.splitlines():
+        match = _XWININFO_TREE_LINE.match(line)
+        if not match:
+            continue
+        windows.append({
+            "id": match.group(1),
+            "name": match.group("name") or "",
+            "instance": match.group("instance") or "",
+            "wmclass": match.group("wmclass") or "",
+            "geometry": match.group("geometry") or "",
+        })
+    if not windows and out.strip():
+        logger.info("[x11] xwininfo -root -tree returned %d unparseable line(s)",
+                    len(out.splitlines()))
+    return windows
+
+
+def _window_detail(window_id: str, env: dict) -> dict:
+    """`xwininfo -id` for one window: Map State and absolute geometry.
+
+    Keys are lower-cased because xwininfo's own spelling differs between
+    fields ("Map State" but "Override redirection state") and across versions;
+    callers must not have to guess the capitalisation.
+    """
+    xwininfo = _tool("xwininfo", "x11-utils")
+    if not xwininfo:
+        return {}
+    out = _capture_output([xwininfo, "-id", window_id], env)
+    detail = {}
+    for line in (out or "").splitlines():
+        key, sep, value = line.strip().partition(":")
+        if sep and key:
+            detail[key.lower()] = value.strip()
+    return detail
+
+
+def _detail_value(detail: dict, *names: str) -> Optional[str]:
+    """The first present of `names` in an `xwininfo -id` field map.
+
+    xwininfo is not consistent with itself, between fields ("Map State" but
+    "Override redirection state") or between builds, so lookups accept the
+    variants rather than reporting "?" for evidence that is on the screen.
+    """
+    for name in names:
+        value = detail.get(name.lower())
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _log_drm_connectors(env: dict, drm_root: str = "/sys/class/drm") -> None:
+    """Connector evidence for KMS/DRM, where there is no X11 window tree.
+
+    A card with no connected output is the console equivalent of an unmapped
+    window, and it is exactly what `retry_strategy` tries to work around by
+    moving to another /dev/dri/cardN.
+    """
+    pinned = os.path.basename(env.get("SDL_VIDEO_KMSDRM_DEVICE", "") or "")
+    try:
+        names = sorted(os.listdir(drm_root))
+    except OSError as exc:
+        logger.info("[drm] %s is unreadable (%s); no connector evidence", drm_root, exc)
+        return
+    connected = 0
+    for name in names:
+        card, _, connector = name.partition("-")
+        if not connector or (pinned and card != pinned):
+            continue
+        base = os.path.join(drm_root, name)
+        if (_read_sysfs(os.path.join(base, "status")) or "") != "connected":
+            logger.info("[drm] %s: not connected", name)
+            continue
+        connected += 1
+        modes = (_read_sysfs(os.path.join(base, "modes")) or "").splitlines()
+        preferred = modes[0].strip() if modes else "none"
+        logger.info("[drm] %s: connected, enabled=%s dpms=%s preferred=%s (%d mode(s))",
+                    name, _read_sysfs(os.path.join(base, "enabled")) or "?",
+                    _read_sysfs(os.path.join(base, "dpms")) or "?",
+                    preferred, len(modes))
+    logger.info("[drm] SDL_VIDEODRIVER=%s device=%s connected-connector(s)=%d",
+                env.get("SDL_VIDEODRIVER", "auto"),
+                env.get("SDL_VIDEO_KMSDRM_DEVICE") or "(unpinned)", connected)
+    if not connected:
+        logger.warning("[drm] no connected connector on %s: this card drives no "
+                       "output, which presents as a black screen",
+                       pinned or drm_root)
+
+
+def log_display_diagnostics(env: Optional[dict] = None,
+                            settle: float = DIAG_SETTLE_SECONDS,
+                            alive_check=None) -> None:
+    """Records whether the emulator's window mapped, and where it landed.
+
+    A black screen has two very different causes, and only the second one is
+    visible to the adapter: mGBA never created a window, or it created one that
+    is unmapped, off-screen, or smaller than the screen. Sampling the X11 tree
+    (or the DRM connectors when there is no X) once, shortly after the child
+    starts, turns that into a line in the log instead of a guess.
+
+    Read-only, time-bounded and never fatal: a missing `xwininfo` or a dead
+    display must not be able to stop a game from starting.
+    """
+    if not diagnostics_enabled():
+        return
+    env = dict(os.environ if env is None else env)
+    if settle > 0:
+        time.sleep(settle)
+
+    child_alive = "unknown"
+    if alive_check is not None:
+        try:
+            child_alive = "yes" if alive_check() else "no"
+        except Exception:
+            child_alive = "unknown"
+    logger.info("[diag] sampling the display: child-alive=%s DISPLAY=%s "
+                "SDL_VIDEODRIVER=%s SDL_VIDEO_WINDOW_POS=%s",
+                child_alive, env.get("DISPLAY") or "none",
+                env.get("SDL_VIDEODRIVER", "auto"),
+                env.get("SDL_VIDEO_WINDOW_POS", "(unset)"))
+
+    if not env.get("DISPLAY"):
+        _log_drm_connectors(env)
+        return
+
+    active = _log_xrandr(env)
+    windows = _parse_window_tree(env)
+    if windows is None:
+        # Say so rather than staying quiet: a missing window tree is not the
+        # same evidence as an empty one, and the gap must be visible.
+        logger.info("[x11] window tree unavailable, so whether the emulator "
+                    "window mapped is unconfirmed (reason logged above)")
+        return
+
+    matched = [w for w in windows if _matches_emulator(w)]
+    others = [w for w in windows if not _matches_emulator(w)]
+    logger.info("[x11] window tree: %d window(s), %d look like the emulator",
+                len(windows), len(matched))
+
+    # Log the raw tree lines (resolution + position for every window), matched
+    # windows first so a truncated capture keeps the useful part.
+    budget = DIAG_MAX_TREE_LINES
+    for window in matched[:budget]:
+        logger.info("[x11] tree (match): %s \"%s\" class=%s/%s geometry=%s",
+                    window["id"], window["name"], window["instance"],
+                    window["wmclass"], window["geometry"])
+    for window in others[:max(0, budget - len(matched[:budget]))]:
+        logger.info("[x11] tree: %s \"%s\" class=%s/%s geometry=%s",
+                    window["id"], window["name"], window["instance"],
+                    window["wmclass"], window["geometry"])
+    if len(windows) > budget:
+        logger.info("[x11] tree truncated at %d of %d window(s)", budget, len(windows))
+
+    if not matched:
+        logger.warning("[x11] NO emulator window in the X11 tree: mGBA never "
+                       "created one, or died before mapping it. The [mgba] lines "
+                       "above carry the SDL/Mesa reason.")
+        return
+
+    for window in matched[:DIAG_WINDOW_DETAIL_LIMIT]:
+        detail = _window_detail(window["id"], env)
+        state = _detail_value(detail, "map state") or "unknown"
+        width = _detail_value(detail, "width")
+        height = _detail_value(detail, "height")
+        pos_x = _detail_value(detail, "absolute upper-left x", "absolute upper left x")
+        pos_y = _detail_value(detail, "absolute upper-left y", "absolute upper left y")
+        override = _detail_value(detail, "override redirection state",
+                                 "override redirect state")
+        logger.info("[x11] emulator window %s \"%s\": map-state=%s size=%sx%s "
+                    "position=%s,%s override-redirect=%s",
+                    window["id"], window["name"], state, width or "?", height or "?",
+                    pos_x or "?", pos_y or "?", override or "?")
+        if state != "IsViewable":
+            logger.warning("[x11] window %s is %s: SDL created it but it is not "
+                           "on screen (never mapped, or covered by another surface)",
+                           window["id"], state)
+        try:
+            size = (int(width), int(height))
+            origin = (int(pos_x), int(pos_y))
+        except (TypeError, ValueError):
+            continue
+        if not active:
+            continue
+        screen_w, screen_h = active
+        win_w, win_h = size
+        win_x, win_y = origin
+        if (win_x >= screen_w or win_y >= screen_h
+                or win_x + win_w <= 0 or win_y + win_h <= 0):
+            logger.warning("[x11] window %s at %dx%d+%d+%d lies entirely outside "
+                           "the active %dx%d mode: it is off-screen",
+                           window["id"], win_w, win_h, win_x, win_y, screen_w, screen_h)
+        elif (win_x < -DIAG_EDGE_TOLERANCE or win_y < -DIAG_EDGE_TOLERANCE
+              or win_x + win_w > screen_w + DIAG_EDGE_TOLERANCE
+              or win_y + win_h > screen_h + DIAG_EDGE_TOLERANCE):
+            logger.info("[x11] window %s at %dx%d+%d+%d overflows the %dx%d mode "
+                        "(clipped by the screen edge)",
+                        window["id"], win_w, win_h, win_x, win_y, screen_w, screen_h)
+        elif (win_w, win_h) != (screen_w, screen_h):
+            logger.info("[x11] window %s is %dx%d on a %dx%d screen: it does not "
+                        "fill the display", window["id"], win_w, win_h,
+                        screen_w, screen_h)
+        else:
+            logger.info("[x11] window %s fills the active %dx%d mode",
+                        window["id"], screen_w, screen_h)
+    if len(matched) > DIAG_WINDOW_DETAIL_LIMIT:
+        logger.info("[x11] %d further emulator-looking window(s) not detailed",
+                    len(matched) - DIAG_WINDOW_DETAIL_LIMIT)
+
+
+def log_load_diagnostics(content_path: str, save_dir: str, config_dir: Optional[str] = None) -> None:
+    """Records the 'Load' stage: ROM header, save routing and BIOS resolution.
+
+    mGBA derives the save filename from the ROM's basename inside
+    `savegamePath`, so the expected path is checked here rather than after a
+    session ends and a missing save looks like data loss.
+    """
+    if not diagnostics_enabled():
+        return
+    try:
+        size = os.path.getsize(content_path)
+    except OSError as exc:
+        logger.warning("[load] cannot stat %s: %s", content_path, exc)
+        size = -1
+    title = ""
+    try:
+        title = extract_gba_title(content_path)
+    except Exception as exc:
+        logger.info("[load] cartridge header unreadable: %s", exc)
+    logger.info("[load] ROM: %s (%s bytes, title=%r)", content_path,
+                f"{size:,}" if size >= 0 else "?", title or "(unparsed)")
+
+    stem = os.path.splitext(os.path.basename(content_path))[0]
+    for extension in (".sav", ".srm"):
+        candidate = os.path.join(save_dir, stem + extension)
+        try:
+            if os.path.exists(candidate):
+                logger.info("[load] save file: %s exists (%s bytes)", candidate,
+                            f"{os.path.getsize(candidate):,}")
+            else:
+                logger.info("[load] save file: %s does not exist yet (mGBA creates "
+                            "it on the first in-game save)", candidate)
+        except OSError as exc:
+            logger.warning("[load] save file %s is unreadable: %s", candidate, exc)
+
+    bios = (os.environ.get("GBA_BIOS_PATH") or os.environ.get("SYS_BIOS_PATH") or "").strip()
+    if bios and os.path.isfile(bios):
+        try:
+            logger.info("[load] BIOS: %s (%s bytes)", bios,
+                        f"{os.path.getsize(bios):,}")
+        except OSError:
+            logger.info("[load] BIOS: %s (size unknown)", bios)
+    elif bios:
+        logger.warning("[load] BIOS: configured path %s does not exist; mGBA will "
+                       "fall back to its built-in BIOS", bios)
+    else:
+        logger.info("[load] BIOS: none configured; mGBA uses its built-in HLE BIOS "
+                    "(no proprietary file is required)")
+    if config_dir:
+        logger.info("[load] mGBA config: XDG_CONFIG_HOME=%s -> %s", config_dir,
+                    mgba_config_path(config_dir))
+
+
 def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
                        windowed: bool, display_scaling: str,
                        display_size: Optional[tuple] = None,
@@ -1011,7 +1482,8 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
                        savestate: Optional[str] = None,
                        fps_target: Optional[float] = None,
                        runtime_dir: Optional[str] = None,
-                       bare_x11: bool = False) -> list:
+                       bare_x11: bool = False,
+                       log_level: Optional[int] = None) -> list:
     """
     Builds the mGBA argv with save routing (SV1), scaling (D2) and explicit
     video settings.
@@ -1034,6 +1506,11 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
     instead (the caller places it at 0,0). With no WM it has no decorations.
     Desktop and KMS fullscreen remain SDL-managed. Unknown-size X11 retains
     the fullscreen fallback rather than pretending a 4x window fills a screen.
+
+    `log_level` is mgba-sdl's `-l` bitmask. With None (the default) the command
+    line is untouched and mGBA logs only FATAL|ERROR|WARN; a diagnostic session
+    passes 31 so the boot log also shows the ROM/BIOS load, save routing, audio
+    buffer negotiation and frame timing.
     """
     screen_window = (bare_x11 and not windowed and display_size is not None
                      and display_size[0] > 0 and display_size[1] > 0)
@@ -1051,6 +1528,8 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
         # suspect for stutter (most visible in the GB/GBC frame loop).
         "-C", "rewindEnable=0",
     ]
+    if log_level is not None:
+        cmd.extend(["-l", str(int(log_level))])
     if fps_target:
         cmd.extend(["-C", f"fpsTarget={float(fps_target):g}"])
     if cheats_dir:
@@ -1154,11 +1633,17 @@ class MgbaSessionRunner:
         if child.poll() is not None:
             return True
         timeout = self.stop_timeout if timeout is None else float(timeout)
-        logger.info("Stopping mGBA (pid %s) for a display handoff", getattr(child, "pid", -1))
+        pid = getattr(child, "pid", -1)
+        logger.info("Stopping mGBA (pid %s) for a display handoff", pid)
         # Every wait is bounded, including the final reap. SIGCONT lets a
         # suspended child handle termination; SIGKILL also works if SDL is hung.
+        # Each step is logged so the closing stage of the log shows exactly
+        # which signal ended the session and how long escalation took.
+        stop_started = time.monotonic()
         for sig, grace in ((signal.SIGCONT, 0), (signal.SIGTERM, timeout),
                            (signal.SIGHUP, 0.5), (signal.SIGKILL, 2.0)):
+            name = getattr(sig, "name", str(sig))
+            signal_at = time.monotonic()
             try:
                 if sig == signal.SIGTERM:
                     child.terminate()
@@ -1166,24 +1651,33 @@ class MgbaSessionRunner:
                     child.kill()
                 else:
                     child.send_signal(sig)
+                logger.info("Stop sequence: %s -> pid %s (%.2fs into the stop, "
+                            "grace %.1fs)", name, pid, signal_at - stop_started, grace)
             except ProcessLookupError:
-                pass                 # exit raced with the signal
+                logger.info("Stop sequence: %s not delivered; pid %s already exited",
+                            name, pid)
             except OSError as exc:
-                logger.warning("Could not signal mGBA (%s): %s", sig, exc)
+                logger.warning("Could not signal mGBA (%s): %s", name, exc)
             if not grace:
                 continue
             try:
                 child.wait(timeout=grace)
+                logger.info("Stop sequence: pid %s exited after %s (%.2fs)",
+                            pid, name, time.monotonic() - signal_at)
                 break
             except subprocess.TimeoutExpired:
-                logger.warning("mGBA did not exit after signal %s in %.1fs", sig, grace)
+                logger.warning("mGBA did not exit after %s in %.1fs; escalating",
+                               name, grace)
             except OSError as exc:
                 logger.warning("Could not reap mGBA: %s", exc)
         # The input watcher deliberately keeps running: it is what delivers
         # the combo that closes the overlay, and it lives as long as the
         # session (`_session_alive`), not as long as this child.
         stopped = child.poll() is not None
-        if not stopped:
+        if stopped:
+            logger.info("Stop sequence: pid %s reaped with status %s after %.2fs",
+                        pid, child.returncode, time.monotonic() - stop_started)
+        else:
             logger.error("mGBA is still running after the handoff stop")
         return stopped
 
@@ -1209,10 +1703,20 @@ class MgbaSessionRunner:
         if self.monitor is not None:
             self.monitor.stop()
             self.monitor = None
+        # stderr is merged into stdout (never DEVNULL, never a second pipe):
+        # mGBA logs to stdout, while SDL2 and Mesa write their verbose
+        # diagnostics to stderr, and both must land in /data/logs/latest.log.
         self.child = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                       stderr=subprocess.STDOUT, text=True,
                                       bufsize=1, env=self.env)
         self.spawn_count += 1
+        # The first spawn's command line is already in the log as `Executing
+        # mGBA:` (or `Retrying:`) from main(); a restart after an overlay
+        # handoff or a speed change is not, so argv is recorded again only when
+        # it is new information rather than twice per session.
+        logger.info("Spawned mGBA (pid %s, spawn #%d)%s",
+                    getattr(self.child, "pid", -1), self.spawn_count,
+                    "" if self.spawn_count == 1 else f": {' '.join(cmd)}")
         if self.native is not None:
             self.native.proc = self.child
         self.monitor = InputMonitor(
@@ -1228,6 +1732,21 @@ class MgbaSessionRunner:
         self.monitor.start()
         threading.Thread(target=self._pump_stdout, args=(self.child,),
                          daemon=True, name="gba-mgba-log").start()
+        if diagnostics_enabled():
+            # Off the main thread: sampling the window tree must never delay the
+            # emulator's own start, and it re-runs after every handoff restart so
+            # an overlay can also be caught leaving a stale or misplaced window.
+            threading.Thread(target=self._log_display_evidence, args=(self.child,),
+                             daemon=True, name="gba-display-diag").start()
+
+    def _log_display_evidence(self, child) -> None:
+        """Samples the display once mGBA has had a moment to map its window."""
+        try:
+            log_display_diagnostics(
+                self.env,
+                alive_check=(lambda: child.poll() is None) if child is not None else None)
+        except Exception as exc:
+            logger.debug("Display diagnostics failed: %s", exc)
 
     def _session_alive(self) -> bool:
         """Liveness for the input watcher: the session, not the child.
@@ -1243,15 +1762,27 @@ class MgbaSessionRunner:
 
     @staticmethod
     def _pump_stdout(child) -> None:
+        """Forwards mGBA's merged stdout+stderr into the session log.
+
+        With `-l 31` this is where mGBA's own ROM/BIOS load, save routing,
+        audio buffer negotiation and frame timing lines arrive; SDL2's and
+        Mesa's verbose diagnostics come in on the same stream because stderr
+        is merged at spawn time. A pump that dies silently would look exactly
+        like an emulator that logged nothing, so both ends are recorded.
+        """
+        lines = 0
         try:
             if child.stdout:
                 for line in iter(child.stdout.readline, ""):
                     cleaned = line.strip()
                     if cleaned:
+                        lines += 1
                         logger.info("[mgba] %s", cleaned)
                 child.stdout.close()
-        except Exception:
-            pass
+            logger.info("[mgba] output stream closed after %d line(s)", lines)
+        except Exception as exc:
+            logger.warning("[mgba] log pump stopped early after %d line(s): %s",
+                           lines, exc)
 
     def _terminate_child(self) -> None:
         self.stop_emulator()
@@ -1441,6 +1972,10 @@ def main():
     backup_saves(save_dir)
 
     ensure_mgba_config(config_dir)
+    # Stage 1 of the log: what we are about to hand mGBA (ROM header, save
+    # routing, BIOS). Recorded before the emulator starts so a session that
+    # never gets that far still leaves its input behind.
+    log_load_diagnostics(content_path, save_dir, config_dir)
     try:
         mgba_bin = find_mgba_binary()
     except FileNotFoundError as exc:
@@ -1475,6 +2010,30 @@ def main():
                 display_session(), env.get("SDL_VIDEODRIVER", "auto"),
                 is_windowed, display_scaling,
                 f"{screen[0]}x{screen[1]}" if screen else "unknown")
+    if display_session() == "console":
+        # A card with nothing wired to it emulates perfectly and shows nothing,
+        # so name the pin, the ranking behind it and every card that sysfs says
+        # drives no output (T-DISPLAY-2 / D8).
+        blind = cards_without_output()
+        logger.info("KMS/DRM pin: %s | ranked: %s%s",
+                    env.get("SDL_VIDEO_KMSDRM_DEVICE") or "(unset)",
+                    ", ".join(ranked_drm_cards()) or "no /dev/dri card found",
+                    f" | output-less: {', '.join(blind)}" if blind else "")
+
+    # Stage 2 of the log: the subsystem verbosity actually in force. mGBA's own
+    # mask is ours to set; SDL2/Mesa are configured by src/gba_session.sh, so
+    # recording what arrived makes a silent capture self-explanatory.
+    log_level = mgba_log_level()
+    if log_level is not None:
+        logger.info("Subsystem diagnostics: mGBA log mask -l %d (%s); "
+                    "SDL_LOG_PRIORITY=%s LIBGL_DEBUG=%s MESA_DEBUG=%s",
+                    log_level, describe_log_mask(log_level),
+                    env.get("SDL_LOG_PRIORITY", "(default)"),
+                    env.get("LIBGL_DEBUG", "(default)"),
+                    env.get("MESA_DEBUG", "(default)"))
+    else:
+        logger.info("Subsystem diagnostics: off (GBA_DEBUG=0); mGBA logs "
+                    "FATAL|ERROR|WARN only")
 
     # --- per-game in-game features (keyed by stable content identity) ------
     settings = settings_store.load_settings()
@@ -1538,7 +2097,8 @@ def main():
             display_scaling, screen if size is None else size,
             cheat_file=current_cheat_file(), cheats_dir=cheats_dir,
             savestate=savestate, fps_target=fps_target,
-            runtime_dir=runtime_dir, bare_x11=bare_x11)
+            runtime_dir=runtime_dir, bare_x11=bare_x11,
+            log_level=log_level)
 
     def reload_command(**kwargs):
         return make_command(fps_target=kwargs.get("fps_target"),
@@ -1585,7 +2145,11 @@ def main():
                        env.get("SDL_VIDEO_KMSDRM_DEVICE") or "default", strategy[1])
         ret = _run_mgba(cmd, retry_env, **run_kwargs)
 
-    # Durability: fsync save files and their directory, then keep a backup.
+    # Stage 4 of the log: closing. mGBA's own audio-shutdown and surface
+    # cleanup lines arrive through the log pump above; what the adapter owns is
+    # durability, so that is what gets recorded and verified here.
+    logger.info("Teardown: exit status %d after %.1fs total; flushing saves",
+                ret, time.monotonic() - started)
     sync_directory(save_dir)
     backup_saves(save_dir)
     if native is not None:

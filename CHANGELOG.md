@@ -4,6 +4,142 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — In-shell self-update (SETTINGS → System → Check for updates)
+
+The console can now pull its own updates from GitHub without a terminal, a login or a second
+computer: an anonymous HTTPS check compares `origin/main` with the commit stamped in
+`/opt/gba-distro/VERSION`, a modal lists the new commits, and confirming re-runs the shipped
+`scripts/install.sh --apply --repair` from a shallow clone — the same code path as a manual
+install, so saves, ROMs and settings stay untouched by contract. Suite: **509 passing, 1 skipped**.
+
+### Added
+
+- **`src/gba_updater.py`**: `network_ok()` reachability probe, `installed_version()` (VERSION stamp
+  or local `.git`), `check_for_updates()` (`git ls-remote` + shallow clone for the commit list) and
+  `apply_update()` (reset the clone to `origin/<branch>`, run its installer with `sudo -n` when
+  unprivileged, `GIT_TERMINAL_PROMPT=0` everywhere so nothing can block on a credential prompt).
+- **`UpdateOverlay`** in `src/gba_launcher.py`: a modal state machine (checking → prompt →
+  applying → done / info / error) whose git and network work runs on a worker thread so the shell
+  keeps drawing; on success it toasts and re-execs the launcher into the new version.
+- **VERSION stamp**: `scripts/install.sh` now writes `$INSTALL_DIR/VERSION` (commit + timestamp)
+  during `install_files`, and ships `gba_updater.py` with the rest of the modules.
+
+### Tests
+
+- `tests/test_updater.py` (14): reachability, version stamp, behind/up-to-date/unreachable checks
+  and apply success/failure/missing-installer against throwaway `file://` git repositories.
+- `tests/test_shell.py` `TestUpdateOverlay` (5): menu wiring, prompt → apply → restart, up-to-date
+  toast, no-network error, and cancel-during-check never applying.
+
+## [Unreleased] — Cartridge card and wordmark visual fixes
+
+Three defects reported from a photo of the real shelf, all in the theme's cartridge painter and the
+header wordmark. Suite: **490 passing, 1 skipped** (`make test`); `ui_preview_*.png` regenerated.
+
+### Fixed
+
+- **Square plastic corners on cartridge cards** (`src/theme.py`). The shell gradient was painted as
+  plain square bands under a rounded 1px outline, so the corner pixels of the fill poked out of the
+  curve. The gradient is now composited inside a rounded SRCALPHA silhouette
+  (`BLEND_RGBA_MIN`), matching the outline, shadow and selection ring radius.
+- **"GBA" seal text bleeding out of its circle.** The ring had a fixed radius smaller than the
+  rendered word. The ring is now sized from the measured wordmark (new `seal` type size) and sat
+  inside the sticker; the bottom row's height reservation follows the ring so titles keep their
+  lines on the smallest grid tile.
+- **Header wordmark overlap ("GBA OS").** The second word's x was hard-coded; `Theme.wordmark()`
+  now places "OS" from the measured width of "GBA", at every scale.
+- **Truncated titles dotted every line** ("Pocket.. / Rally.."). The ".." suffix belongs to the
+  last shown line only; wrapping moved into a testable `_wrap_lines()`.
+
+### Added
+
+- Pixel-level regressions in `tests/test_theme_config.py` (`TestCartridgeVisuals`): corner cuts
+  stay background/shadow, the seal bounding box stays square (text inside the ring) and on the
+  sticker, wordmark rects never collide, and elision dots land on the last line only.
+
+## [Unreleased] — Verbose boot diagnostics: evidence for a black screen
+
+No behaviour change and no new dependency. Every stage of an emulator session — load, windowing,
+running, closing — now writes its own evidence into `/data/logs/latest.log`, so "the game opened to a
+black screen" can be answered from a log instead of guessed at. Suite: **478 passing, 1 skipped**
+(`make test`).
+
+### Added
+
+- **Subsystem debug exports** (`src/gba_session.sh`). The appliance session now exports
+  `SDL_LOG_PRIORITY=verbose` (plus the `_video`, `_audio` and `_render` categories),
+  `LIBGL_DEBUG=verbose`, `MESA_DEBUG=1` and `GBA_DEBUG=1`, each written as `${VAR:-default}` so a
+  single boot can raise or silence one without editing a file. It also announces a missing
+  `xwininfo`/`xrandr` once, with the package names, instead of leaving a silent gap in the log.
+- **mGBA's own log mask** (`src/gba_adapter_mgba.py`). `mgba_log_level()` passes `-l 31`
+  (`FATAL|ERROR|WARN|INFO|DEBUG`, verified against `include/mgba/core/log.h`; mgba-sdl parses it as
+  `--log-level` and applies it as a `logLevel` config *override*, so no `config.ini` can defeat it).
+  mgba-sdl's default is `FATAL|ERROR|WARN`, which is why an emulator that never presented a frame
+  printed nothing at all. `GBA_MGBA_LOG_LEVEL` overrides the mask (127 = `mLOG_ALL`) and an unusable
+  value is clamped or replaced rather than reaching `getopt_long`, which would abort the whole
+  command line. `build_mgba_command` still produces a byte-identical argv when no level is passed.
+- **Window-mapping evidence** (`log_display_diagnostics`). About 1.5 s after *every* spawn — so also
+  after each overlay handoff restart — the adapter samples `xrandr --current` and
+  `xwininfo -root -tree`, then queries `xwininfo -id` for windows matching mGBA's title or SDL's
+  WM_CLASS, and logs a verdict: `map-state=IsViewable … fills the active 1920x1080 mode`,
+  `IsUnmapped` (created but never mapped), `lies entirely outside the active … mode` (off-screen),
+  `overflows …` (clipped), `does not fill the display`, or `NO emulator window in the X11 tree`. A
+  few pixels of window-manager frame are deliberately *not* reported as a fault
+  (`DIAG_EDGE_TOLERANCE`), and a tool that exits non-zero is reported as `window tree unavailable`
+  rather than as a missing window — the two are opposite diagnoses.
+- **DRM connector evidence** (`_log_drm_connectors`). With no `DISPLAY` there is no window tree, so
+  the same slot logs `/sys/class/drm` status/enabled/DPMS/preferred mode for the pinned card and
+  warns when that card drives no connected output — the console equivalent of an unmapped window, and
+  exactly what the D-047 card ladder exists to escape.
+- **Load-stage evidence** (`log_load_diagnostics`). ROM path, size and parsed cartridge title; the
+  expected `.sav`/`.srm` path and whether it exists yet; and the resolved BIOS situation (a
+  configured-but-missing path warns, otherwise the built-in HLE BIOS is stated plainly). Recorded
+  *before* the emulator starts, so a session that never gets that far still leaves its input behind.
+- **Input evidence** (`InputMonitor`). The monitor logs the `/dev/input` devices it opened by name,
+  the escape keys and combos it is watching, and — at debug level, so it reaches the file but not the
+  console — every device it could not open, which is the usual reason an exit combo "does nothing".
+  Exit gestures now name the actual trigger (`Exit key detected (evdev code 1)`,
+  `Gamepad exit combo (button 10, held=[…])`) and confirm SIGTERM delivery.
+- **Self-test coverage** (`src/gba_selftest.py`). A new `diagnostics` check reports the mask in
+  force, the SDL/Mesa variables that arrived, and which of `xwininfo`/`xrandr` are missing, with the
+  exact `apt install` line. Missing tools are a warning, never a failure.
+
+### Changed
+
+- **Closing is a trail, not a status code** (`MgbaSessionRunner.stop_emulator`). Each signal in the
+  existing bounded ladder is logged as `Stop sequence: SIGTERM -> pid N (0.00s into the stop, grace
+  2.0s)` with the wait outcome, escalations say `escalating`, and the end reports
+  `reaped with status -15 after 0.02s`. A session that needed SIGKILL now says so.
+- **The log pump reports both ends** (`_pump_stdout`). stderr was already merged into stdout; the
+  pump now also records `output stream closed after N line(s)`, and a pump that dies early logs a
+  warning instead of failing silently — which previously looked identical to an emulator that logged
+  nothing.
+- **`sync_directory` verifies out loud** (Rule SV2). It returns the number of files it fsynced and
+  logs `Save fsync verified: N file(s) plus the directory …`; a per-file fsync failure is now
+  attributed instead of swallowed. `main()` adds a `Teardown: exit status … after …s total` line.
+
+### Trade-offs and escape hatch
+
+`GBA_DEBUG=0` switches the capture off again, argv included — mGBA goes back to its default
+`FATAL|ERROR|WARN` mask, and no `[load]`/`[diag]`/`[x11]`/`[drm]` lines are written. The
+lifecycle lines (`Spawned mGBA`, `Stop sequence:`, `Save fsync verified`, `Teardown:`) stay on
+purpose: one line each, and they are facts about the session rather than a capture. Diagnostic volume is
+bounded three ways: tree/xrandr output is truncated (`DIAG_MAX_TREE_LINES`), every tool call is
+time-bounded (`DIAG_TOOL_TIMEOUT`) on its own daemon thread so it can never delay a launch, and Rule
+ST5 rotation still caps the log at 2 MB with five archives. `xwininfo`/`xrandr` stay optional and
+read-only; nothing is installed, and no package was added to the ISO.
+
+### Tests
+
+- `tests/test_adapter_diagnostics.py` (43 tests): the mask and its overrides/clamping, argv with and
+  without `-l`, and window verdicts driven by scripted `xwininfo`/`xrandr` on `PATH` — mapped,
+  unmapped, off-screen, clipped, undersized, absent, renamed-but-SDL-classed, tools missing, a tool
+  that hangs, and `GBA_DEBUG=0` producing no records at all. DRM evidence is tested against a
+  temporary `/sys/class/drm`, including the pin filter and an unreadable sysfs. Also covered: the
+  load-stage lines, fsync reporting, the merged stdout/stderr pump with a real subprocess, the full
+  `SIGCONT → SIGTERM → SIGHUP → SIGKILL` trail with a child that ignores SIGTERM and SIGHUP (using
+  the ready-file handshake from `tests/test_adapter_shutdown.py`), and the session wrapper's exports.
+
 ## [Unreleased] — Runtime bug-fix pass (seven reported defects)
 
 Seven defects reported against the in-game and USB-import runtime, fixed in place. No module was
