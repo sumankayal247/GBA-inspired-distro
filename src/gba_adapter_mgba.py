@@ -2028,22 +2028,23 @@ def main():
             logger.info("Bare X11: SDL fullscreen (display size unknown)")
 
     # Bare-X11 workaround: without a compositor, mGBA's OpenGL via GLX
-    # (even llvmpipe software GL) can't present frames to bare X11.
-    # Additionally, Matchbox doesn't send SDL_WINDOWEVENT_EXPOSED or focus
-    # events, so SDL2 pauses rendering.
+    # can't present frames to bare X11. The solution requires TWO things:
+    # 1. Software OpenGL (llvmpipe) to avoid AMD DRI3 page-flip failures
+    # 2. A compositor (picom/compton) to present the software-rendered frames
     #
-    # The fix is a lightweight compositor in the session (see gba_session.sh).
-    # If no compositor is available, we try SDL2 software renderer as fallback.
+    # LIBGL_ALWAYS_SOFTWARE=1 forces Mesa to use llvmpipe (software OpenGL)
+    # instead of hardware radeonsi. This is slower but avoids DRI3 issues.
+    # The compositor (started in gba_session.sh) handles X11 presentation.
     #
     # Set GBA_HARDWARE_GL=1 to skip software fallback (will likely black-screen
-    # if no compositor is running).
+    # on bare X11 without a compositor).
     if bare_x11:
         force_hw = env.get("GBA_HARDWARE_GL") == "1"
         if not force_hw:
-            # Try SDL2 software renderer as fallback (bypasses OpenGL/GLX)
-            env["SDL_RENDER_DRIVER"] = "software"
-            logger.info("Bare X11: SDL_RENDER_DRIVER=software set as fallback. "
-                        "If compositor is running, this is ignored.")
+            # Force software OpenGL rendering (llvmpipe) to avoid DRI3 issues
+            env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+            logger.info("Bare X11: LIBGL_ALWAYS_SOFTWARE=1 set to use software OpenGL "
+                        "(llvmpipe). A compositor (picom/compton) is required to present frames.")
     logger.info("Display session=%s driver=%s windowed=%s scaling=%s screen=%s",
                 display_session(), env.get("SDL_VIDEODRIVER", "auto"),
                 is_windowed, display_scaling,

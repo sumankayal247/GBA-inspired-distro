@@ -141,6 +141,7 @@ Run '$0 --apply' to install it for the first time."
     fi
 
     install_automount_dependencies
+    install_x11_dependencies
     install_files
     install_ownership
     install_wrappers
@@ -174,6 +175,12 @@ check_dependencies() {
         && missing+=("python3-pygame")
     command -v mgba >/dev/null 2>&1 || missing+=("mgba-sdl")
 
+    # X11 compositor: required for bare X11 sessions (Matchbox) to present
+    # OpenGL frames. Without it, games show a black screen.
+    if ! command -v picom >/dev/null 2>&1 && ! command -v compton >/dev/null 2>&1; then
+        missing+=("picom")
+    fi
+
     # Optional: Android phones in File Transfer/MTP mode are not block disks.
     # Normal USB stick import and game launching work without this package.
     if ! command -v jmtpfs >/dev/null 2>&1 && ! command -v gio >/dev/null 2>&1; then
@@ -190,8 +197,8 @@ check_dependencies() {
     if [ ${#missing[@]} -gt 0 ]; then
         gb_warn "Missing packages: ${missing[*]}"
         gb_warn "Install them first (the appliance can still be installed, but games"
-        gb_warn "will not start until mGBA and pygame are present):"
-        gb_warn "    sudo apt install python3 python3-pygame mgba-sdl"
+        gb_warn "will not start until mGBA, pygame, and a compositor are present):"
+        gb_warn "    sudo apt install python3 python3-pygame mgba-sdl picom"
         if [ "$APPLY" = "1" ] && [ "${GBA_ALLOW_MISSING_DEPS:-0}" != "1" ]; then
             gb_die "Refusing to touch the boot configuration with incomplete runtime deps.
 Set GBA_ALLOW_MISSING_DEPS=1 to override (the installer will write a working
@@ -199,8 +206,27 @@ recovery-first setup, but games will not launch until you install them)."
         fi
         return 1
     fi
-    gb_ok "python3, pygame and mGBA are present."
+    gb_ok "python3, pygame, mGBA, and compositor are present."
     return 0
+}
+
+# Install X11 dependencies for bare X11 sessions (compositor + utilities).
+install_x11_dependencies() {
+    gb_step "Installing X11 session dependencies"
+    if gb_is_dry_run; then
+        gb_dim "  (dry-run) would install picom x11-utils x11-server-utils without recommends"
+        return 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        gb_die "Install picom, x11-utils, and x11-server-utils with your package manager,
+then retry. Automatic dependency installation currently supports Debian/Ubuntu."
+    fi
+    apt-get install -y --no-install-recommends picom x11-utils x11-server-utils
+    if command -v picom >/dev/null 2>&1; then
+        gb_ok "picom compositor installed"
+    else
+        gb_warn "picom installation failed; games will show a black screen on bare X11"
+    fi
 }
 
 # Install only the headless automount stack, never desktop recommendations.
@@ -712,6 +738,7 @@ main() {
     fi
 
     install_automount_dependencies
+    install_x11_dependencies
     install_files
     install_ownership
     install_profile
