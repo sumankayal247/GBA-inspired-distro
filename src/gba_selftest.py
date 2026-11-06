@@ -33,6 +33,11 @@ OK_MARK = {"PASS": "ok  ", "WARN": "warn", "FAIL": "FAIL"}
 # window-mapping evidence is simply absent from the boot log.
 DIAGNOSTIC_TOOLS = (("xwininfo", "x11-utils"), ("xrandr", "x11-server-utils"))
 
+# Lightweight compositors that fix bare-X11 GL presentation and Matchbox focus.
+# Without a compositor, mGBA's OpenGL (even llvmpipe) can't present frames and
+# SDL2 pauses rendering waiting for focus/expose events that never arrive.
+COMPOSITORS = ("picom", "compton")
+
 
 class Check:
     def __init__(self, name: str, status: str, detail: str, hint: str = ""):
@@ -289,6 +294,22 @@ def mtp_report(attempt_mount: bool = True) -> str:
         return f"MTP diagnostics failed: {exc}"
 
 
+def check_compositor() -> Check:
+    """Bare X11 needs a compositor for GL presentation and window focus.
+
+    Without picom or compton, mGBA's OpenGL (even llvmpipe) can't present
+    frames to bare X11, and SDL2 pauses rendering waiting for focus/expose
+    events that Matchbox doesn't send. The gba_session.sh script starts the
+    compositor automatically if one is found.
+    """
+    found = [c for c in COMPOSITORS if shutil.which(c)]
+    if found:
+        return Check("compositor", PASS, f"{found[0]} available")
+    return Check("compositor", WARN, "no compositor found (picom/compton)",
+                 "Bare X11 games need a compositor for GL presentation. "
+                 "Install one: sudo apt install picom")
+
+
 def check_diagnostics() -> Check:
     """Will a black screen actually leave evidence in the boot log?
 
@@ -331,7 +352,8 @@ def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
 
     checks: List[Check] = [check_python(), check_fonts(), check_pty(),
                            check_display(), check_mgba(), check_mtp(),
-                           check_native_hotkeys(), check_diagnostics()]
+                           check_native_hotkeys(), check_compositor(),
+                           check_diagnostics()]
     checks.extend(check_modules())
     checks.extend(check_pygame())
     checks.extend(check_storage(data_dir, games_dir))
