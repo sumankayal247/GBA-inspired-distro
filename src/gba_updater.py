@@ -82,9 +82,13 @@ def _git(args: List[str], cwd: Optional[str] = None,
          timeout: float = 60.0) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env.update(_GIT_ENV_EXTRA)
-    return subprocess.run(["git"] + args, cwd=cwd, env=env, timeout=timeout,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True)
+    # Inject safe.directory=* to bypass git's ownership check. The updater
+    # may run as root while /data/update/work is owned by the user account,
+    # which triggers git's "dubious ownership" error. This is safe because
+    # we only operate on our own repository.
+    return subprocess.run(["git", "-c", "safe.directory=*"] + args, cwd=cwd,
+                          env=env, timeout=timeout, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True)
 
 
 def _tail(text: str, lines: int = 12) -> str:
