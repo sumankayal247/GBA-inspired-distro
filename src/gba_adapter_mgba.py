@@ -1564,17 +1564,33 @@ def retry_strategy(session: str, ret: int, elapsed: float, windowed: bool,
     A "black screen then back to the library" is almost always a video backend
     that could not present. The fallback depends on where we are running:
 
+    * bare X11: DRI3 page-flipping may have failed silently; first try windowed
+      (which lets SDL negotiate), and if that also fails, software rendering;
     * desktop (x11/wayland): retry once windowed with no driver pinning, so SDL
       negotiates for itself;
     * bare console: the first DRM card may drive no output, so try the others.
 
-    Returns ("windowed", None) or ("card", "/dev/dri/cardN").
+    Returns ("windowed", None), ("software", None) or ("card", "/dev/dri/cardN").
     """
     if ret in (0, -signal.SIGTERM, -signal.SIGINT, -signal.SIGHUP, -signal.SIGKILL) \
-            or windowed or elapsed >= 5.0:
+            or elapsed >= 5.0:
         return None
-    if session in ("x11", "wayland"):
-        return ("windowed", None)
+    if session == "x11":
+        # Bare X11 without a compositor: DRI3 page-flipping on AMD/Intel
+        # sometimes fails silently.  If the first attempt used DRI2 blit
+        # (LIBGL_DRI3_DISABLE) and still died, escalate to software rendering.
+        if env.get("LIBGL_DRI3_DISABLE") and not windowed:
+            return ("windowed", None)
+        if not windowed:
+            return ("windowed", None)
+        # Already windowed and still failed: try full software rendering.
+        if env.get("LIBGL_ALWAYS_SOFTWARE") != "1":
+            return ("software", None)
+        return None
+    if session in ("wayland",):
+        if not windowed:
+            return ("windowed", None)
+        return None
     if session == "console":
         cards = other_drm_devices(env.get("SDL_VIDEO_KMSDRM_DEVICE", ""))
         if cards:
@@ -2006,6 +2022,30 @@ def main():
         env["SDL_VIDEO_WINDOW_POS"] = "0,0"
         logger.info("Bare X11: screen-sized window %sx%s at 0,0; SDL fullscreen disabled",
                     *screen)
+
+    # Bare-X11 GL workaround: without a compositor, SDL2/Mesa's DRI3
+    # direct-rendering page-flipping fails silently on AMD Radeon integrated
+    # graphics (and occasionally on Intel).  The emulator window maps and
+    # emulation runs, but glXSwapBuffers never presents frames to the screen,
+    # producing a black screen with no error.  Disabling DRI3 forces Mesa to
+    # use DRI2 blit-based presentation, which goes through the X server and
+    # works without a compositor.  Hardware acceleration is preserved.
+    #
+    # Set GBA_SOFTWARE_GL=1 in the environment to force full software rendering
+    # (LIBGL_ALWAYS_SOFTWARE=1) when DRI2 also fails.  This is slower but works
+    # on any GPU; for GBA at 240x160 -> 1920x1080 it is fast enough on modern
+    # CPUs.
+    if bare_x11:
+        if env.get("GBA_SOFTWARE_GL") == "1":
+            env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+            logger.info("Bare X11 GL workaround: full software rendering forced "
+                        "(GBA_SOFTWARE_GL=1 -> LIBGL_ALWAYS_SOFTWARE=1)")
+        else:
+            # Disable DRI3: fall back to DRI2 blit presentation, which the X
+            # server handles directly without a compositor.
+            env.setdefault("LIBGL_DRI3_DISABLE", "1")
+            logger.info("Bare X11 GL workaround: DRI3 disabled -> DRI2 blit "
+                        "presentation (avoids page-flip failure on AMD/Intel)")
     logger.info("Display session=%s driver=%s windowed=%s scaling=%s screen=%s",
                 display_session(), env.get("SDL_VIDEODRIVER", "auto"),
                 is_windowed, display_scaling,
@@ -2026,14 +2066,20 @@ def main():
     log_level = mgba_log_level()
     if log_level is not None:
         logger.info("Subsystem diagnostics: mGBA log mask -l %d (%s); "
-                    "SDL_LOG_PRIORITY=%s LIBGL_DEBUG=%s MESA_DEBUG=%s",
+                    "SDL_LOG_PRIORITY=%s LIBGL_DEBUG=%s MESA_DEBUG=%s "
+                    "LIBGL_DRI3_DISABLE=%s LIBGL_ALWAYS_SOFTWARE=%s",
                     log_level, describe_log_mask(log_level),
                     env.get("SDL_LOG_PRIORITY", "(default)"),
                     env.get("LIBGL_DEBUG", "(default)"),
-                    env.get("MESA_DEBUG", "(default)"))
+                    env.get("MESA_DEBUG", "(default)"),
+                    env.get("LIBGL_DRI3_DISABLE", "(default)"),
+                    env.get("LIBGL_ALWAYS_SOFTWARE", "(default)"))
     else:
         logger.info("Subsystem diagnostics: off (GBA_DEBUG=0); mGBA logs "
-                    "FATAL|ERROR|WARN only")
+                    "FATAL|ERROR|WARN only; "
+                    "LIBGL_DRI3_DISABLE=%s LIBGL_ALWAYS_SOFTWARE=%s",
+                    env.get("LIBGL_DRI3_DISABLE", "(default)"),
+                    env.get("LIBGL_ALWAYS_SOFTWARE", "(default)"))
 
     # --- per-game in-game features (keyed by stable content identity) ------
     settings = settings_store.load_settings()
@@ -2123,6 +2169,8 @@ def main():
     # Self-heal: a fast, non-zero exit inside a desktop session usually means
     # the requested SDL backend could not create a window. Retry once windowed
     # without our driver pin instead of bouncing the user to the library.
+    # On bare X11 the DRI3 page-flipping can also fail silently, so if windowed
+    # also fails, escalate to full software rendering.
     strategy = retry_strategy(display_session(), ret, elapsed, is_windowed, env)
     if strategy and strategy[0] == "windowed":
         logger.warning("mGBA failed early; retrying once in a window without SDL video pinning")
@@ -2138,6 +2186,25 @@ def main():
                                 savestate=kwargs.get("savestate"))
         retry_kwargs["build_command"] = retry_reload if session else None
         ret = _run_mgba(retry_cmd, retry_env, **retry_kwargs)
+        # If windowed also failed, try software rendering as a last resort.
+        if ret != 0 and ret not in (-signal.SIGTERM, -signal.SIGINT, -signal.SIGHUP):
+            strategy2 = retry_strategy("x11", ret, time.monotonic() - started, True, retry_env)
+            if strategy2 and strategy2[0] == "software":
+                logger.warning("Windowed retry also failed; escalating to software rendering")
+                sw_env = dict(retry_env)
+                sw_env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+                sw_env.pop("LIBGL_DRI3_DISABLE", None)
+                sw_cmd = make_command(windowed=True, size=None)
+                logger.info("Retrying (software): %s", " ".join(sw_cmd))
+                ret = _run_mgba(sw_cmd, sw_env, **retry_kwargs)
+    elif strategy and strategy[0] == "software":
+        logger.warning("mGBA failed early; retrying with full software rendering")
+        sw_env = dict(env)
+        sw_env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+        sw_env.pop("LIBGL_DRI3_DISABLE", None)
+        sw_cmd = make_command()
+        logger.info("Retrying (software): %s", " ".join(sw_cmd))
+        ret = _run_mgba(sw_cmd, sw_env, **run_kwargs)
     elif strategy and strategy[0] == "card":
         retry_env = dict(env)
         retry_env["SDL_VIDEO_KMSDRM_DEVICE"] = strategy[1]
