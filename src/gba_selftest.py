@@ -38,6 +38,10 @@ DIAGNOSTIC_TOOLS = (("xwininfo", "x11-utils"), ("xrandr", "x11-server-utils"))
 # SDL2 pauses rendering waiting for focus/expose events that never arrive.
 COMPOSITORS = ("picom", "compton")
 
+# Window managers that provide focus/expose events to SDL2 fullscreen windows.
+# Without a WM, SDL2 windows don't render frames on bare X11.
+WINDOW_MANAGERS = ("matchbox-window-manager", "openbox")
+
 
 class Check:
     def __init__(self, name: str, status: str, detail: str, hint: str = ""):
@@ -310,6 +314,22 @@ def check_compositor() -> Check:
                  "Install one: sudo apt install picom")
 
 
+def check_window_manager() -> Check:
+    """Bare X11 needs a window manager for SDL2 fullscreen windows to render.
+
+    Without a WM, SDL2 windows never receive focus/expose events, so they
+    don't render frames. matchbox-window-manager is lightweight and designed
+    for embedded/appliance use. The gba_session.sh script starts the WM
+    automatically if one is found.
+    """
+    found = [wm for wm in WINDOW_MANAGERS if shutil.which(wm)]
+    if found:
+        return Check("window_manager", PASS, f"{found[0]} available")
+    return Check("window_manager", WARN, "no window manager found (matchbox-window-manager/openbox)",
+                 "Bare X11 games need a window manager for SDL2 window rendering. "
+                 "Install one: sudo apt install matchbox-window-manager")
+
+
 def check_diagnostics() -> Check:
     """Will a black screen actually leave evidence in the boot log?
 
@@ -353,7 +373,7 @@ def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
     checks: List[Check] = [check_python(), check_fonts(), check_pty(),
                            check_display(), check_mgba(), check_mtp(),
                            check_native_hotkeys(), check_compositor(),
-                           check_diagnostics()]
+                           check_window_manager(), check_diagnostics()]
     checks.extend(check_modules())
     checks.extend(check_pygame())
     checks.extend(check_storage(data_dir, games_dir))
