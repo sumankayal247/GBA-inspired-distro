@@ -228,7 +228,12 @@ install_x11_dependencies() {
         gb_die "Install picom, matchbox-window-manager, x11-utils, and x11-server-utils with your package manager,
 then retry. Automatic dependency installation currently supports Debian/Ubuntu."
     fi
-    apt-get install -y --no-install-recommends picom matchbox-window-manager x11-utils x11-server-utils
+    local xserver_pkg="x11-xserver-utils"
+    if apt-cache show x11-server-utils >/dev/null 2>&1; then
+        xserver_pkg="x11-server-utils"
+    fi
+    apt-get install -y --no-install-recommends picom matchbox-window-manager x11-utils "$xserver_pkg" || \
+    apt-get install -y --no-install-recommends picom matchbox-window-manager x11-utils || true
     if command -v picom >/dev/null 2>&1; then
         gb_ok "picom compositor installed"
     else
@@ -301,7 +306,7 @@ install_files() {
 
     local mod
     for mod in common.py library.py config.py theme.py gba_terminal.py gba_browser.py gba_usb.py \
-               gba_mtp.py game_data.py gba_ingame.py gba_ingame_ui.py gba_updater.py; do
+               gba_mtp.py game_data.py gba_ingame.py gba_ingame_ui.py gba_updater.py gba_adapter_mgba.py; do
         [ -f "$REPO_DIR/src/$mod" ] || gb_die "missing source file: src/$mod"
         gb_run install -m 0644 "$REPO_DIR/src/$mod" "$INSTALL_DIR/src/$mod"
     done
