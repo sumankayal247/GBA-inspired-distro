@@ -342,6 +342,24 @@ class Library:
                 "args": []
             },
             {
+                "id": "setting_wifi",
+                "title": "WiFi",
+                "type": "settings",
+                "format": "WIF",
+                "description": "Connect to a wireless network",
+                "handler": "internal_settings_wifi",
+                "args": []
+            },
+            {
+                "id": "setting_bluetooth",
+                "title": "Bluetooth",
+                "type": "settings",
+                "format": "BT",
+                "description": "Pair and connect Bluetooth devices",
+                "handler": "internal_settings_bluetooth",
+                "args": []
+            },
+            {
                 "id": "setting_controls",
                 "title": "Controls",
                 "type": "settings",

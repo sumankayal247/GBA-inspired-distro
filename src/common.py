@@ -262,6 +262,48 @@ DEFAULT_KEYBINDINGS = {
     "keyStart": 13           # Enter / Return (GBA START)
 }
 
+# SDL scancodes -> canonical SDL keycodes.  Scancodes are position-based and
+# never vary between keyboards, so this table lets us correct old laptops
+# where the BIOS or keyboard matrix reports the wrong keycode for a physical
+# key.  When an event arrives we look up its scancode here first; if it
+# matches, we substitute the canonical keycode before running the normal
+# keybinding lookup.  Unknown scancodes fall through to the raw keycode.
+SCANCODE_TO_KEYCODE = {
+    # Letters
+    4: 97, 5: 98, 6: 99, 7: 100, 8: 101, 9: 102, 10: 103, 11: 104,
+    12: 105, 13: 106, 14: 107, 15: 108, 16: 109, 17: 110, 18: 111,
+    19: 112, 20: 113, 21: 114, 22: 115, 23: 116, 24: 117, 25: 118,
+    26: 119, 27: 120, 28: 121, 29: 122,
+    # Number row
+    30: 49, 31: 50, 32: 51, 33: 52, 34: 53, 35: 54, 36: 55, 37: 56,
+    38: 57, 39: 48,
+    # Special keys
+    40: 13,      # Return
+    41: 27,      # Escape
+    42: 8,       # Backspace
+    43: 9,       # Tab
+    44: 32,      # Space
+    # Arrow keys
+    79: 1073741903,   # Right
+    80: 1073741904,   # Left
+    81: 1073741905,   # Down
+    82: 1073741906,   # Up
+}
+
+
+def resolve_event_keycode(event) -> int:
+    """Return the canonical keycode for a pygame key event.
+
+    Uses the SDL scancode (position-based) to correct keycodes on old
+    laptops where the keyboard hardware or BIOS reports the wrong keycode
+    for a physical key.  Falls back to the raw keycode for unknown
+    scancodes (e.g. multimedia keys).
+    """
+    scancode = getattr(event, "scancode", -1)
+    if scancode >= 0 and scancode in SCANCODE_TO_KEYCODE:
+        return SCANCODE_TO_KEYCODE[scancode]
+    return event.key
+
 # The shipped defaults before the Z -> A / X -> B correction.  They are used
 # only to recognise a *stock* profile written by an older install so it can be
 # migrated without touching anybody's custom bindings.
