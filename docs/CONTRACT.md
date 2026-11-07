@@ -339,9 +339,10 @@ Parameters (provisional): N = 3, M = 30.
 - **I5** [REVIEW] USB controllers are in scope for Phase 1. Bluetooth is not.
 - **I6** [TEST: T-INPUT-1, T-INPUT-4] The shipped keyboard profile MUST map `Z` to the GBA `A`
   button and `X` to `B` (`DEFAULT_KEYBINDINGS` = 122/120, and the same values written into the
-  mGBA `config.ini`). Changing that default MUST NOT overwrite a profile the user customised: a
-  stored profile identical to the legacy reversed pair (and nothing else changed) is migrated, any
-  other stored profile is left alone.
+  mGBA `config.ini`). An unversioned/v1/v2 stored profile containing the legacy reversed A/B pair
+  MUST have that pair repaired even when other buttons are customised, and those other custom
+  bindings MUST survive. A profile saved by the current profile version is an explicit user choice
+  and MUST NOT be overwritten by later default migrations.
 
 ---
 

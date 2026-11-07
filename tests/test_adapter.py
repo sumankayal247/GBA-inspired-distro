@@ -2,6 +2,7 @@
 Contract Tests for GBA OS mGBA Adapter (Rules H1, H5, SV1-SV4).
 """
 
+import json
 import os
 import sys
 import unittest
@@ -183,6 +184,27 @@ class TestAdapterContract(unittest.TestCase):
                     content = f.read()
                 self.assertIn("keyA=122", content)     # Z
                 self.assertIn("keyB=120", content)     # X
+            finally:
+                shutil.rmtree(home, ignore_errors=True)
+
+    def test_mgba_config_repairs_mixed_legacy_profile_without_losing_custom_keys(self):
+        """A customised old profile must not invert Z/A and X/B only in-game."""
+        config_dir = os.path.join(self.test_dir, "config", "handlers", "mgba-adapter")
+        home = tempfile.mkdtemp()
+        profile = dict(common.LEGACY_DEFAULT_KEYBINDINGS, keyR=114, version=2)
+        os.makedirs(os.path.join(home, "config"), exist_ok=True)
+        with open(os.path.join(home, "config", "keybindings.json"), "w") as f:
+            json.dump(profile, f)
+        with mock.patch.dict(os.environ, {"HOME": home}), \
+                mock.patch.object(common, "get_data_dir", lambda: home):
+            try:
+                from gba_adapter_mgba import ensure_mgba_config
+                ensure_mgba_config(config_dir)
+                with open(os.path.join(config_dir, "config.ini"), "r") as f:
+                    content = f.read()
+                self.assertIn("keyA=122", content)     # Z = A
+                self.assertIn("keyB=120", content)     # X = B
+                self.assertIn("keyR=114", content)     # unrelated custom key survives
             finally:
                 shutil.rmtree(home, ignore_errors=True)
 
