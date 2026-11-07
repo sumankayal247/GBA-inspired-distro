@@ -283,8 +283,8 @@ class TestLibraryIntegration(ShellTestCase):
     def test_apps_and_settings_are_cartridge_entries(self):
         launcher = self.make_launcher()
         self.assertEqual(len(launcher.apps), 6)
-        # 8 original settings pages + Game Management (delete/favorites section).
-        self.assertEqual(len(launcher.settings_entries), 9)
+        # 9 original settings pages + WiFi + Bluetooth = 11.
+        self.assertEqual(len(launcher.settings_entries), 11)
         for entry in launcher.apps + launcher.settings_entries:
             self.assertTrue(entry["handler"].startswith("internal_"))
             self.assertIn("format", entry)

@@ -653,3 +653,339 @@ def other_drm_devices(exclude: str = "", drm_root: str = "/sys/class/drm") -> Li
     can actually present instead of onto a second output-less one.
     """
     return [card for card in ranked_drm_cards(drm_root=drm_root) if card != exclude]
+
+
+# --- network / WiFi ---------------------------------------------------------
+
+def get_wifi_status() -> Optional[Dict[str, Any]]:
+    """Detect WiFi connection status via /proc/net/wireless or nmcli/ip.
+
+    Returns None if no WiFi hardware is found, otherwise a dict with:
+      - connected: bool
+      - ssid: str (empty if not connected)
+      - signal: int (0-100, approximate quality)
+    """
+    import glob as _glob
+    # Check for wireless interfaces
+    wireless_ifaces = []
+    try:
+        for iface in os.listdir("/sys/class/net"):
+            phy_path = f"/sys/class/net/{iface}/wireless"
+            if os.path.exists(phy_path):
+                wireless_ifaces.append(iface)
+    except Exception:
+        pass
+
+    if not wireless_ifaces:
+        return None
+
+    result: Dict[str, Any] = {"connected": False, "ssid": "", "signal": 0}
+
+    # Try nmcli first (NetworkManager)
+    nmcli = shutil.which("nmcli")
+    if nmcli:
+        try:
+            out = subprocess.run(
+                [nmcli, "-t", "-f", "active,ssid,signal", "dev", "wifi"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=3.0, check=False
+            ).stdout.decode("utf-8", "ignore").strip()
+            for line in out.splitlines():
+                parts = line.split(":")
+                if len(parts) >= 3 and parts[0].strip().lower() == "yes":
+                    result["connected"] = True
+                    result["ssid"] = parts[1].strip()
+                    try:
+                        result["signal"] = int(parts[2].strip())
+                    except (ValueError, IndexError):
+                        result["signal"] = 50
+                    break
+            return result
+        except Exception:
+            pass
+
+    # Fallback: read /proc/net/wireless
+    try:
+        with open("/proc/net/wireless", "r") as f:
+            lines = f.readlines()
+        for line in lines[2:]:  # Skip header lines
+            parts = line.split()
+            if len(parts) >= 4:
+                iface_name = parts[0].rstrip(":")
+                if iface_name in wireless_ifaces:
+                    try:
+                        quality = int(parts[2].rstrip("."))
+                        result["connected"] = quality > 0
+                        result["signal"] = min(100, max(0, quality * 2))
+                    except (ValueError, IndexError):
+                        pass
+                    break
+    except Exception:
+        pass
+
+    return result
+
+
+def get_wifi_networks() -> List[Dict[str, str]]:
+    """List available WiFi networks via nmcli."""
+    nmcli = shutil.which("nmcli")
+    if not nmcli:
+        return []
+    try:
+        out = subprocess.run(
+            [nmcli, "-t", "-f", "ssid,signal,security,in-use", "dev", "wifi"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=5.0, check=False
+        ).stdout.decode("utf-8", "ignore").strip()
+        networks = []
+        seen = set()
+        for line in out.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 3:
+                ssid = parts[0].strip()
+                if not ssid or ssid in seen:
+                    continue
+                seen.add(ssid)
+                try:
+                    signal = int(parts[1].strip())
+                except (ValueError, IndexError):
+                    signal = 0
+                security = parts[2].strip() if len(parts) > 2 else ""
+                in_use = parts[3].strip().lower() == "yes" if len(parts) > 3 else False
+                networks.append({
+                    "ssid": ssid,
+                    "signal": signal,
+                    "security": security,
+                    "connected": in_use,
+                })
+        networks.sort(key=lambda n: n["signal"], reverse=True)
+        return networks[:20]
+    except Exception:
+        return []
+
+
+def connect_wifi(ssid: str, password: str = "") -> Tuple[bool, str]:
+    """Connect to a WiFi network. Returns (success, message)."""
+    nmcli = shutil.which("nmcli")
+    if not nmcli:
+        return False, "NetworkManager not available"
+    try:
+        cmd = [nmcli, "dev", "wifi", "connect", ssid]
+        if password:
+            cmd.extend(["--ask"])
+        # Try with password via stdin if provided
+        if password:
+            proc = subprocess.run(
+                [nmcli, "dev", "wifi", "connect", ssid,
+                 "wifi-sec.key-mgmt", "wpa-psk",
+                 "wifi-sec.psk", password],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=15.0, check=False
+            )
+        else:
+            proc = subprocess.run(
+                [nmcli, "dev", "wifi", "connect", ssid],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=15.0, check=False
+            )
+        if proc.returncode == 0:
+            return True, f"Connected to {ssid}"
+        err = proc.stderr.decode("utf-8", "ignore").strip()
+        return False, err or "Connection failed"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def toggle_wifi(enabled: bool) -> bool:
+    """Enable or disable WiFi radio."""
+    nmcli = shutil.which("nmcli")
+    if not nmcli:
+        return False
+    state = "on" if enabled else "off"
+    try:
+        subprocess.run(
+            [nmcli, "radio", "wifi", state],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=3.0, check=False
+        )
+        return True
+    except Exception:
+        return False
+
+
+# --- Bluetooth --------------------------------------------------------------
+
+def get_bluetooth_status() -> Optional[Dict[str, Any]]:
+    """Detect Bluetooth adapter and connection status.
+
+    Returns None if no BT hardware found, otherwise:
+      - powered: bool
+      - connected: bool
+      - device_name: str (connected device name, empty if none)
+    """
+    btcli = shutil.which("bluetoothctl")
+    if not btcli:
+        return None
+
+    result: Dict[str, Any] = {"powered": False, "connected": False, "device_name": ""}
+
+    try:
+        # Check adapter power
+        out = subprocess.run(
+            [btcli, "show"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=3.0, check=False
+        ).stdout.decode("utf-8", "ignore")
+        for line in out.splitlines():
+            if "Powered:" in line:
+                result["powered"] = "yes" in line.lower()
+            if "Name:" in line and "Alias:" not in line:
+                pass  # adapter name, not needed
+
+        if not result["powered"]:
+            return result
+
+        # Check connected devices
+        out = subprocess.run(
+            [btcli, "devices", "Connected"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=3.0, check=False
+        ).stdout.decode("utf-8", "ignore").strip()
+        if out:
+            result["connected"] = True
+            # Try to get device name
+            lines = out.splitlines()
+            if lines:
+                mac = lines[0].split()[-1] if lines[0].split() else ""
+                if mac:
+                    info_out = subprocess.run(
+                        [btcli, "info", mac],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        timeout=3.0, check=False
+                    ).stdout.decode("utf-8", "ignore")
+                    for line in info_out.splitlines():
+                        if "Name:" in line:
+                            result["device_name"] = line.split(":", 1)[1].strip()
+                            break
+    except Exception:
+        pass
+
+    return result
+
+
+def get_bluetooth_devices() -> List[Dict[str, str]]:
+    """List known/paired Bluetooth devices."""
+    btcli = shutil.which("bluetoothctl")
+    if not btcli:
+        return []
+    try:
+        out = subprocess.run(
+            [btcli, "devices"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=3.0, check=False
+        ).stdout.decode("utf-8", "ignore").strip()
+        devices = []
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) >= 3 and parts[0] == "Device":
+                mac = parts[1]
+                name = parts[2]
+                devices.append({"mac": mac, "name": name})
+        return devices
+    except Exception:
+        return []
+
+
+def toggle_bluetooth(enabled: bool) -> bool:
+    """Power on/off the Bluetooth adapter."""
+    btcli = shutil.which("bluetoothctl")
+    if not btcli:
+        return False
+    try:
+        state = "on" if enabled else "off"
+        subprocess.run(
+            [btcli, "power", state],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=3.0, check=False
+        )
+        return True
+    except Exception:
+        return False
+
+
+def connect_bluetooth(mac: str) -> Tuple[bool, str]:
+    """Connect to a paired Bluetooth device. Returns (success, message)."""
+    btcli = shutil.which("bluetoothctl")
+    if not btcli:
+        return False, "bluetoothctl not available"
+    try:
+        # Trust and connect
+        subprocess.run(
+            [btcli, "trust", mac],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=3.0, check=False
+        )
+        proc = subprocess.run(
+            [btcli, "connect", mac],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=15.0, check=False
+        )
+        out = proc.stdout.decode("utf-8", "ignore").strip()
+        if "Connected" in out or proc.returncode == 0:
+            return True, "Connected"
+        return False, out or "Connection failed"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def disconnect_bluetooth(mac: str) -> Tuple[bool, str]:
+    """Disconnect a Bluetooth device."""
+    btcli = shutil.which("bluetoothctl")
+    if not btcli:
+        return False, "bluetoothctl not available"
+    try:
+        proc = subprocess.run(
+            [btcli, "disconnect", mac],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10.0, check=False
+        )
+        out = proc.stdout.decode("utf-8", "ignore").strip()
+        if "Disconnected" in out or proc.returncode == 0:
+            return True, "Disconnected"
+        return False, out or "Disconnect failed"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def scan_bluetooth_devices() -> List[Dict[str, str]]:
+    """Scan for nearby Bluetooth devices (quick 3-second scan)."""
+    btcli = shutil.which("bluetoothctl")
+    if not btcli:
+        return []
+    try:
+        # Start scan, wait 3 seconds, stop scan
+        subprocess.run(
+            [btcli, "scan", "on"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=1.0, check=False
+        )
+        time.sleep(3)
+        subprocess.run(
+            [btcli, "scan", "off"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=1.0, check=False
+        )
+        # Get devices found
+        out = subprocess.run(
+            [btcli, "devices"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=3.0, check=False
+        ).stdout.decode("utf-8", "ignore").strip()
+        devices = []
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) >= 3 and parts[0] == "Device":
+                devices.append({"mac": parts[1], "name": parts[2]})
+        return devices
+    except Exception:
+        return []

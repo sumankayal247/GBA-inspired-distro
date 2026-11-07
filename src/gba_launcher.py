@@ -69,6 +69,7 @@ from common import (
     load_keybindings,
     load_play_history,
     record_play_session,
+    resolve_event_keycode,
     sanitize_keybindings,
     save_keybindings,
     setup_logging,
@@ -936,37 +937,39 @@ class KeyRemapOverlay(Overlay):
                 self.close(shell)
             return
         if event.type == pygame.KEYDOWN:
+            # Resolve via scancode so old laptops capture the correct key.
+            key = resolve_event_keycode(event)
             if self.listening:
-                if event.key == pygame.K_ESCAPE:
+                if key == pygame.K_ESCAPE:
                     self.listening = False
                     self.error = ""
                 else:
                     key_id = GBA_BUTTON_ORDER[self.index][0]
-                    reason = keybindings_conflict_error(shell.keybindings, key_id, event.key)
+                    reason = keybindings_conflict_error(shell.keybindings, key_id, key)
                     if reason:
                         self.error = reason
                     else:
-                        shell.keybindings[key_id] = event.key
+                        shell.keybindings[key_id] = key
                         shell.keybindings = sanitize_keybindings(shell.keybindings)
                         save_keybindings(shell.keybindings)
                         self.error = ""
                         self.listening = False
                 return
-            if event.key == pygame.K_UP:
+            if key == pygame.K_UP:
                 self.index = (self.index - 1) % len(GBA_BUTTON_ORDER)
-            elif event.key == pygame.K_DOWN:
+            elif key == pygame.K_DOWN:
                 self.index = (self.index + 1) % len(GBA_BUTTON_ORDER)
-            elif event.key in (pygame.K_LEFT, pygame.K_RIGHT):
+            elif key in (pygame.K_LEFT, pygame.K_RIGHT):
                 self.index = (self.index + len(GBA_BUTTON_ORDER) // 2) % len(GBA_BUTTON_ORDER)
-            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+            elif key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
                 self.listening = True
                 self.error = ""
-            elif event.key == pygame.K_r:
+            elif key == pygame.K_r:
                 shell.keybindings = dict(DEFAULT_KEYBINDINGS)
                 save_keybindings(shell.keybindings)
                 self.error = ""
                 shell.toast("Key bindings reset to defaults", TOAST_OK)
-            elif event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+            elif key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
                 self.close(shell)
         elif event.type == pygame.JOYBUTTONDOWN and not self.listening:
             if event.button == 0:
@@ -1038,26 +1041,28 @@ class ShortcutOverlay(Overlay):
                 self.close(shell)
             return
         if event.type == pygame.KEYDOWN:
+            # Resolve via scancode so old laptops capture the correct key.
+            key = resolve_event_keycode(event)
             if self.listening:
-                if event.key == pygame.K_ESCAPE:
+                if key == pygame.K_ESCAPE:
                     self.listening = False
                     self.captured = []
                     return
-                button = button_from_key(event.key, shell.keybindings)
+                button = button_from_key(key, shell.keybindings)
                 self._capture(button, shell)
                 return
-            if event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE, pygame.K_x):
+            if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE, pygame.K_x):
                 self.close(shell)
-            elif event.key == pygame.K_UP:
+            elif key == pygame.K_UP:
                 self.index = (self.index - 1) % len(self.actions)
-            elif event.key == pygame.K_DOWN:
+            elif key == pygame.K_DOWN:
                 self.index = (self.index + 1) % len(self.actions)
-            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_z,
-                               pygame.K_SPACE):
+            elif key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_z,
+                         pygame.K_SPACE):
                 self.listening = True
                 self.captured = []
                 self.message = ""
-            elif event.key == pygame.K_r:
+            elif key == pygame.K_r:
                 self._reset(shell)
             return
         if event.type == pygame.JOYBUTTONDOWN:
@@ -1595,21 +1600,22 @@ class SettingsOverlay(Overlay):
                 self.close(shell)
             return
         if event.type == pygame.KEYDOWN:
-            if event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+            key = resolve_event_keycode(event)
+            if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
                 self.close(shell)
-            elif event.key == pygame.K_UP:
+            elif key == pygame.K_UP:
                 self.index = (self.index - 1) % len(self.rows)
-            elif event.key == pygame.K_DOWN:
+            elif key == pygame.K_DOWN:
                 self.index = (self.index + 1) % len(self.rows)
-            elif event.key == pygame.K_PAGEUP:
+            elif key == pygame.K_PAGEUP:
                 self.index = (self.index - 5) % len(self.rows)
-            elif event.key == pygame.K_PAGEDOWN:
+            elif key == pygame.K_PAGEDOWN:
                 self.index = (self.index + 5) % len(self.rows)
-            elif event.key == pygame.K_LEFT:
+            elif key == pygame.K_LEFT:
                 self.adjust(shell, -1)
-            elif event.key == pygame.K_RIGHT:
+            elif key == pygame.K_RIGHT:
                 self.adjust(shell, 1)
-            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_z, pygame.K_SPACE):
+            elif key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_z, pygame.K_SPACE):
                 self.activate(shell)
         elif event.type == pygame.JOYHATMOTION:
             dx, dy = event.value
@@ -1626,7 +1632,7 @@ class SettingsOverlay(Overlay):
                 self.close(shell)
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             rect = self.content_rect(shell)
-            row = (event.pos[1] - rect.y) // shell.theme.px(24)
+            row = (event.pos[1] - rect.y) // shell.theme.px(28)
             if 0 <= row < len(self.rows):
                 self.index = row
                 self.activate(shell)
@@ -1673,7 +1679,7 @@ class SettingsOverlay(Overlay):
         rect = self.content_rect(shell)
         x0, y0 = rect.x / theme.scale, rect.y / theme.scale
         width = rect.width / theme.scale
-        row_h = 26.0
+        row_h = 28.0
         visible = max(1, int((rect.height / theme.scale) // row_h))
         start = max(0, min(self.index - visible + 1, len(self.rows) - visible)) \
             if len(self.rows) > visible else 0
@@ -1687,22 +1693,22 @@ class SettingsOverlay(Overlay):
             row = self.rows[index]
             selected = index == self.index
             y = y0 + offset * row_h
-            box = theme.rect(x0, y, width, row_h - 2)
+            box = theme.rect(x0, y, width, row_h - 3)
             if selected:
                 pygame.draw.rect(shell.surface, c.card_sel, box, border_radius=theme.px(4))
                 pygame.draw.rect(shell.surface, c.primary, box, width=1, border_radius=theme.px(4))
-            theme.label(shell.surface, row["label"], (x0 + 6, y + 3),
+            theme.label(shell.surface, row["label"], (x0 + 8, y + 4),
                         c.text if selected else c.text_muted, key="body")
 
             value = row.get("value")
             if row["type"] == "slider":
-                track = theme.rect(x0 + width * 0.52, y + 6, width * 0.3, 5)
+                track = theme.rect(x0 + width * 0.52, y + 7, width * 0.3, 5)
                 theme.bar(shell.surface, track, (row["get"]() - row["min"]) /
                           max(1, row["max"] - row["min"]), c.info)
                 value = f"{row['get']()}{row.get('suffix', '')}"
             elif row["type"] == "toggle":
                 on = bool(row["get"]())
-                chip = theme.rect(x0 + width - 30, y + 4, 24, 11)
+                chip = theme.rect(x0 + width - 32, y + 5, 24, 11)
                 pygame.draw.rect(shell.surface, c.success if on else c.border, chip,
                                  border_radius=chip.height // 2)
                 knob_r = max(2, chip.height // 2 - theme.px(1.5))
@@ -1713,26 +1719,443 @@ class SettingsOverlay(Overlay):
             elif row["type"] == "choice":
                 value = row.get("label_for", lambda v: str(v))(row["get"]())
             elif row["type"] == "action":
-                value = ">"
+                value = None  # No arrow indicator for action rows
             elif row["type"] == "info":
                 value = row.get("value", "")
 
             if value is not None:
                 theme.label(shell.surface, truncate(theme.font("small"), str(value),
                                                     theme.px(width * 0.44)),
-                            (x0 + width - 6, y + 3),
+                            (x0 + width - 8, y + 4),
                             c.info if row["type"] in ("toggle", "choice", "slider") else c.text,
                             align="right")
             hint = row.get("hint", "")
             if hint and selected:
                 theme.label(shell.surface, truncate(theme.font("micro"), hint,
-                                                    theme.px(width - 14)),
-                            (x0 + 6, y + 15), c.highlight if row["type"] != "info" else c.text_dim,
+                                                    theme.px(width - 16)),
+                            (x0 + 8, y + 16), c.highlight if row["type"] != "info" else c.text_dim,
                             key="micro")
 
         if len(self.rows) > visible:
             theme.label(shell.surface, f"{self.index + 1}/{len(self.rows)}",
                         (x0 + width, y0 + visible * row_h + 2), c.text_dim, align="right")
+
+
+class WifiOverlay(Overlay):
+    """WiFi network scanner and connector."""
+
+    def __init__(self, shell):
+        super().__init__()
+        self.title = "WIFI NETWORKS"
+        self.width = 360.0
+        self.height = 260.0
+        self.index = 0
+        self.networks = []
+        self.status_msg = ""
+        self.scanning = False
+        self._password_buffer = ""
+        self._connecting_to = None
+        self._need_password = False
+        self._load_networks()
+
+    def _load_networks(self):
+        self.networks = settings_store.get_wifi_networks()
+
+    def _refresh(self, shell):
+        self.scanning = True
+        shell.toast("Scanning for networks...", TOAST_INFO)
+        self._load_networks()
+        self.scanning = False
+        if self.networks:
+            shell.toast(f"{len(self.networks)} network(s) found", TOAST_OK)
+        else:
+            shell.toast("No networks found", TOAST_WARN)
+
+    def _connect(self, shell, network):
+        ssid = network["ssid"]
+        if network.get("security") and network["security"] != "":
+            self._connecting_to = ssid
+            self._need_password = True
+            self._password_buffer = ""
+            return
+        ok, msg = settings_store.connect_wifi(ssid)
+        if ok:
+            shell.toast(f"Connected to {ssid}", TOAST_OK)
+            self._load_networks()
+        else:
+            shell.toast(f"Failed: {msg}", TOAST_ERROR)
+
+    def handle(self, event, shell) -> None:
+        if event.type == pygame.QUIT:
+            if not shell.appliance_mode:
+                self.close(shell)
+            return
+        if event.type == pygame.KEYDOWN:
+            key = resolve_event_keycode(event)
+            if self._need_password:
+                if key == pygame.K_ESCAPE:
+                    self._need_password = False
+                    self._connecting_to = None
+                    self._password_buffer = ""
+                elif key == pygame.K_RETURN:
+                    ssid = self._connecting_to
+                    self._need_password = False
+                    self._connecting_to = None
+                    pwd = self._password_buffer
+                    self._password_buffer = ""
+                    ok, msg = settings_store.connect_wifi(ssid, pwd)
+                    if ok:
+                        shell.toast(f"Connected to {ssid}", TOAST_OK)
+                        self._load_networks()
+                    else:
+                        shell.toast(f"Failed: {msg}", TOAST_ERROR)
+                elif key == pygame.K_BACKSPACE:
+                    self._password_buffer = self._password_buffer[:-1]
+                else:
+                    char = getattr(event, "unicode", "")
+                    if char and char.isprintable():
+                        self._password_buffer += char
+                return
+            if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                self.close(shell)
+            elif key == pygame.K_UP:
+                self.index = max(0, self.index - 1)
+            elif key == pygame.K_DOWN:
+                self.index = min(len(self.networks), self.index + 1)
+            elif key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_z, pygame.K_SPACE):
+                if self.index == 0:
+                    self._refresh(shell)
+                elif self.index <= len(self.networks):
+                    self._connect(shell, self.networks[self.index - 1])
+            elif key == pygame.K_r:
+                self._refresh(shell)
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            rect = self.content_rect(shell)
+            row = (event.pos[1] - rect.y) // shell.theme.px(22)
+            if row == 0:
+                self._refresh(shell)
+            elif 1 <= row <= len(self.networks):
+                self.index = row
+                self._connect(shell, self.networks[row - 1])
+
+    def draw_body(self, shell) -> None:
+        theme = shell.theme
+        c = theme.colors
+        rect = self.content_rect(shell)
+        x0, y0 = rect.x / theme.scale, rect.y / theme.scale
+        width = rect.width / theme.scale
+
+        if self._need_password:
+            theme.label(shell.surface, f"Password for {self._connecting_to}:",
+                        (x0, y0), c.highlight, key="body")
+            pwd_display = "*" * len(self._password_buffer) if self._password_buffer else "(empty)"
+            theme.label(shell.surface, pwd_display, (x0, y0 + 16), c.text, key="body")
+            theme.label(shell.surface, "Enter · Esc cancel", (x0, y0 + 32), c.text_dim, key="micro")
+            return
+
+        # Refresh option
+        selected = self.index == 0
+        y = y0
+        if selected:
+            box = theme.rect(x0, y, width, 20)
+            pygame.draw.rect(shell.surface, c.card_sel, box, border_radius=theme.px(3))
+            pygame.draw.rect(shell.surface, c.primary, box, width=1, border_radius=theme.px(3))
+        theme.label(shell.surface, "Scan for networks" + ("..." if self.scanning else ""),
+                    (x0 + 6, y + 3), c.text if selected else c.info, key="body")
+
+        if not self.networks:
+            theme.label(shell.surface, "No networks found. Press Enter to scan.",
+                        (x0 + 6, y0 + 28), c.text_muted, key="micro")
+            return
+
+        # Network list
+        visible = max(1, int((rect.height / theme.scale - 22) // 20))
+        for i, net in enumerate(self.networks[:visible]):
+            idx = i + 1
+            sel = idx == self.index
+            ny = y0 + 22 + i * 20
+            if sel:
+                box = theme.rect(x0, ny, width, 18)
+                pygame.draw.rect(shell.surface, c.card_sel, box, border_radius=theme.px(3))
+                pygame.draw.rect(shell.surface, c.primary, box, width=1, border_radius=theme.px(3))
+            # Signal strength bars
+            signal = net.get("signal", 0)
+            bar_x = x0 + 6
+            bar_y = ny + 4
+            for b in range(4):
+                bx = bar_x + b * 4
+                bh = 3 + b * 2
+                filled = signal > b * 25
+                pygame.draw.rect(shell.surface,
+                                 c.info if filled else c.border,
+                                 theme.rect(bx, bar_y + (8 - bh), 3, bh))
+            # SSID
+            label = truncate(theme.font("body"), net["ssid"], theme.px(width - 70))
+            theme.label(shell.surface, label, (x0 + 28, ny + 2),
+                        c.text if sel else c.text_muted, key="body")
+            # Connected badge or security
+            if net.get("connected"):
+                theme.label(shell.surface, "CONNECTED", (x0 + width - 8, ny + 3),
+                            c.success, align="right", key="micro")
+            elif net.get("security"):
+                sec = truncate(theme.font("micro"), net["security"][:6], theme.px(50))
+                theme.label(shell.surface, sec, (x0 + width - 8, ny + 4),
+                            c.text_dim, align="right", key="micro")
+
+
+class BluetoothOverlay(Overlay):
+    """Bluetooth device manager."""
+
+    def __init__(self, shell):
+        super().__init__()
+        self.title = "BLUETOOTH"
+        self.width = 360.0
+        self.height = 260.0
+        self.index = 0
+        self.devices = []
+        self.scanning = False
+        self.status = settings_store.get_bluetooth_status()
+        self._load_devices()
+
+    def _load_devices(self):
+        self.devices = settings_store.get_bluetooth_devices()
+
+    def _refresh(self, shell):
+        self.scanning = True
+        shell.toast("Scanning for devices...", TOAST_INFO)
+        # Quick scan
+        found = settings_store.scan_bluetooth_devices()
+        self._load_devices()
+        self.scanning = False
+        total = len(self.devices)
+        if total:
+            shell.toast(f"{total} device(s) found", TOAST_OK)
+        else:
+            shell.toast("No devices found", TOAST_WARN)
+
+    def _toggle_power(self, shell):
+        if self.status is None:
+            shell.toast("No Bluetooth adapter found", TOAST_ERROR)
+            return
+        powered = self.status.get("powered", False)
+        settings_store.toggle_bluetooth(not powered)
+        self.status = settings_store.get_bluetooth_status()
+        shell.toast("Bluetooth " + ("on" if not powered else "off"), TOAST_OK)
+
+    def _connect_device(self, shell, device):
+        mac = device["mac"]
+        name = device["name"]
+        # Check if already connected
+        if self.status and self.status.get("connected") and self.status.get("device_name") == name:
+            ok, msg = settings_store.disconnect_bluetooth(mac)
+            shell.toast(f"Disconnected from {name}" if ok else msg, TOAST_OK if ok else TOAST_ERROR)
+        else:
+            ok, msg = settings_store.connect_bluetooth(mac)
+            shell.toast(f"Connected to {name}" if ok else msg, TOAST_OK if ok else TOAST_ERROR)
+        self.status = settings_store.get_bluetooth_status()
+
+    def handle(self, event, shell) -> None:
+        if event.type == pygame.QUIT:
+            if not shell.appliance_mode:
+                self.close(shell)
+            return
+        if event.type == pygame.KEYDOWN:
+            key = resolve_event_keycode(event)
+            if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                self.close(shell)
+            elif key == pygame.K_UP:
+                self.index = max(0, self.index - 1)
+            elif key == pygame.K_DOWN:
+                total_items = 2 + len(self.devices)  # power toggle, scan, devices
+                self.index = min(total_items - 1, self.index + 1)
+            elif key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_z, pygame.K_SPACE):
+                if self.index == 0:
+                    self._toggle_power(shell)
+                elif self.index == 1:
+                    self._refresh(shell)
+                elif self.index < 2 + len(self.devices):
+                    dev = self.devices[self.index - 2]
+                    self._connect_device(shell, dev)
+            elif key == pygame.K_r:
+                self._refresh(shell)
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            rect = self.content_rect(shell)
+            row = (event.pos[1] - rect.y) // shell.theme.px(22)
+            if row == 0:
+                self._toggle_power(shell)
+            elif row == 1:
+                self._refresh(shell)
+            elif row < 2 + len(self.devices):
+                self.index = row
+                self._connect_device(shell, self.devices[row - 2])
+
+    def draw_body(self, shell) -> None:
+        theme = shell.theme
+        c = theme.colors
+        rect = self.content_rect(shell)
+        x0, y0 = rect.x / theme.scale, rect.y / theme.scale
+        width = rect.width / theme.scale
+
+        items = []
+        powered = self.status.get("powered", False) if self.status else False
+        items.append(("Power: " + ("ON" if powered else "OFF"),
+                      c.success if powered else c.text_muted))
+        items.append(("Scan for devices" + ("..." if self.scanning else ""), c.info))
+        for dev in self.devices:
+            is_connected = (self.status and self.status.get("connected")
+                            and self.status.get("device_name") == dev["name"])
+            label = dev["name"]
+            if is_connected:
+                label += " [connected]"
+            items.append((label, c.success if is_connected else c.text))
+
+        row_h = 22.0
+        visible = max(1, int((rect.height / theme.scale) // row_h))
+        start = max(0, min(self.index - visible + 1, len(items) - visible)) \
+            if len(items) > visible else 0
+
+        for offset, idx in enumerate(range(start, min(len(items), start + visible))):
+            sel = idx == self.index
+            y = y0 + offset * row_h
+            if sel:
+                box = theme.rect(x0, y, width, row_h - 3)
+                pygame.draw.rect(shell.surface, c.card_sel, box, border_radius=theme.px(3))
+                pygame.draw.rect(shell.surface, c.primary, box, width=1, border_radius=theme.px(3))
+            text, color = items[idx]
+            theme.label(shell.surface, text, (x0 + 8, y + 4),
+                        color if sel else c.text_muted, key="body")
+
+        if not self.devices and not self.scanning:
+            theme.label(shell.surface, "No paired devices. Press Scan to find devices.",
+                        (x0 + 8, y0 + 50), c.text_dim, key="micro")
+
+
+class VolumeOverlay(Overlay):
+    """Simple non-blocking volume animation overlay.
+
+    Not an interactive overlay: it fades out automatically after a short delay.
+    Drawn at the bottom-centre of the screen so it never covers the cartridge
+    shelf.  Direction is 'up' or 'down'.
+    """
+
+    def __init__(self, volume: int, direction: str = "up", muted: bool = False):
+        super().__init__()
+        self.volume = volume
+        self.direction = direction
+        self.muted = muted
+        self.width = 180.0
+        self.height = 40.0
+        self._show_until = time.monotonic() + 1.2
+        self._fade_start = time.monotonic() + 0.7
+
+    def _alpha(self) -> float:
+        now = time.monotonic()
+        if now >= self._show_until:
+            return 0.0
+        if now < self._fade_start:
+            return 1.0
+        return max(0.0, 1.0 - (now - self._fade_start) / (self._show_until - self._fade_start))
+
+    @property
+    def expired(self) -> bool:
+        return time.monotonic() >= self._show_until
+
+    def handle(self, event, shell) -> None:
+        # Non-interactive: all events pass through to the shell.
+        pass
+
+    def draw(self, shell) -> None:
+        alpha = self._alpha()
+        if alpha <= 0:
+            return
+        theme = shell.theme
+        c = theme.colors
+        surf_w, surf_h = shell.surface.get_size()
+        # Centre-bottom position
+        box_w = theme.px(self.width)
+        box_h = theme.px(self.height)
+        bx = (surf_w - box_w) // 2
+        by = surf_h - box_h - theme.px(30)
+
+        # Semi-transparent background
+        bg = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+        bg.fill((0, 0, 0, int(160 * alpha)))
+        shell.surface.blit(bg, (bx, by))
+        pygame.draw.rect(shell.surface, c.border,
+                         (bx, by, box_w, box_h), width=1,
+                         border_radius=theme.px(8))
+
+        # Volume icon area (left side)
+        icon_x = bx + theme.px(10)
+        icon_y = by + box_h // 2
+        px1 = max(1, theme.px(1))
+        icon_color = (*c.text_dim[:3], int(255 * alpha))
+        # Speaker body
+        pygame.draw.rect(shell.surface, icon_color,
+                         (icon_x, icon_y - theme.px(3),
+                          theme.px(5), theme.px(6)))
+        # Speaker cone
+        pygame.draw.polygon(shell.surface, icon_color, [
+            (icon_x + theme.px(5), icon_y - theme.px(3)),
+            (icon_x + theme.px(9), icon_y - theme.px(6)),
+            (icon_x + theme.px(9), icon_y + theme.px(6)),
+            (icon_x + theme.px(5), icon_y + theme.px(3)),
+        ])
+        if self.muted or self.volume == 0:
+            # X through speaker
+            pygame.draw.line(shell.surface, c.danger,
+                             (icon_x + theme.px(11), icon_y - theme.px(4)),
+                             (icon_x + theme.px(17), icon_y + theme.px(4)), px1)
+            pygame.draw.line(shell.surface, c.danger,
+                             (icon_x + theme.px(17), icon_y - theme.px(4)),
+                             (icon_x + theme.px(11), icon_y + theme.px(4)), px1)
+        else:
+            # Sound waves
+            for i in range(1, 3):
+                wave_r = theme.px(3 + i * 3)
+                rect = pygame.Rect(icon_x + theme.px(9) - wave_r // 2,
+                                   icon_y - wave_r,
+                                   wave_r, wave_r * 2)
+                pygame.draw.arc(shell.surface, icon_color, rect,
+                                -45 * (3.14159 / 180), 45 * (3.14159 / 180), px1)
+
+        # Volume bar (right side)
+        bar_x = bx + theme.px(38)
+        bar_y = by + box_h // 2 - theme.px(3)
+        bar_w = theme.px(self.width - 50)
+        bar_h = theme.px(6)
+        pygame.draw.rect(shell.surface, c.border,
+                         (bar_x, bar_y, bar_w, bar_h),
+                         border_radius=theme.px(3))
+        fill = max(0, int(bar_w * self.volume / 100))
+        if fill > 0:
+            bar_color = c.danger if self.volume > 85 else c.info
+            pygame.draw.rect(shell.surface, bar_color,
+                             (bar_x, bar_y, fill, bar_h),
+                             border_radius=theme.px(3))
+
+        # Volume percentage text
+        font = theme.font("micro")
+        text = font.render(f"{self.volume}%", True, c.text)
+        text.set_alpha(int(255 * alpha))
+        shell.surface.blit(text, (bar_x, bar_y - theme.px(12)))
+
+        # Direction arrow
+        arrow_x = bx + box_w - theme.px(20)
+        arrow_y = by + box_h // 2
+        arrow_color = c.highlight
+        if self.direction == "up":
+            pygame.draw.polygon(shell.surface, arrow_color, [
+                (arrow_x, arrow_y - theme.px(5)),
+                (arrow_x - theme.px(4), arrow_y + theme.px(2)),
+                (arrow_x + theme.px(4), arrow_y + theme.px(2)),
+            ])
+        else:
+            pygame.draw.polygon(shell.surface, arrow_color, [
+                (arrow_x, arrow_y + theme.px(5)),
+                (arrow_x - theme.px(4), arrow_y - theme.px(2)),
+                (arrow_x + theme.px(4), arrow_y - theme.px(2)),
+            ])
 
 
 # =============================================================================
@@ -1781,6 +2204,7 @@ class GBALauncher:
         self.toast_text = ""
         self.toast_kind = TOAST_INFO
         self.toast_until = 0.0
+        self._volume_overlay: Optional[VolumeOverlay] = None
         self.running = True
         self.scan_started_at = time.monotonic()
         self.scanner = None
@@ -2418,6 +2842,28 @@ class GBALauncher:
                 and self.last_outcome not in (None, "clean")):
             self.show_logs()
             return True
+
+        # Volume keys: raise/lower/mute with animation overlay.
+        vol_up = getattr(pygame, "K_VOLUMEUP", -1)
+        vol_down = getattr(pygame, "K_VOLUMEDOWN", -1)
+        vol_mute = getattr(pygame, "K_AUDIOMUTE", -1)
+        if event.key == vol_up:
+            new_vol = min(100, self.settings.get("volume", 85) + 5)
+            self.set_setting("volume", new_vol)
+            self._show_volume_overlay(new_vol, "up")
+            return True
+        if event.key == vol_down:
+            new_vol = max(0, self.settings.get("volume", 85) - 5)
+            self.set_setting("volume", new_vol)
+            self._show_volume_overlay(new_vol, "down")
+            return True
+        if event.key == vol_mute:
+            self.set_setting("muted", not self.settings.get("muted", False))
+            self._show_volume_overlay(
+                self.settings.get("volume", 85), "down",
+                muted=self.settings.get("muted", False))
+            return True
+
         return False
 
     def handle_events(self) -> None:
@@ -2461,7 +2907,8 @@ class GBALauncher:
                 self.toast("SELECT: search is keyboard-only", TOAST_INFO)
 
     def _handle_key(self, event) -> None:
-        key = event.key
+        # Resolve via scancode to fix old laptops where Z/X keycodes swap.
+        key = resolve_event_keycode(event)
         mod = getattr(event, "mod", 0)
         if key == pygame.K_f and (mod & pygame.KMOD_CTRL) and \
                 self.current_tab == TAB_GAMES:
@@ -2739,6 +3186,8 @@ class GBALauncher:
             "internal_terminal": lambda: self.goto_tab(TAB_TERMINAL),
             "internal_settings_display": lambda: self.open_settings_page("display"),
             "internal_settings_audio": lambda: self.open_settings_page("audio"),
+            "internal_settings_wifi": lambda: self.open_settings_page("wifi"),
+            "internal_settings_bluetooth": lambda: self.open_settings_page("bluetooth"),
             "internal_settings_controls": lambda: self.open_settings_page("controls"),
             "internal_settings_library": lambda: self.open_settings_page("library"),
             "internal_settings_games": lambda: self.open_settings_page("games"),
@@ -2847,6 +3296,11 @@ class GBALauncher:
         settings_store.apply_volume(self.settings.get("volume", 85),
                                     self.settings.get("muted", False))
 
+    def _show_volume_overlay(self, volume: int, direction: str = "up",
+                             muted: bool = False) -> None:
+        """Show the animated volume overlay (auto-fades after ~1.2s)."""
+        self._volume_overlay = VolumeOverlay(volume, direction, muted)
+
     def configure_usb_watcher(self) -> None:
         enabled = self.settings.get("usb_autoscan", True)
         if enabled and self.usb_watcher is None:
@@ -2861,6 +3315,8 @@ class GBALauncher:
         builders = {
             "display": self._rows_display,
             "audio": self._rows_audio,
+            "wifi": self._rows_wifi,
+            "bluetooth": self._rows_bluetooth,
             "controls": self._rows_controls,
             "library": self._rows_library,
             "games": self._rows_games,
@@ -2868,7 +3324,8 @@ class GBALauncher:
             "system": self._rows_system,
         }
         titles = {
-            "display": "DISPLAY", "audio": "AUDIO", "controls": "CONTROLS",
+            "display": "DISPLAY", "audio": "AUDIO", "wifi": "WIFI",
+            "bluetooth": "BLUETOOTH", "controls": "CONTROLS",
             "library": "LIBRARY", "games": "GAME MANAGEMENT",
             "storage": "STORAGE & SAVES", "system": "SYSTEM",
         }
@@ -2919,14 +3376,21 @@ class GBALauncher:
 
     def _rows_audio(self) -> List[dict]:
         s = self.settings
+
+        def _set_volume(v):
+            old = s["volume"]
+            self.set_setting("volume", v)
+            self._show_volume_overlay(v, "up" if v > old else "down")
+
         return [
             {"type": "slider", "label": "Volume", "min": 0, "max": 100, "step": 5,
              "suffix": "%", "hint": "Master output level (ALSA).",
              "key": "volume", "get": lambda: s["volume"],
-             "set": lambda v: self.set_setting("volume", v)},
+             "set": _set_volume},
             {"type": "toggle", "label": "Mute", "hint": "Silence all output.",
              "key": "muted", "get": lambda: s["muted"],
-             "set": lambda v: self.set_setting("muted", v)},
+             "set": lambda v: (self.set_setting("muted", v),
+                               self._show_volume_overlay(s["volume"], "down", muted=v))},
             {"type": "info", "label": "Mixer",
              "value": "ALSA ready" if settings_store.audio_available() else "not found",
              "hint": "Install alsa-utils for hardware volume control."},
@@ -2935,6 +3399,54 @@ class GBALauncher:
              "action": lambda shell: (shell.apply_volume_setting(),
                                       shell.toast("Volume applied", TOAST_OK))},
         ]
+
+    def _rows_wifi(self) -> List[dict]:
+        wifi = settings_store.get_wifi_status()
+        if wifi is None:
+            return [
+                {"type": "info", "label": "Status", "value": "no adapter",
+                 "hint": "No WiFi hardware detected on this machine."},
+            ]
+        rows = [
+            {"type": "info", "label": "Status",
+             "value": "Connected" if wifi.get("connected") else "Disconnected",
+             "hint": f"SSID: {wifi.get('ssid', 'N/A')}" if wifi.get("connected")
+                    else "Not connected to any network."},
+            {"type": "action", "label": "Browse networks",
+             "hint": "Scan and connect to a WiFi network.",
+             "action": lambda shell: shell.push_overlay(WifiOverlay(shell))},
+            {"type": "toggle", "label": "WiFi radio",
+             "hint": "Turn the WiFi adapter on or off.",
+             "key": "wifi_enabled",
+             "get": lambda: wifi.get("connected", False) or True,
+             "set": lambda v: settings_store.toggle_wifi(v)},
+        ]
+        return rows
+
+    def _rows_bluetooth(self) -> List[dict]:
+        bt = settings_store.get_bluetooth_status()
+        if bt is None:
+            return [
+                {"type": "info", "label": "Status", "value": "no adapter",
+                 "hint": "No Bluetooth hardware detected on this machine."},
+            ]
+        rows = [
+            {"type": "info", "label": "Adapter",
+             "value": "On" if bt.get("powered") else "Off",
+             "hint": "Bluetooth adapter power state."},
+            {"type": "info", "label": "Connected",
+             "value": bt.get("device_name", "None") if bt.get("connected") else "None",
+             "hint": "Currently connected Bluetooth device."},
+            {"type": "action", "label": "Manage devices",
+             "hint": "Scan, pair and connect Bluetooth devices.",
+             "action": lambda shell: shell.push_overlay(BluetoothOverlay(shell))},
+            {"type": "toggle", "label": "Bluetooth power",
+             "hint": "Turn the Bluetooth adapter on or off.",
+             "key": "bt_enabled",
+             "get": lambda: bt.get("powered", False),
+             "set": lambda v: settings_store.toggle_bluetooth(v)},
+        ]
+        return rows
 
     def _rows_controls(self) -> List[dict]:
         s = self.settings
@@ -3321,6 +3833,11 @@ class GBALauncher:
         if self.overlay is not None:
             self.overlay.draw(self)
         self.draw_toast()
+        # Draw volume overlay on top (non-blocking, auto-fades)
+        if self._volume_overlay is not None:
+            self._volume_overlay.draw(self)
+            if self._volume_overlay.expired:
+                self._volume_overlay = None
         self.present()
 
     def draw_background(self) -> None:
@@ -3356,20 +3873,39 @@ class GBALauncher:
                          max(1, theme.px(1)))
         theme.wordmark(self.surface, (22, 6))
 
-        # --- right cluster, laid out first so the tabs can never run into it.
+        # --- right cluster, laid out right-to-left so the tabs can never run into it.
         right = self.design_w - 7
+
+        # Battery (far right) with optional charging indicator (lightning bolt)
         battery = get_battery_status()
         if battery:
             level = battery["capacity"]
+            charging = battery.get("status", "").lower() in ("charging", "full")
             body = theme.rect(right - 15, 7, 13, 9)
             pygame.draw.rect(self.surface, c.text_dim, body, width=1, border_radius=theme.px(2))
             pygame.draw.rect(self.surface, c.text_dim,
                              (body.right, body.y + theme.px(2), theme.px(2), theme.px(5)))
             inner = max(0, int((body.width - theme.px(3)) * level / 100.0))
             if inner:
-                pygame.draw.rect(self.surface, c.success if level > 30 else c.danger,
+                color = c.info if charging else (c.success if level > 30 else c.danger)
+                pygame.draw.rect(self.surface, color,
                                  (body.x + theme.px(1.5), body.y + theme.px(1.5),
                                   inner, body.height - theme.px(3)))
+            # Charging indicator: small lightning bolt inside the battery
+            if charging:
+                bx = body.x + body.width // 2
+                by = body.y + theme.px(1)
+                bolt_color = c.highlight
+                px1 = max(1, theme.px(0.8))
+                # Tiny zigzag bolt
+                pygame.draw.line(self.surface, bolt_color,
+                                 (bx, by), (bx - theme.px(1.5), by + theme.px(3.5)), px1)
+                pygame.draw.line(self.surface, bolt_color,
+                                 (bx - theme.px(1.5), by + theme.px(3.5)),
+                                 (bx + theme.px(1), by + theme.px(3.5)), px1)
+                pygame.draw.line(self.surface, bolt_color,
+                                 (bx + theme.px(1), by + theme.px(3.5)),
+                                 (bx - theme.px(0.5), by + theme.px(7)), px1)
             right -= 19
         else:
             cx = theme.px(right - 5)
@@ -3379,6 +3915,7 @@ class GBALauncher:
                              (cx, cy - theme.px(8)), max(1, theme.px(1)))
             right -= 12
 
+        # Clock
         if self.settings.get("show_clock", True):
             now = datetime.datetime.now()
             clock = now.strftime("%H:%M") if self.settings.get("clock_24h", True) \
@@ -3388,6 +3925,56 @@ class GBALauncher:
             self.surface.blit(surf, (theme.px(right) - surf.get_width(),
                                      theme.px(13) - surf.get_height() // 2))
             right -= surf.get_width() / theme.scale + 5
+
+        # Bluetooth icon (left of clock)
+        try:
+            bt_status = settings_store.get_bluetooth_status()
+            if bt_status is not None:
+                right -= 3  # gap
+                ix = theme.px(right - 4)
+                iy = theme.px(8)
+                ih = theme.px(10)
+                bt_color = c.info if bt_status.get("connected") else (
+                    c.text_dim if bt_status.get("powered") else c.text_dim)
+                # Draw Bluetooth rune: angular B shape
+                mid_x = ix + ih // 4
+                pts = [
+                    (mid_x, iy),
+                    (mid_x + ih // 2, iy + ih // 3),
+                    (mid_x, iy + ih // 2),
+                    (mid_x + ih // 2, iy + ih * 2 // 3),
+                    (mid_x, iy + ih),
+                ]
+                lw = max(1, theme.px(0.8))
+                for i in range(len(pts) - 1):
+                    pygame.draw.line(self.surface, bt_color, pts[i], pts[i + 1], lw)
+                # Vertical spine
+                pygame.draw.line(self.surface, bt_color,
+                                 (mid_x, iy), (mid_x, iy + ih), lw)
+                right -= int(ih / theme.scale) + 3
+        except Exception:
+            pass
+
+        # WiFi icon (left of Bluetooth)
+        try:
+            wifi = settings_store.get_wifi_status()
+            if wifi is not None:
+                right -= 3  # gap
+                ix = theme.px(right - 4)
+                iy = theme.px(17)
+                wifi_color = c.info if wifi.get("connected") else c.text_dim
+                lw = max(1, theme.px(0.8))
+                # Draw WiFi arcs (concentric arcs above a dot)
+                dot_r = max(1, theme.px(1))
+                pygame.draw.circle(self.surface, wifi_color, (ix, iy), dot_r)
+                for arc_i in range(1, 4):
+                    arc_r = dot_r + theme.px(arc_i * 1.8)
+                    rect = pygame.Rect(ix - arc_r, iy - arc_r, arc_r * 2, arc_r * 2)
+                    pygame.draw.arc(self.surface, wifi_color, rect,
+                                    220, 320, lw)
+                right -= int((dot_r * 2 + theme.px(5.4)) / theme.scale) + 3
+        except Exception:
+            pass
 
         status = self.usb_status_text()
         if status != "none":
