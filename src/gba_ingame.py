@@ -312,36 +312,260 @@ class IndicatorOverlayModel(OverlayModel):
 
 
 class CheatsOverlayModel(OverlayModel):
-    """Cheats for the currently running game, with enabled/disabled state."""
+    """mGBA cheats with an in-overlay, controller-friendly editor.
+
+    The list keeps the original quick toggle behaviour and adds one explicit
+    Add Cheat row. Editing uses mGBA's native name + code-lines model, so the
+    same GameShark / Action Replay / CodeBreaker text accepted by mGBA can be
+    entered without manually creating a `.cheats` file.
+    """
 
     kind = ACTION_CHEATS
+    MAX_NAME = 48
+    MAX_CODE = 2048
+    KEYBOARD_ROWS = (
+        tuple("1234567890"),
+        tuple("QWERTYUIOP"),
+        tuple("ASDFGHJKL"),
+        tuple("ZXCVBNM+-"),
+        (":", "/", "_", ".", "SPACE"),
+        ("NAME", "CODE", "DELETE", "NEW LINE", "SAVE"),
+    )
 
     def __init__(self, cheat_store, on_close=None):
         super().__init__(on_close)
         self.store = cheat_store
         self.title = "CHEATS"
-        self.subtitle = "A enable / disable · B close"
         self.index = 0
+        self.mode = "list"             # list | edit | delete
+        self.edit_id: Optional[str] = None
+        self.draft_name = ""
+        self.draft_code = ""
+        self.field = 0                 # 0 = name, 1 = code
+        self.key_row = 1
+        self.key_col = 0
+        self._update_subtitle()
 
     def items(self) -> List[Dict[str, Any]]:
         return self.store.cheats()
 
-    def move(self, delta: int) -> None:
+    def selected_item(self) -> Optional[Dict[str, Any]]:
         items = self.items()
-        if not items:
+        return items[self.index] if 0 <= self.index < len(items) else None
+
+    def _update_subtitle(self) -> None:
+        if self.mode == "edit":
+            self.subtitle = "D-pad + A type · B back · keyboard supported"
+        elif self.mode == "delete":
+            self.subtitle = "A confirm delete · B keep cheat"
+        elif self.selected_item() is None:
+            self.subtitle = "A add cheat · B close"
+        else:
+            self.subtitle = "A toggle · Pad X edit · Pad Y delete · B close"
+
+    def _show_list(self) -> None:
+        self.mode = "list"
+        self.edit_id = None
+        self.index = max(0, min(self.index, len(self.items())))
+        self._update_subtitle()
+
+    def move(self, delta: int, dy: Optional[int] = None) -> None:
+        """Old one-argument navigation still works; edit mode accepts dx, dy."""
+        if dy is None or self.mode == "list":
+            amount = delta if dy is None else (dy or delta)
+            if self.mode == "list":
+                # The final row is always Add Cheat, including on an empty list.
+                self.index = (self.index + amount) % (len(self.items()) + 1)
+                self.message = ""
+                self._update_subtitle()
             return
-        self.index = (self.index + delta) % len(items)
+        if self.mode != "edit":
+            return
+        dx = delta
+        if dx:
+            row = self.KEYBOARD_ROWS[self.key_row]
+            self.key_col = (self.key_col + dx) % len(row)
+        if dy:
+            self.key_row = (self.key_row + dy) % len(self.KEYBOARD_ROWS)
+            self.key_col = min(self.key_col, len(self.KEYBOARD_ROWS[self.key_row]) - 1)
+
+    def activate(self) -> bool:
+        if self.mode == "edit":
+            return self.press_key()
+        if self.mode == "delete":
+            return self.confirm_delete()
+        if self.selected_item() is None:
+            return self.begin_add()
+        return self.toggle()
 
     def toggle(self) -> bool:
         items = self.items()
         if not items:
             self.message = "No cheats configured for this game"
             return False
-        item = items[min(self.index, len(items) - 1)]
+        item = self.selected_item()
+        if item is None:
+            return self.begin_add()
         ok = self.store.set_enabled(item["id"], not item["enabled"])
         self.message = (("ENABLED" if not item["enabled"] else "DISABLED")
                         + " " + item["name"]) if ok else "Could not update cheat"
         return ok
+
+    def begin_add(self) -> bool:
+        if self.mode != "list":
+            return False
+        self.mode = "edit"
+        self.edit_id = None
+        self.draft_name = ""
+        self.draft_code = ""
+        self.field = 0
+        self.key_row, self.key_col = 1, 0
+        self.message = "Name your cheat, then choose CODE"
+        self._update_subtitle()
+        return True
+
+    def edit_selected(self) -> bool:
+        if self.mode == "edit":
+            self.backspace()
+            return True
+        if self.mode != "list":
+            return False
+        item = self.selected_item()
+        if item is None:
+            return self.begin_add()
+        self.mode = "edit"
+        self.edit_id = item["id"]
+        self.draft_name = item["name"]
+        self.draft_code = item["code"]
+        self.field = 0
+        self.key_row, self.key_col = 1, 0
+        self.message = "Edit name or code, then choose SAVE"
+        self._update_subtitle()
+        return True
+
+    def request_delete(self) -> bool:
+        if self.mode != "list":
+            return False
+        item = self.selected_item()
+        if item is None:
+            self.message = "Choose a cheat to delete"
+            return False
+        self.mode = "delete"
+        self.message = ""
+        self._update_subtitle()
+        return True
+
+    def confirm_delete(self) -> bool:
+        item = self.selected_item()
+        if self.mode != "delete" or item is None:
+            self._show_list()
+            return False
+        ok = self.store.remove_cheat(item["id"])
+        self.message = ("Deleted " + item["name"]) if ok else "Could not delete cheat"
+        self._show_list()
+        return ok
+
+    def cancel(self) -> None:
+        if self.mode == "list":
+            self.close()
+            return
+        self.message = ""
+        self._show_list()
+
+    def switch_field(self, field: Optional[int] = None) -> None:
+        self.field = ((1 - self.field) if field is None else int(field)) % 2
+        self.message = "Editing NAME" if self.field == 0 else "Editing CODE"
+
+    def insert_text(self, text: str) -> None:
+        if self.mode != "edit" or not isinstance(text, str):
+            return
+        for char in text:
+            if char == "\n" and self.field == 1:
+                if len(self.draft_code) < self.MAX_CODE:
+                    self.draft_code += "\n"
+                continue
+            if not char.isprintable() or char in "\r\n\t":
+                continue
+            if self.field == 0:
+                if len(self.draft_name) < self.MAX_NAME:
+                    self.draft_name += char
+            elif len(self.draft_code) < self.MAX_CODE:
+                # mGBA's code syntax is case-insensitive for the supported
+                # devices; uppercase makes controller-entered codes readable.
+                self.draft_code += char.upper()
+
+    def backspace(self) -> None:
+        if self.mode != "edit":
+            return
+        if self.field == 0:
+            self.draft_name = self.draft_name[:-1]
+        else:
+            self.draft_code = self.draft_code[:-1]
+
+    def press_key(self) -> bool:
+        if self.mode != "edit":
+            return False
+        label = self.KEYBOARD_ROWS[self.key_row][self.key_col]
+        if label == "NAME":
+            self.switch_field(0)
+        elif label == "CODE":
+            self.switch_field(1)
+        elif label == "DELETE":
+            self.backspace()
+        elif label == "NEW LINE":
+            if self.field == 1:
+                self.insert_text("\n")
+            else:
+                self.message = "NEW LINE is used for multiline codes"
+        elif label == "SAVE":
+            return self.save_draft()
+        elif label == "SPACE":
+            self.insert_text(" ")
+        else:
+            self.insert_text(label)
+        return True
+
+    def save_draft(self) -> bool:
+        if self.mode != "edit":
+            return False
+        name = " ".join(self.draft_name.split()).strip()
+        code = "\n".join(line.strip() for line in self.draft_code.splitlines()
+                         if line.strip())
+        if not name:
+            self.field = 0
+            self.message = "Enter a cheat name first"
+            return False
+        if not code:
+            self.field = 1
+            self.message = "Enter at least one mGBA code"
+            return False
+        reserved = ("#", "!", "[")
+        if any(line.startswith(reserved) or line.lower().startswith("cheats =")
+               for line in code.splitlines()):
+            self.field = 1
+            self.message = "Code lines cannot start with #, !, [ or cheats ="
+            return False
+
+        if self.edit_id is None:
+            cheat_id = self.store.add_cheat(name, code, enabled=True)
+            ok = cheat_id is not None
+            success_message = "Cheat added and enabled"
+        else:
+            ok = self.store.update_cheat(self.edit_id, name, code)
+            cheat_id = None
+            success_message = "Cheat updated"
+        if not ok:
+            self.message = "Could not save cheat (duplicate or storage error)"
+            return False
+
+        items = self.items()
+        self.index = next((index for index, item in enumerate(items)
+                           if (cheat_id is not None and item["id"] == cheat_id) or
+                           (item["name"] == name and item["code"] == code)),
+                          max(0, len(items) - 1))
+        self.message = success_message
+        self._show_list()
+        return True
 
 
 class SaveStatesOverlayModel(OverlayModel):

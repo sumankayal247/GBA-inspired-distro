@@ -104,6 +104,30 @@ class TestCheats(StorageTestCase):
                                    data_dir=self.data_dir).cheats()[0]["enabled"])
         self.assertEqual(self.cheats(GAME_B).cheats(), [])
 
+    def test_edit_preserves_enabled_state_and_supports_multiline_codes(self):
+        store = self.cheats()
+        cid = store.add_cheat("Infinite Lives", "01234567 89ABCDEF", enabled=True)
+        self.assertTrue(store.update_cheat(
+            cid, "Infinite Lives + Coins", "01234567 89ABCDEF\nCAFEBABE 00000001"))
+        restarted = self.cheats()
+        self.assertEqual(len(restarted.cheats()), 1)
+        item = restarted.cheats()[0]
+        self.assertEqual(item["name"], "Infinite Lives + Coins")
+        self.assertEqual(item["code"], "01234567 89ABCDEF\nCAFEBABE 00000001")
+        self.assertTrue(item["enabled"])
+        with open(restarted.native_path, encoding="utf-8") as native:
+            self.assertIn("CAFEBABE 00000001", native.read())
+
+    def test_deleting_last_cheat_does_not_reimport_a_stale_native_file(self):
+        store = self.cheats()
+        cid = store.add_cheat("Temporary", "DEADBEEF 00000001", enabled=True)
+        self.assertTrue(os.path.isfile(store.native_path))
+        self.assertTrue(store.remove_cheat(cid))
+        self.assertEqual(store.cheats(), [])
+        self.assertFalse(os.path.exists(store.native_path))
+        self.assertEqual(self.cheats().cheats(), [])
+        self.assertFalse(store.remove_cheat("missing"))
+
     def test_corrupt_metadata_is_tolerated(self):
         store = self.cheats()
         os.makedirs(os.path.dirname(store.metadata_path), exist_ok=True)

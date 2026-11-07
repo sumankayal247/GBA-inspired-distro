@@ -279,9 +279,10 @@ process keeps its SDL/KMS surface and a second pygame window cannot acquire it.
 - **IG4** [TEST: T-INGAME-3] No key event, hotkey or signal MAY be sent to a stopped or exited
   emulator. State capture MUST be refused while the emulator is stopped instead of waiting for a
   timeout.
-- **IG5** [TEST: T-INGAME-4] Cheat toggles MUST persist immediately and MUST reach the restarted
-  emulator through its own `-c` cheat file; a cheat change alone MUST NOT restart the emulator
-  before the overlay has closed.
+- **IG5** [TEST: T-INGAME-4] Cheat additions, edits, deletions and toggles MUST persist immediately
+  and MUST reach the restarted emulator through its own `-c` cheat file; a cheat change alone MUST
+  NOT restart the emulator before the overlay has closed. The overlay MUST provide a controller-
+  usable name/code editor, and destructive deletion MUST require confirmation.
 - **IG6** [TEST: T-INGAME-3] The fast-forward cycle (`1x → 2x → 3x → 1x`) MUST be edge-triggered:
   holding `L + R` MUST produce exactly one transition, and every transition MUST preserve gameplay
   state.
@@ -544,7 +545,7 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 |---|---|---|---|
 | T-INGAME-1 | Open the cheats and the save-state overlay 20 times each on the appliance; also run once with the display deliberately unavailable. | Overlay is drawn over a still frame every time; gameplay resumes at the same point; with no display the game keeps running and a failure is logged. | IG1, IG2, IG7 |
 | T-INGAME-2 | Save into all nine slots, overwrite one, load each in turn, then exit and re-enter the game. | Nine slots, each with thumbnail and timestamp; load restores that exact state; slots are per game and survive a restart; a failed save leaves the previous slot intact. | IG3, SV8 |
-| T-INGAME-3 | Toggle a cheat, close the overlay, re-open; then cycle speed with `L + R` and hold the combo. | Toggled cheat is active in the running game after the restart and still enabled after a re-open; one speed step per deliberate press, state preserved, never frozen. | IG4, IG5, IG6 |
+| T-INGAME-3 | Add a multiline cheat using only the controller, toggle it, close/re-open, edit it, then delete it and confirm the prompt; also cycle speed with `L + R` and hold the combo. | Cheat changes are active after the handoff restart and persist after re-open; deletion never returns from a stale native file; one speed step per deliberate press, state preserved, never frozen. | IG4, IG5, IG6 |
 | T-INGAME-4 | Open each overlay with no `/dev/uinput` access (chmod 000 as a test user). | Overlays still open and close; capture/load report a clear error; the emulator is never left stopped. | IG1, IG2, IG4 |
 | T-INGAME-5 | Kill the overlay renderer (`SIGKILL`) while an overlay is open. | The handler resumes or exits, never leaving a stopped/orphaned mGBA process behind. | IG2, IG7, H8 |
 

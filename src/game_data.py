@@ -244,6 +244,46 @@ class CheatStore:
         self.write_native()
         return cid
 
+    def update_cheat(self, cheat_id: str, name: str, code: str) -> bool:
+        """Edits a cheat in place while keeping its enabled/disabled choice."""
+        if not self.ok or not isinstance(name, str) or not isinstance(code, str):
+            return False
+        name = name.strip()
+        code = "\n".join(line.strip() for line in code.splitlines() if line.strip())
+        if not name or not code:
+            return False
+        new_id = self._cheat_id(name, code)
+        for item in self._data["cheats"]:
+            if item["id"] == new_id and item["id"] != cheat_id:
+                return False               # do not create a duplicate entry
+        for item in self._data["cheats"]:
+            if item["id"] != cheat_id:
+                continue
+            previous = dict(item)
+            item.update({"id": new_id, "name": name, "code": code})
+            if not self._save():
+                item.clear()
+                item.update(previous)
+                return False
+            self.write_native()
+            return True
+        return False
+
+    def remove_cheat(self, cheat_id: str) -> bool:
+        """Deletes one cheat and refreshes (or removes) mGBA's native file."""
+        if not self.ok:
+            return False
+        for index, item in enumerate(self._data["cheats"]):
+            if item["id"] != cheat_id:
+                continue
+            removed = self._data["cheats"].pop(index)
+            if not self._save():
+                self._data["cheats"].insert(index, removed)
+                return False
+            self.write_native()
+            return True
+        return False
+
     def import_native(self, path: Optional[str] = None) -> int:
         """Imports a native mGBA .cheats file without losing known enabled state."""
         path = path or self.native_path
@@ -305,8 +345,19 @@ class CheatStore:
         return False
 
     def write_native(self) -> Optional[str]:
-        """Renders the per-game list in mGBA's native `.cheats` format."""
-        if not self.ok or not self._data["cheats"]:
+        """Renders the per-game list in mGBA's native `.cheats` format.
+
+        Removing the final cheat also removes the old native file. Leaving it
+        behind would make CheatStore re-import the deleted cheat next boot.
+        """
+        if not self.ok:
+            return None
+        if not self._data["cheats"]:
+            try:
+                if os.path.isfile(self.native_path):
+                    os.remove(self.native_path)
+            except OSError:
+                pass
             return None
         lines: List[str] = []
         for item in self._data["cheats"]:
