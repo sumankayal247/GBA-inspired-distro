@@ -304,15 +304,17 @@ def resolve_event_keycode(event) -> int:
         return SCANCODE_TO_KEYCODE[scancode]
     return event.key
 
-# The shipped defaults before the Z -> A / X -> B correction.  They are used
-# only to recognise a *stock* profile written by an older install so it can be
-# migrated without touching anybody's custom bindings.
+# The shipped defaults before the Z -> A / X -> B correction. The reversed pair
+# identifies profiles written by older installs; migration changes only that
+# pair and preserves every unrelated custom binding.
 LEGACY_DEFAULT_KEYBINDINGS = dict(DEFAULT_KEYBINDINGS, keyA=120, keyB=122)
 
 # Bumped whenever the shipped profile changes shape; recorded in
-# `keybindings.json` so an upgrade can tell "untouched defaults" from "the user
-# made choices".  Older files simply have no version key.
-KEYBINDINGS_PROFILE_VERSION = 2
+# `keybindings.json` so an upgrade can tell legacy mappings from choices saved
+# by the current release. Version 3 repairs the reversed A/B pair even when an
+# older profile also contains custom bindings for other buttons.
+KEYBINDINGS_PROFILE_VERSION = 3
+KEYBINDINGS_AB_FIX_VERSION = 3
 
 GBA_BUTTON_ORDER = [
     ("keyUp", "D-PAD UP"),
@@ -345,15 +347,29 @@ def is_legacy_default_profile(bindings: dict) -> bool:
     return True
 
 
-def migrate_legacy_keybindings(bindings: dict) -> dict:
-    """Rewrites a stock old-default profile to the shipped defaults.
+def migrate_legacy_keybindings(bindings: dict, profile_version: int = 0) -> dict:
+    """Repairs legacy reversed A/B keys without discarding other custom keys.
 
-    Customised profiles (any key differing from the old shipped values) are
-    returned unchanged, which is what keeps a user's Z/X choice intact.
+    Older releases migrated only an *exact* stock profile. Consequently a user
+    who had changed (for example) R kept X=A/Z=B in mGBA while the shell still
+    used its hardcoded Z=A/X=B navigation. Every unversioned, v1 or v2 profile
+    with that reversed pair is therefore upgraded here, independently of the
+    other buttons. A profile saved by v3+ is an explicit current choice and is
+    left alone, so the remapping UI remains fully customisable.
     """
-    if is_legacy_default_profile(bindings):
+    if not isinstance(bindings, dict):
         return dict(DEFAULT_KEYBINDINGS)
-    return dict(bindings) if isinstance(bindings, dict) else dict(DEFAULT_KEYBINDINGS)
+    result = dict(bindings)
+    try:
+        version = int(profile_version or 0)
+    except (TypeError, ValueError):
+        version = 0
+    if version < KEYBINDINGS_AB_FIX_VERSION and \
+            result.get("keyA") == LEGACY_DEFAULT_KEYBINDINGS["keyA"] and \
+            result.get("keyB") == LEGACY_DEFAULT_KEYBINDINGS["keyB"]:
+        result["keyA"] = DEFAULT_KEYBINDINGS["keyA"]
+        result["keyB"] = DEFAULT_KEYBINDINGS["keyB"]
+    return result
 
 
 def load_keybindings() -> dict:
@@ -370,7 +386,8 @@ def load_keybindings() -> dict:
                 for k, v in data.items():
                     if k in bindings and isinstance(v, int) and not isinstance(v, bool):
                         bindings[k] = v
-                return sanitize_keybindings(migrate_legacy_keybindings(bindings))
+                return sanitize_keybindings(migrate_legacy_keybindings(
+                    bindings, data.get("version", 0)))
         except Exception:
             pass
 

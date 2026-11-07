@@ -94,13 +94,33 @@ class TestCommonHelpers(unittest.TestCase):
         bindings = self.load_isolated()
         self.assertEqual(bindings["keyA"], 113)
         self.assertEqual(bindings["keyR"], 114)
-        # A profile that also changed another button keeps its Z/X choice,
-        # even when that choice looks like the old shipped pair.
+        # An older profile with the reversed stock pair is repaired even when
+        # another button was customised; that other customisation survives.
         custom = dict(common.LEGACY_DEFAULT_KEYBINDINGS, keyR=114)
         with open(path, "w") as f:
             json.dump(custom, f)
         bindings = self.load_isolated()
+        self.assertEqual((bindings["keyA"], bindings["keyB"]), (122, 120))
+        self.assertEqual(bindings["keyR"], 114)
+        custom["version"] = 2
+        with open(path, "w") as f:
+            json.dump(custom, f)
+        bindings = self.load_isolated()
+        self.assertEqual((bindings["keyA"], bindings["keyB"]), (122, 120))
+        self.assertEqual(bindings["keyR"], 114)
+
+        # Once saved by the current profile version, even an intentionally
+        # reversed custom pair is a user choice and must survive future loads.
+        custom["version"] = common.KEYBINDINGS_PROFILE_VERSION
+        with open(path, "w") as f:
+            json.dump(custom, f)
+        bindings = self.load_isolated()
         self.assertEqual((bindings["keyA"], bindings["keyB"]), (120, 122))
+        self.assertEqual(bindings["keyR"], 114)
+        custom["version"] = common.KEYBINDINGS_PROFILE_VERSION + 1
+        with open(path, "w") as f:
+            json.dump(custom, f)
+        self.assertEqual(self.load_isolated()["keyA"], 120)
 
     def test_save_keybindings_records_a_profile_version(self):
         common.save_keybindings(common.DEFAULT_KEYBINDINGS)
