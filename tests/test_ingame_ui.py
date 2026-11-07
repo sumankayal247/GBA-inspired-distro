@@ -109,6 +109,50 @@ class OverlayUITestCase(unittest.TestCase):
         self.renderer.handle(self._event(pygame.JOYBUTTONDOWN, button=1))
         self.assertIsNone(self.session.overlay)
 
+    def test_empty_overlay_add_flow_supports_physical_keyboard(self):
+        self.session.open_overlay("cheats")
+        self.assertTrue(self.renderer.open())
+        self.renderer.handle(self._event(pygame.KEYDOWN, key=pygame.K_RETURN))
+        model = self.session.overlay
+        self.assertEqual(model.mode, "edit")
+        for char in "Max HP":
+            self.renderer.handle(self._event(pygame.KEYDOWN, key=ord(char.lower()),
+                                             unicode=char, mod=0))
+        self.renderer.handle(self._event(pygame.KEYDOWN, key=pygame.K_TAB,
+                                         unicode="\t", mod=0))
+        for char in "01234567 89abcdef":
+            self.renderer.handle(self._event(pygame.KEYDOWN, key=ord(char.lower()),
+                                             unicode=char, mod=0))
+        self.renderer.draw()
+        self.renderer.handle(self._event(pygame.KEYDOWN, key=pygame.K_RETURN,
+                                         unicode="\r", mod=0))
+        self.assertEqual(model.mode, "list")
+        self.assertEqual(self.cheats.cheats()[0]["name"], "Max HP")
+        self.assertEqual(self.cheats.cheats()[0]["code"], "01234567 89ABCDEF")
+        self.assertTrue(self.cheats.cheats()[0]["enabled"])
+
+    def test_gamepad_and_mouse_drive_the_on_screen_keyboard(self):
+        self.session.open_overlay("cheats")
+        self.assertTrue(self.renderer.open())
+        self.renderer.handle(self._event(pygame.JOYBUTTONDOWN, button=0))
+        model = self.session.overlay
+        self.assertEqual(model.mode, "edit")
+        # Q is selected initially; controller A inserts it into NAME.
+        self.renderer.handle(self._event(pygame.JOYBUTTONDOWN, button=0))
+        self.assertEqual(model.draft_name, "Q")
+        # Clicking CODE changes fields; clicking A enters a code character.
+        code_rect = self.renderer._cheat_key_geometry(5, 1)
+        self.renderer.handle(self._event(pygame.MOUSEBUTTONDOWN, button=1,
+                                         pos=code_rect.center))
+        self.assertEqual(model.field, 1)
+        a_rect = self.renderer._cheat_key_geometry(2, 0)
+        self.renderer.handle(self._event(pygame.MOUSEBUTTONDOWN, button=1,
+                                         pos=a_rect.center))
+        self.assertEqual(model.draft_code, "A")
+        self.renderer.draw()
+        self.renderer.handle(self._event(pygame.JOYBUTTONDOWN, button=1))
+        self.assertEqual(model.mode, "list")
+
     def test_save_states_overlay_renders_nine_cards_with_thumbnails(self):
         thumbnail = os.path.join(self.root, "thumb.png")
         pygame.image.save(pygame.Surface((48, 32)), thumbnail)

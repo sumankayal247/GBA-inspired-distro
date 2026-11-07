@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Contract](https://img.shields.io/badge/Contract-Draft%202%20(V1)-purple.svg)](docs/CONTRACT.md)
-[![Tests](https://img.shields.io/badge/Tests-412%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/Tests-526%20passing-brightgreen.svg)](tests)
 [![Safe by default](https://img.shields.io/badge/install-safe%20by%20default-blue.svg)](docs/SAFETY.md)
 
 **GBA OS** is an appliance-style Linux operating system experience designed to turn any PC or laptop into a dedicated Game Boy Advance console.
@@ -20,6 +20,8 @@ Power On -> GRUB Menu -> GBA OS -> Game Library -> Play Game -> Return to Librar
 ```
 
 - **Zero Desktop Bloat:** Direct KMS/DRM display output. No window manager, panels, or login screens.
+- **Original GBA-style startup:** a skippable cartridge-and-handheld boot animation covers first-scan
+  work without holding the UI hostage; returning from a game goes straight back to the shelf.
 - **Controller-First:** Full gamepad support (including hot-plug) with a keyboard fallback.
 - **Managed Saves:** Saves and states are stored per game under `/data/saves/<entry-id>/`, with a
   last-known-good backup that survives a hard power cut.
@@ -84,6 +86,8 @@ The shell itself is deliberately small and single-purpose per module:
 | `src/gba_ingame.py` | shortcut router, fast-forward cycle, overlay models, session state (no GUI dependency) |
 | `src/gba_updater.py` | anonymous GitHub self-update: reachability probe, commit compare, shallow clone, installer hand-off |
 | `src/gba_ingame_ui.py` | pygame/Theme overlay renderer used *inside the mGBA handler* |
+| `src/gba_boot.py` | original cartridge/handheld startup animation and bounded timing policy |
+| `src/gba_status.py` | background WiFi/Bluetooth probes with lock-protected, non-blocking UI snapshots |
 
 ### Process Lifecycle
 1. **Supervisor** starts and executes `gba-launcher`.
@@ -249,9 +253,13 @@ gameplay input.
 
 | Action | Default combo | Behaviour |
 | :--- | :--- | :--- |
-| **Cheats Overlay** | `Up + Left` | Only this game's cheats; `A` toggles one with an `ENABLED`/`DISABLED` chip, `B` closes. |
+| **Cheats Overlay** | `Up + Left` | Only this game's cheats. `A` toggles a cheat or opens **Add Cheat**, `X` edits, `Y` asks before deleting, and `B` goes back/closes. |
 | **Fast-Forward Cycle** | `L + R` | Each deliberate press cycles `1x → 2x → 3x → Normal`, showing a temporary `2x` / `3x` / `Normal` badge. |
 | **Save States Overlay** | `Left + Right` | Exactly nine slots in a 3×3 grid with thumbnails and timestamps; `Load Save` / `Overwrite Save` for occupied slots. |
+
+In the cheat list, **Pad X** edits and **Pad Y** requests deletion. On a physical keyboard, use `E`
+to edit and `Delete` to request deletion; `N` or `F2` opens Add Cheat directly, while `Esc` /
+`Backspace` retains the usual B/back behaviour.
 
 All three are configurable under **SETTINGS → Controls → In-game shortcuts** (press `A` on a row,
 then two distinct controller or keyboard buttons; `R` resets to defaults). They are stored in the
@@ -272,9 +280,16 @@ DATA/saves/<content-id>/
 DATA/config/favorites.json       # content ids, stable favorites-first ordering
 ```
 
+Choose **+ ADD CHEAT** in the overlay to enter a name and one or more mGBA code lines directly. The
+on-screen keyboard works with a D-pad and `A` (including **NAME**, **CODE**, **DELETE**, **NEW LINE**
+and **SAVE** actions), or you can type on a physical keyboard: `Tab` changes field, `Enter` saves,
+and `Shift+Enter` inserts a code newline. New cheats start enabled; edits preserve the existing
+enabled/disabled choice. GameShark, Action Replay and CodeBreaker text uses the same native mGBA
+format as manually imported cheats, so no file-manager trip is needed.
+
 Cheats are loaded through mGBA's own `-c <file>` mechanism (`cheatAutoload=0` when a game has none,
-so no global list leaks in); toggling one persists immediately and the restart above picks it up, so
-the change is active in the running game. Save/load use mGBA's native state hotkeys — sent only while
+so no global list leaks in); adding, editing or toggling one persists immediately and the restart
+above picks it up, so the change is active in the running game. Save/load use mGBA's native state hotkeys — sent only while
 mGBA is *running*, which is exactly the moment the handoff captures them. Screenshots are separate
 PNGs. Speed uses mGBA's real `fpsTarget` (60/120/180) rather than skipped frames or hand-written
 timing. Slots are written atomically (temp file + `os.replace`), verified by size + SHA-256 on load,

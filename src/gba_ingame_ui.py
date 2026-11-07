@@ -201,10 +201,19 @@ class InGameOverlayRenderer:
             return                            # badge is not interactive
         if event.type == pygame.KEYDOWN:
             key = event.key
+            if isinstance(model, CheatsOverlayModel) and model.mode == "edit":
+                self._cheat_editor_key(model, event)
+                return
             if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE, pygame.K_x):
                 self._cancel(model)
             elif key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_z, pygame.K_SPACE):
                 self._activate(model)
+            elif isinstance(model, CheatsOverlayModel) and key in (pygame.K_n, pygame.K_F2):
+                model.begin_add()
+            elif isinstance(model, CheatsOverlayModel) and key == pygame.K_e:
+                model.edit_selected()
+            elif isinstance(model, CheatsOverlayModel) and key == pygame.K_DELETE:
+                model.request_delete()
             elif key == pygame.K_UP:
                 self._move(model, 0, -1)
             elif key == pygame.K_DOWN:
@@ -224,6 +233,13 @@ class InGameOverlayRenderer:
                 self._activate(model)
             elif event.button == 1:
                 self._cancel(model)
+            elif isinstance(model, CheatsOverlayModel) and event.button == 2:
+                model.edit_selected()       # X: edit, or backspace in editor
+            elif isinstance(model, CheatsOverlayModel) and event.button == 3:
+                if model.mode == "edit":
+                    model.switch_field()    # Y: jump between name and code
+                else:
+                    model.request_delete()  # Y: delete (with confirmation)
             elif event.button in (6, 8, 4):
                 self._cancel(model)
             return
@@ -231,25 +247,54 @@ class InGameOverlayRenderer:
             self._click(model, event.pos)
             return
 
+    def _cheat_editor_key(self, model, event) -> None:
+        """Physical keyboard input for the same draft driven by the OSK."""
+        key = event.key
+        if key == pygame.K_ESCAPE:
+            model.cancel()
+        elif key == pygame.K_BACKSPACE:
+            model.backspace()
+        elif key == pygame.K_TAB:
+            model.switch_field()
+        elif key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            if getattr(event, "mod", 0) & pygame.KMOD_SHIFT and model.field == 1:
+                model.insert_text("\n")
+            else:
+                model.save_draft()
+        elif key == pygame.K_UP:
+            model.move(0, -1)
+        elif key == pygame.K_DOWN:
+            model.move(0, 1)
+        elif key == pygame.K_LEFT:
+            model.move(-1, 0)
+        elif key == pygame.K_RIGHT:
+            model.move(1, 0)
+        else:
+            char = getattr(event, "unicode", "")
+            if char:
+                model.insert_text(char)
+
     def _activate(self, model) -> None:
         try:
-            if isinstance(model, CheatsOverlayModel):
-                model.toggle()
-            else:
-                model.activate()
+            model.activate()
         except Exception as exc:
             self._log("Overlay action failed: %s", exc)
             model.message = "Action failed"
 
     def _cancel(self, model) -> None:
-        if isinstance(model, SaveStatesOverlayModel) and model.mode != "grid":
+        if isinstance(model, CheatsOverlayModel):
+            model.cancel()
+        elif isinstance(model, SaveStatesOverlayModel) and model.mode != "grid":
             model.cancel()
         else:
             model.close()
 
     def _move(self, model, dx: int, dy: int) -> None:
         if isinstance(model, CheatsOverlayModel):
-            model.move(dy or dx)
+            if model.mode == "edit":
+                model.move(dx, dy)
+            else:
+                model.move(dy or dx)
         else:
             model.move(dx, dy)
 
@@ -257,12 +302,21 @@ class InGameOverlayRenderer:
         """Mouse fallback: click to select, click the selection again to act."""
         try:
             if isinstance(model, CheatsOverlayModel):
+                if model.mode == "edit":
+                    key = self._cheat_key_at(pos)
+                    if key is not None:
+                        model.key_row, model.key_col = key
+                        self._activate(model)
+                    return
+                if model.mode != "list":
+                    return
                 row = self._cheat_row_at(pos)
                 if row is not None:
                     if row == model.index:
                         self._activate(model)
                     else:
                         model.index = row
+                        model._update_subtitle()
             else:
                 cell = self._slot_cell_at(pos)
                 if cell is not None:
@@ -292,14 +346,52 @@ class InGameOverlayRenderer:
         y = (self.design_h - height) / 2
         return self.theme.rect(x, y, width, height)
 
+    @staticmethod
+    def _cheat_list_window(model):
+        total = len(model.items()) + 1      # cheats + Add Cheat
+        visible = min(total, 9)
+        start = max(0, min(model.index - visible + 1, total - visible)) \
+            if total > visible else 0
+        return start, visible
+
     def _cheat_row_at(self, pos):
+        model = self.session.overlay
+        if not isinstance(model, CheatsOverlayModel):
+            return None
         rect = self.panel_rect()
         theme = self.theme
-        top = rect.y / theme.scale + 44
+        top = rect.y / theme.scale + 32
         row_h = 22.0
         row = int((pos[1] / theme.scale - top) // row_h)
+        start, visible = self._cheat_list_window(model)
+        if not 0 <= row < visible or pos[1] / theme.scale < top:
+            return None
+        index = start + row
+        return index if index < len(model.items()) + 1 else None
+
+    def _cheat_key_geometry(self, row_index, col_index):
+        """Pixel rect for one on-screen keyboard key."""
+        rect = self.panel_rect()
+        theme = self.theme
         model = self.session.overlay
-        return row if 0 <= row < len(model.items()) else None
+        labels = model.KEYBOARD_ROWS[row_index]
+        x0 = rect.x / theme.scale + 8
+        y0 = rect.y / theme.scale + 109
+        width = rect.width / theme.scale - 16
+        gap = 2.0
+        key_w = (width - gap * (len(labels) - 1)) / len(labels)
+        return theme.rect(x0 + col_index * (key_w + gap),
+                          y0 + row_index * 19, key_w, 17)
+
+    def _cheat_key_at(self, pos):
+        model = self.session.overlay
+        if not isinstance(model, CheatsOverlayModel):
+            return None
+        for row, labels in enumerate(model.KEYBOARD_ROWS):
+            for col in range(len(labels)):
+                if self._cheat_key_geometry(row, col).collidepoint(pos):
+                    return row, col
+        return None
 
     def _slot_geometry(self):
         rect = self.panel_rect()
@@ -350,7 +442,12 @@ class InGameOverlayRenderer:
         rect = self.panel_rect()
         theme.panel(surface, rect, fill=c.panel, border=c.primary,
                     radius=8, width=1.4)
-        theme.text(surface, model.title,
+        title = model.title
+        if isinstance(model, CheatsOverlayModel) and model.mode == "edit":
+            title = "EDIT CHEAT" if model.edit_id else "ADD CHEAT"
+        elif isinstance(model, CheatsOverlayModel) and model.mode == "delete":
+            title = "DELETE CHEAT"
+        theme.text(surface, title,
                    (rect.centerx / theme.scale, rect.y / theme.scale + 6),
                    "header", c.highlight, align="center")
         theme.label(surface, model.subtitle,
@@ -372,22 +469,23 @@ class InGameOverlayRenderer:
         self._draw_indicator()
 
     def _draw_cheats(self, model, rect) -> None:
+        if model.mode == "edit":
+            self._draw_cheat_editor(model, rect)
+            return
+        self._draw_cheat_list(model, rect)
+        if model.mode == "delete":
+            self._draw_cheat_delete(model, rect)
+
+    def _draw_cheat_list(self, model, rect) -> None:
         theme, c = self.theme, self.theme.colors
         surface = self.surface
         items = model.items()
         x0 = rect.x / theme.scale + 8
         y0 = rect.y / theme.scale + 32
         width = rect.width / theme.scale - 16
-        if not items:
-            theme.text(surface, "No cheats for this game", (x0 + 2, y0 + 8),
-                       "body", c.text_muted)
-            theme.label(surface, "Put a .cheats file in DATA/saves/<id>/cheats/.",
-                        (x0 + 2, y0 + 26), c.text_dim)
-            return
-        visible = min(len(items), 9)
-        start = max(0, min(model.index - visible + 1, len(items) - visible))
+        start, visible = self._cheat_list_window(model)
         for offset, index in enumerate(range(start, start + visible)):
-            item = items[index]
+            item = items[index] if index < len(items) else None
             y = y0 + offset * 22
             row = theme.rect(x0, y, width, 20)
             selected = index == model.index
@@ -395,6 +493,15 @@ class InGameOverlayRenderer:
                 pygame.draw.rect(surface, c.card_sel, row, border_radius=theme.px(4))
                 pygame.draw.rect(surface, c.highlight, row, width=1,
                                  border_radius=theme.px(4))
+            if item is None:
+                # An explicit action, not a filesystem instruction or a hidden
+                # hotkey. On an empty list this is selected immediately.
+                theme.label(surface, "+  ADD CHEAT", (x0 + 6, y + 4),
+                            c.success if selected else c.info, key="body_bold")
+                theme.label(surface, "NAME + MGBA CODE",
+                            (x0 + width - 6, y + 6), c.text_dim,
+                            key="micro", align="right")
+                continue
             name = self._fit(item["name"], theme.font("body"),
                              theme.px(width - 60))
             theme.label(surface, name, (x0 + 5, y + 5),
@@ -407,6 +514,106 @@ class InGameOverlayRenderer:
             theme.label(surface, state,
                         (x0 + width - 25, y + 5.5), color, key="micro",
                         align="center")
+
+        if not items:
+            theme.label(surface, "No cheats yet — add one in seconds.",
+                        (x0 + 4, y0 + 31), c.text_muted, key="body")
+            theme.label(surface, "GameShark · Action Replay · CodeBreaker",
+                        (x0 + 4, y0 + 46), c.text_dim, key="small")
+            theme.label(surface, "Use the on-screen keyboard or type directly.",
+                        (x0 + 4, y0 + 59), c.text_dim, key="micro")
+        elif len(items) + 1 > visible:
+            theme.label(surface, f"{model.index + 1}/{len(items) + 1}",
+                        (x0 + width, y0 + visible * 22 + 2), c.text_dim,
+                        key="micro", align="right")
+
+    def _draw_cheat_editor(self, model, rect) -> None:
+        theme, c = self.theme, self.theme.colors
+        surface = self.surface
+        x0 = rect.x / theme.scale + 8
+        y0 = rect.y / theme.scale + 32
+        width = rect.width / theme.scale - 16
+        fields = (
+            ("NAME", model.draft_name, "Infinite lives", y0 + 9, 18),
+            ("CODE  (mGBA)", model.draft_code, "01234567 89ABCDEF", y0 + 40, 31),
+        )
+        for field_index, (label, value, placeholder, y, height) in enumerate(fields):
+            active = model.field == field_index
+            theme.label(surface, label, (x0 + 2, y - 8),
+                        c.highlight if active else c.text_dim, key="micro")
+            box = theme.rect(x0, y, width, height)
+            pygame.draw.rect(surface, c.panel_alt, box, border_radius=theme.px(3))
+            pygame.draw.rect(surface, c.primary if active else c.border_soft,
+                             box, width=max(1, theme.px(1)),
+                             border_radius=theme.px(3))
+            if not value:
+                theme.label(surface, placeholder, (x0 + 5, y + 5),
+                            c.text_dim, key="small")
+                continue
+            lines = value.splitlines() or [value]
+            if field_index == 0:
+                lines = [lines[0]]
+            else:
+                lines = lines[-2:]
+            for line_index, line in enumerate(lines):
+                shown = self._fit(line, theme.mono(8), box.width - theme.px(10))
+                theme.label(surface, shown, (x0 + 5, y + 3 + line_index * 12),
+                            c.text, key="small")
+            if active and (time.monotonic() % 1.0) < 0.6:
+                # A small cursor makes the active field obvious even when the
+                # player is using only the controller keyboard.
+                last = lines[-1]
+                cursor_x = box.x + theme.px(5) + min(
+                    theme.font("small").size(last)[0], box.width - theme.px(11))
+                pygame.draw.line(surface, c.highlight,
+                                 (cursor_x, box.y + theme.px(4)),
+                                 (cursor_x, box.bottom - theme.px(4)), 1)
+
+        for row_index, labels in enumerate(model.KEYBOARD_ROWS):
+            for col_index, label in enumerate(labels):
+                key = self._cheat_key_geometry(row_index, col_index)
+                selected = (row_index, col_index) == (model.key_row, model.key_col)
+                fill = c.card_sel if selected else c.panel_alt
+                border = c.highlight if selected else c.border_soft
+                pygame.draw.rect(surface, fill, key, border_radius=theme.px(2))
+                pygame.draw.rect(surface, border, key, width=1,
+                                 border_radius=theme.px(2))
+                color = c.text if selected else c.text_muted
+                if label == "SAVE":
+                    color = c.success if selected else c.success
+                fitted = self._fit(label, theme.font("micro"), key.width - theme.px(3))
+                theme.label(surface, fitted,
+                            (key.centerx / theme.scale, key.y / theme.scale + 5),
+                            color, key="micro", align="center")
+        theme.label(surface, "A press key · B back · Tab field · Enter save · Shift+Enter new line",
+                    (rect.centerx / theme.scale, rect.bottom / theme.scale - 28),
+                    c.text_dim, key="micro", align="center")
+
+    def _draw_cheat_delete(self, model, rect) -> None:
+        theme, c = self.theme, self.theme.colors
+        item = model.selected_item()
+        if item is None:
+            return
+        shade = pygame.Surface(self.surface.get_size(), pygame.SRCALPHA)
+        shade.fill((6, 4, 14, 150))
+        self.surface.blit(shade, (0, 0))
+        box = theme.rect((self.design_w - 250) / 2,
+                         (self.design_h - 88) / 2, 250, 88)
+        theme.panel(self.surface, box, fill=c.panel, border=c.danger,
+                    radius=7, width=1.4)
+        theme.text(self.surface, "DELETE THIS CHEAT?",
+                   (box.centerx / theme.scale, box.y / theme.scale + 9),
+                   "body_bold", c.danger, align="center")
+        name = self._fit(item["name"], theme.font("body"), box.width - theme.px(20))
+        theme.label(self.surface, name,
+                    (box.centerx / theme.scale, box.y / theme.scale + 30),
+                    c.text, key="body", align="center")
+        theme.label(self.surface, "This cannot be undone.",
+                    (box.centerx / theme.scale, box.y / theme.scale + 47),
+                    c.text_muted, key="small", align="center")
+        theme.label(self.surface, "[A] DELETE     [B] KEEP CHEAT",
+                    (box.centerx / theme.scale, box.bottom / theme.scale - 20),
+                    c.highlight, key="small", align="center")
 
     def _draw_states(self, model, rect) -> None:
         theme, c = self.theme, self.theme.colors

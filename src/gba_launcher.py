@@ -22,6 +22,7 @@ Design notes
 import argparse
 import datetime
 import json
+import math
 import os
 import shutil
 import sys
@@ -75,8 +76,10 @@ from common import (
     setup_logging,
 )
 import game_data
+from gba_boot import BootAnimation
 from gba_browser import Browser
 from gba_ingame import button_from_key, button_from_joy_button, buttons_from_hat
+from gba_status import SystemStatusMonitor
 from gba_terminal import TerminalScreen, TerminalSession, TerminalView, key_to_bytes
 from gba_usb import (MtpManager, VolumeWatcher, import_roms, list_import_sources,
                      list_mounted_mtp_volumes, list_mounted_volumes,
@@ -1779,6 +1782,7 @@ class WifiOverlay(Overlay):
             self._password_buffer = ""
             return
         ok, msg = settings_store.connect_wifi(ssid)
+        shell.status_monitor.request_refresh()
         if ok:
             shell.toast(f"Connected to {ssid}", TOAST_OK)
             self._load_networks()
@@ -1804,6 +1808,7 @@ class WifiOverlay(Overlay):
                     pwd = self._password_buffer
                     self._password_buffer = ""
                     ok, msg = settings_store.connect_wifi(ssid, pwd)
+                    shell.status_monitor.request_refresh()
                     if ok:
                         shell.toast(f"Connected to {ssid}", TOAST_OK)
                         self._load_networks()
@@ -1940,6 +1945,7 @@ class BluetoothOverlay(Overlay):
         powered = self.status.get("powered", False)
         settings_store.toggle_bluetooth(not powered)
         self.status = settings_store.get_bluetooth_status()
+        shell.status_monitor.request_refresh()
         shell.toast("Bluetooth " + ("on" if not powered else "off"), TOAST_OK)
 
     def _connect_device(self, shell, device):
@@ -1953,6 +1959,7 @@ class BluetoothOverlay(Overlay):
             ok, msg = settings_store.connect_bluetooth(mac)
             shell.toast(f"Connected to {name}" if ok else msg, TOAST_OK if ok else TOAST_ERROR)
         self.status = settings_store.get_bluetooth_status()
+        shell.status_monitor.request_refresh()
 
     def handle(self, event, shell) -> None:
         if event.type == pygame.QUIT:
@@ -2248,6 +2255,15 @@ class GBALauncher:
             self._apply_focus()
         else:
             self.scanner = self.library.start_scan()
+
+        # Hardware probes can take seconds (NetworkManager/bluetoothctl). They
+        # run here, never in draw_top_bar(), so first-boot rendering and input
+        # stay responsive even when an adapter or system bus is slow.
+        self.status_monitor = SystemStatusMonitor(
+            wifi_provider=settings_store.get_wifi_status,
+            bluetooth_provider=settings_store.get_bluetooth_status)
+        if not screenshot_path:
+            self.status_monitor.start()
 
         self.clock = pygame.time.Clock()
 
@@ -3291,6 +3307,8 @@ class GBALauncher:
             self.configure_usb_watcher()
         elif key == "brightness":
             settings_store.set_brightness(self.settings.get("brightness", 100))
+        if key in ("wifi_enabled", "bt_enabled"):
+            self.status_monitor.request_refresh()
 
     def apply_volume_setting(self) -> None:
         settings_store.apply_volume(self.settings.get("volume", 85),
@@ -3926,66 +3944,47 @@ class GBALauncher:
                                      theme.px(13) - surf.get_height() // 2))
             right -= surf.get_width() / theme.scale + 5
 
-        # Bluetooth icon (left of clock)
-        try:
-            bt_status = settings_store.get_bluetooth_status()
-            if bt_status is not None:
-                right -= 3  # gap
-                ix = theme.px(right - 4)
-                iy = theme.px(8)
-                ih = theme.px(10)
-                bt_color = c.info if bt_status.get("connected") else (
-                    c.text_dim if bt_status.get("powered") else c.text_dim)
-                # Draw Bluetooth rune: angular B shape
-                mid_x = ix + ih // 4
-                pts = [
-                    (mid_x, iy),
-                    (mid_x + ih // 2, iy + ih // 3),
-                    (mid_x, iy + ih // 2),
-                    (mid_x + ih // 2, iy + ih * 2 // 3),
-                    (mid_x, iy + ih),
-                ]
-                lw = max(1, theme.px(0.8))
-                for i in range(len(pts) - 1):
-                    pygame.draw.line(self.surface, bt_color, pts[i], pts[i + 1], lw)
-                # Vertical spine
-                pygame.draw.line(self.surface, bt_color,
-                                 (mid_x, iy), (mid_x, iy + ih), lw)
-                right -= int(ih / theme.scale) + 3
-        except Exception:
-            pass
+        # Connection-only indicators. The monitor performs all hardware I/O in
+        # the background; this method only reads its in-memory snapshot. USB
+        # import still has its own prompts/pages, but no longer crowds the bar.
+        status = self.status_monitor.snapshot()
 
-        # WiFi icon (left of Bluetooth)
-        try:
-            wifi = settings_store.get_wifi_status()
-            if wifi is not None:
-                right -= 3  # gap
-                ix = theme.px(right - 4)
-                iy = theme.px(17)
-                wifi_color = c.info if wifi.get("connected") else c.text_dim
-                lw = max(1, theme.px(0.8))
-                # Draw WiFi arcs (concentric arcs above a dot)
-                dot_r = max(1, theme.px(1))
-                pygame.draw.circle(self.surface, wifi_color, (ix, iy), dot_r)
-                for arc_i in range(1, 4):
-                    arc_r = dot_r + theme.px(arc_i * 1.8)
-                    rect = pygame.Rect(ix - arc_r, iy - arc_r, arc_r * 2, arc_r * 2)
-                    pygame.draw.arc(self.surface, wifi_color, rect,
-                                    220, 320, lw)
-                right -= int((dot_r * 2 + theme.px(5.4)) / theme.scale) + 3
-        except Exception:
-            pass
+        # Bluetooth icon (left of clock), shown only for a connected device.
+        bluetooth = status.get("bluetooth")
+        if bluetooth and bluetooth.get("connected"):
+            right -= 16
+            icon = theme.rect(right, 5, 12, 15)
+            cx = icon.x + theme.px(4)
+            top = icon.y + theme.px(1)
+            bottom = icon.bottom - theme.px(1)
+            cy = (top + bottom) // 2
+            wing = theme.px(3.5)
+            lw = max(1, theme.px(0.8))
+            points = [(cx, top), (cx + wing, top + (cy - top) // 2),
+                      (cx - wing, cy + (bottom - cy) // 2),
+                      (cx + wing, bottom - (bottom - cy) // 3), (cx, bottom)]
+            pygame.draw.lines(self.surface, c.info, False, points, lw)
+            pygame.draw.line(self.surface, c.info, (cx, top), (cx, bottom), lw)
+            right -= 4
 
-        status = self.usb_status_text()
-        if status != "none":
-            font = theme.font("micro")
-            text = font.render(status.split(" (")[0], True, c.bg_deep)
-            chip = pygame.Rect(0, 0, text.get_width() + theme.px(8), theme.px(12))
-            chip.topright = (theme.px(right), theme.px(7))
-            pygame.draw.rect(self.surface, c.info, chip, border_radius=theme.px(6))
-            self.surface.blit(text, (chip.x + theme.px(4),
-                                     chip.centery - text.get_height() // 2))
-            right -= chip.width / theme.scale + 5
+        # WiFi icon (left of Bluetooth), shown only while actually connected.
+        # Correct radians and a fixed bounding box keep the arcs centred and
+        # prevent the old glyph from spilling into the clock.
+        wifi = status.get("wifi")
+        if wifi and wifi.get("connected"):
+            right -= 20
+            icon = theme.rect(right, 5, 16, 15)
+            cx = icon.centerx
+            cy = icon.bottom - theme.px(2)
+            pygame.draw.circle(self.surface, c.info, (cx, cy), theme.px(1.1))
+            for radius_units in (3.0, 5.0, 7.0):
+                radius = theme.px(radius_units)
+                arc_rect = pygame.Rect(cx - radius, cy - radius,
+                                       radius * 2, radius * 2)
+                pygame.draw.arc(self.surface, c.info, arc_rect,
+                                math.radians(42), math.radians(138),
+                                max(1, theme.px(0.75)))
+            right -= 4
 
         if self.filter_text and self.current_tab == TAB_GAMES:
             font = theme.font("micro")
@@ -4186,9 +4185,8 @@ class GBALauncher:
                 theme.label(self.surface, "FAV",
                             (box.right / theme.scale - 24,
                              box.y / theme.scale + 2), c.highlight, key="micro")
-            if selected:
-                theme.label(self.surface, ">", (box.right / theme.scale - 7,
-                                                box.y / theme.scale + 2), c.highlight)
+            # Selection is communicated by the filled row and outline alone;
+            # no right-edge chevron/arrowhead is drawn anywhere on the shelf.
 
     def draw_empty_state(self, rect: pygame.Rect) -> None:
         theme = self.theme
@@ -4439,6 +4437,43 @@ class GBALauncher:
         pygame.display.flip()
 
     # -------------------------------------------------------------- lifecycle
+    def play_boot_animation(self) -> None:
+        """Shows an animated first-launch frame without hiding a long scan.
+
+        Returning from gameplay supplies ``focus_id`` and bypasses this method
+        in run(), so the intro belongs to startup rather than every game exit.
+        Any button skips it after a short accidental-input guard.
+        """
+        animation = BootAnimation()
+        started = time.monotonic()
+        while self.running:
+            elapsed = time.monotonic() - started
+            skipped = False
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    if not self.appliance_mode:
+                        self.running = False
+                    continue
+                if event.type == pygame.JOYDEVICEADDED:
+                    self.refresh_joysticks()
+                    continue
+                if event.type in (pygame.KEYDOWN, pygame.JOYBUTTONDOWN) and \
+                        animation.can_skip(elapsed):
+                    skipped = True
+            if skipped or not self.running:
+                break
+
+            # Keep adopting scanner results while the introduction is up. The
+            # animation has a hard cap; a large library then finishes in the
+            # normal responsive shelf with its scanning indicator.
+            self.update()
+            ready = self.scanner is None
+            if animation.should_finish(elapsed, ready):
+                break
+            animation.draw(self.surface, self.theme, elapsed, loading=not ready)
+            self.present()
+            self.clock.tick(60)
+
     def run(self) -> None:
         if self.screenshot_path:
             self._wait_for_scan()
@@ -4450,6 +4485,8 @@ class GBALauncher:
             print(f"UI preview captured to {self.screenshot_path}")
             return
 
+        if not self.focus_id:
+            self.play_boot_animation()
         while self.running:
             self.update()
             self.handle_events()
@@ -4471,6 +4508,8 @@ class GBALauncher:
             self.terminal_session.close()
         if self.usb_watcher:
             self.usb_watcher.stop()
+        if self.status_monitor:
+            self.status_monitor.stop()
 
     # -- misc -----------------------------------------------------------
     def format_key_name(self, code: int) -> str:

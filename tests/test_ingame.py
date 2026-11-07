@@ -136,6 +136,64 @@ class TestCheatsOverlay(SessionTestCase):
         self.assertFalse(model.toggle())
         self.assertIn("No cheats", model.message)
 
+    def test_add_cheat_from_overlay_is_enabled_and_persisted(self):
+        model = CheatsOverlayModel(self.cheats)
+        self.assertTrue(model.activate())       # selected Add Cheat on empty list
+        self.assertEqual(model.mode, "edit")
+        model.insert_text("Infinite Lives")
+        model.switch_field(1)
+        model.insert_text("01234567 89abcdef\nCAFEBABE 00000001")
+        self.assertTrue(model.save_draft())
+        self.assertEqual(model.mode, "list")
+        item = self.cheats.cheats()[0]
+        self.assertEqual(item["name"], "Infinite Lives")
+        self.assertEqual(item["code"], "01234567 89ABCDEF\nCAFEBABE 00000001")
+        self.assertTrue(item["enabled"])
+        with open(self.cheats.native_path, encoding="utf-8") as native:
+            payload = native.read()
+        self.assertIn("# Infinite Lives", payload)
+        self.assertNotIn("!disabled", payload)
+
+    def test_editor_requires_name_and_safe_nonempty_code(self):
+        model = CheatsOverlayModel(self.cheats)
+        model.begin_add()
+        self.assertFalse(model.save_draft())
+        self.assertIn("name", model.message.lower())
+        model.insert_text("Bad directive")
+        model.switch_field(1)
+        model.insert_text("!reset")
+        self.assertFalse(model.save_draft())
+        self.assertEqual(self.cheats.cheats(), [])
+        self.assertIn("cannot start", model.message)
+
+    def test_edit_and_delete_flow_preserves_state_and_requires_confirmation(self):
+        cid = self.cheats.add_cheat("Moon Jump", "DEADBEEF 00000001", enabled=True)
+        model = CheatsOverlayModel(self.cheats)
+        model.edit_selected()
+        model.draft_name = "Moon Jump High"
+        self.assertTrue(model.save_draft())
+        self.assertEqual(self.cheats.cheats()[0]["name"], "Moon Jump High")
+        self.assertTrue(self.cheats.cheats()[0]["enabled"])
+        model.request_delete()
+        self.assertEqual(model.mode, "delete")
+        model.cancel()                          # B keeps the cheat
+        self.assertEqual(len(self.cheats.cheats()), 1)
+        model.request_delete()
+        self.assertTrue(model.confirm_delete())
+        self.assertEqual(self.cheats.cheats(), [])
+        self.assertFalse(os.path.exists(self.cheats.native_path))
+
+    def test_add_row_is_included_in_controller_navigation(self):
+        self.cheats.add_cheat("One", "A")
+        model = CheatsOverlayModel(self.cheats)
+        model.move(1)
+        self.assertIsNone(model.selected_item())
+        self.assertTrue(model.activate())
+        self.assertEqual(model.mode, "edit")
+        model.cancel()
+        model.move(1)                           # wraps from Add to first cheat
+        self.assertEqual(model.selected_item()["name"], "One")
+
 
 class NoOverlayBackend(FakeBackend):
     """A backend that cannot take the display for an overlay (no injection)."""

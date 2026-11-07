@@ -4,6 +4,42 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — Connected-only status icons, direct cheat editing and GBA boot animation
+
+Suite: **526 passing, 1 skipped** (`make test`). This pass addresses four pieces of real-appliance UI
+feedback without adding a dependency.
+
+### Added
+
+- **Original GBA OS boot animation** (`src/gba_boot.py`): a cartridge drops into an indigo handheld,
+  the screen lights and the two-tone wordmark fades in. It is skippable after a short input guard,
+  extends only while a first scan is active, has a six-second hard cap, and is bypassed when a game
+  returns to the shelf.
+- **In-overlay mGBA cheat editor**: the Cheats overlay always has **Add Cheat**, with name and
+  multiline code fields, a controller/mouse on-screen keyboard and direct physical-keyboard input.
+  `A` toggles/activates, `X` edits (or backspaces in the editor), `Y` switches fields or requests
+  deletion, and deletion always asks first. New cheats start enabled; edits preserve enabled state.
+- `CheatStore.update_cheat()` / `remove_cheat()` plus regression coverage for multiline native files
+  and deletion of the final cheat without stale-file re-import.
+
+### Fixed
+
+- **Startup/rendering stalls from synchronous status probes** (`src/gba_status.py`). WiFi and
+  Bluetooth subprocesses now run on one cached background monitor instead of inside every
+  `draw_top_bar()` call. Network changes request a coalesced refresh.
+- **Status-bar clutter and alignment**: the USB storage chip is gone; Bluetooth appears only for a
+  connected device and WiFi only for a connected network. The WiFi glyph uses correct radians and a
+  fixed bounding box, so it no longer spills into the clock. Settings remains available for pairing.
+- **Selected-row arrowheads**: the shared shelf/list renderer uses its fill and outline alone, with
+  no right-edge `>` marker.
+
+### Tests
+
+- `tests/test_status_boot.py`: slow-provider non-blocking behaviour, connected-only icon drawing,
+  no synchronous probes/USB label in rendering, no shelf chevron, and bounded/skippable boot timing.
+- Expanded cheat model, storage and pygame tests cover direct add, validation, edit, confirmed
+  deletion, physical keyboard, gamepad and mouse input, and native mGBA persistence.
+
 ## [Unreleased] — In-shell self-update (SETTINGS → System → Check for updates)
 
 The console can now pull its own updates from GitHub without a terminal, a login or a second
