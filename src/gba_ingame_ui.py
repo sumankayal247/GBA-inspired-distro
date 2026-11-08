@@ -506,8 +506,10 @@ class InGameOverlayRenderer:
                              theme.px(width - 60))
             theme.label(surface, name, (x0 + 5, y + 5),
                         c.text if selected else c.text_muted, key="body")
-            state = "ENABLED" if item["enabled"] else "DISABLED"
-            color = c.success if item["enabled"] else c.text_dim
+            state = ("INVALID" if item.get("invalid") else
+                     "ENABLED" if item["enabled"] else "DISABLED")
+            color = (c.danger if item.get("invalid") else
+                     c.success if item["enabled"] else c.text_dim)
             chip = theme.rect(x0 + width - 46, y + 4, 42, 12)
             pygame.draw.rect(surface, c.panel_alt, chip,
                              border_radius=theme.px(3))
@@ -518,7 +520,7 @@ class InGameOverlayRenderer:
         if not items:
             theme.label(surface, "No cheats yet — add one in seconds.",
                         (x0 + 4, y0 + 31), c.text_muted, key="body")
-            theme.label(surface, "GameShark · Action Replay · CodeBreaker",
+            theme.label(surface, model.device_hint,
                         (x0 + 4, y0 + 46), c.text_dim, key="small")
             theme.label(surface, "Use the on-screen keyboard or type directly.",
                         (x0 + 4, y0 + 59), c.text_dim, key="micro")
@@ -535,7 +537,8 @@ class InGameOverlayRenderer:
         width = rect.width / theme.scale - 16
         fields = (
             ("NAME", model.draft_name, "Infinite lives", y0 + 9, 18),
-            ("CODE  (mGBA)", model.draft_code, "01234567 89ABCDEF", y0 + 40, 31),
+            ("CODE  (GB)" if model.store.is_gb else "CODE  (mGBA)",
+             model.draft_code, model.code_placeholder, y0 + 40, 31),
         )
         for field_index, (label, value, placeholder, y, height) in enumerate(fields):
             active = model.field == field_index

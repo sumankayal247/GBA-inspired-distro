@@ -336,6 +336,9 @@ class CheatsOverlayModel(OverlayModel):
         super().__init__(on_close)
         self.store = cheat_store
         self.title = "CHEATS"
+        self.code_placeholder = "019947D3" if self.store.is_gb else "01234567 89ABCDEF"
+        self.device_hint = ("GB GameShark · Game Genie · CodeBreaker" if self.store.is_gb
+                            else "GameShark · Action Replay · CodeBreaker")
         self.index = 0
         self.mode = "list"             # list | edit | delete
         self.edit_id: Optional[str] = None
@@ -345,9 +348,16 @@ class CheatsOverlayModel(OverlayModel):
         self.key_row = 1
         self.key_col = 0
         self._update_subtitle()
+        invalid_sets = self.store.validation_summary()["invalid_sets"]
+        if invalid_sets:
+            self.message = (f"{invalid_sets} cheat(s) contain invalid Game Boy "
+                            "code; edit them to fix it")
 
     def items(self) -> List[Dict[str, Any]]:
-        return self.store.cheats()
+        items = self.store.cheats()
+        for item in items:
+            item["invalid"] = bool(self.store.code_error(item["code"]))
+        return items
 
     def selected_item(self) -> Optional[Dict[str, Any]]:
         items = self.items()
@@ -360,6 +370,8 @@ class CheatsOverlayModel(OverlayModel):
             self.subtitle = "A confirm delete · B keep cheat"
         elif self.selected_item() is None:
             self.subtitle = "A add cheat · B close"
+        elif self.store.code_error(self.selected_item()["code"]):
+            self.subtitle = "Invalid Game Boy code · Pad X edit · Pad Y delete · B close"
         else:
             self.subtitle = "A toggle · Pad X edit · Pad Y delete · B close"
 
@@ -406,6 +418,9 @@ class CheatsOverlayModel(OverlayModel):
         item = self.selected_item()
         if item is None:
             return self.begin_add()
+        if not item["enabled"] and item.get("invalid"):
+            self.message = self.store.code_error(item["code"])
+            return False
         ok = self.store.set_enabled(item["id"], not item["enabled"])
         self.message = (("ENABLED" if not item["enabled"] else "DISABLED")
                         + " " + item["name"]) if ok else "Could not update cheat"
@@ -529,8 +544,7 @@ class CheatsOverlayModel(OverlayModel):
         if self.mode != "edit":
             return False
         name = " ".join(self.draft_name.split()).strip()
-        code = "\n".join(line.strip() for line in self.draft_code.splitlines()
-                         if line.strip())
+        code = self.store.normalize_code(self.draft_code)
         if not name:
             self.field = 0
             self.message = "Enter a cheat name first"
@@ -544,6 +558,11 @@ class CheatsOverlayModel(OverlayModel):
                for line in code.splitlines()):
             self.field = 1
             self.message = "Code lines cannot start with #, !, [ or cheats ="
+            return False
+        error = self.store.code_error(code)
+        if error:
+            self.field = 1
+            self.message = error
             return False
 
         if self.edit_id is None:

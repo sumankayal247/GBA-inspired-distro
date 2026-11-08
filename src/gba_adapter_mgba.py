@@ -2096,22 +2096,41 @@ def main():
     cheat_store = None
     cheats_dir = None
     runtime_dir = None
+    last_cheat_diagnostics = None
 
     def current_cheat_file():
-        """Re-renders mGBA's native cheat file for every emulator start.
+        """Re-renders and validates mGBA's native file for every start.
 
         The Cheats overlay only edits the per-game list; the file mGBA reads
         with `-c` is rewritten here, so a cheat enabled in the overlay is
         active in the restarted session without a launcher restart. A game
-        with no cheats at all must not get an empty `-c` argument.
+        with no cheats at all must not get an empty `-c` argument. Invalid
+        legacy GB sets are rendered `!disabled` by CheatStore, rather than
+        risking a write to a different address after mGBA misparses them.
         """
+        nonlocal last_cheat_diagnostics
         if cheat_store is None:
             return None
         try:
-            return cheat_store.write_native()
+            path = cheat_store.write_native()
         except Exception as exc:
             logger.warning("Could not write the native cheat file: %s", exc)
             return None
+        if path:
+            summary = cheat_store.validation_summary()
+            signature = (path, tuple(sorted(summary.items())))
+            if signature != last_cheat_diagnostics:
+                logger.info("Cheats prepared: file=%s enabled_sets=%d active_sets=%d "
+                            "active_lines=%d invalid_lines=%d invalid_sets=%d",
+                            path, summary["enabled_sets"], summary["active_sets"],
+                            summary["active_lines"], summary["invalid_lines"],
+                            summary["invalid_sets"])
+                if summary["invalid_lines"]:
+                    logger.warning("Cheats: %d invalid Game Boy code line(s) in %d "
+                                   "set(s); those sets stay disabled until edited",
+                                   summary["invalid_lines"], summary["invalid_sets"])
+                last_cheat_diagnostics = signature
+        return path
 
     if valid_game_id(game_id):
         try:

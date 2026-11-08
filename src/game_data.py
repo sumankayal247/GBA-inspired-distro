@@ -170,6 +170,75 @@ def _timestamp_label(timestamp: Optional[float]) -> str:
 # Cheats — one list per game, applied through mGBA's native .cheats format
 # ---------------------------------------------------------------------------
 
+# mGBA uses a different parser for GB/GBC and GBA codes. In particular, its GB
+# autodetector consumes the first eight hex digits of a GBA-style code and
+# silently ignores the remainder. Never pass an unrecognised GB line through as
+# if it were valid: that can write a plausible but completely wrong address.
+GB_GAMESHARK_RE = re.compile(r"^[0-9A-F]{8}$")
+GB_CODEBREAKER_RE = re.compile(r"^[0-9A-F]{6}-[0-9A-F]{2}$")
+GB_GAME_GENIE_RE = re.compile(r"^[0-9A-F]{3}-[0-9A-F]{3}(?:-[0-9A-F]{3})?$")
+GB_VBA_RE = re.compile(r"^[0-9A-F]{4}:[0-9A-F]{2}$")
+
+
+def is_gb_rom(rom_path: Optional[str]) -> bool:
+    """Whether mGBA will use its Game Boy cheat parser for this content."""
+    return isinstance(rom_path, str) and \
+        os.path.splitext(rom_path)[1].lower() in (".gb", ".gbc")
+
+
+def normalize_cheat_code(code: str, rom_path: Optional[str] = None) -> str:
+    """Normalizes code lines without changing their mGBA meaning.
+
+    GameShark codes are commonly published as `01 99 47 D3`. mGBA requires the
+    eight digits to be contiguous, so remove whitespace only when the complete
+    line is that one eight-digit code. VBA `AAAA:VV` is converted to the same
+    GameShark RAM write; this also avoids mGBA's VBA parser reading the value
+    from the address portion. Other formats keep their punctuation.
+    """
+    if not isinstance(code, str):
+        return ""
+    lines = [line.strip() for line in code.splitlines() if line.strip()]
+    if not is_gb_rom(rom_path):
+        return "\n".join(lines)
+    normalized = []
+    for line in lines:
+        line = line.upper()
+        if GB_VBA_RE.fullmatch(line):
+            address, value = line.split(":")
+            normalized.append(f"01{value}{address[2:]}{address[:2]}")
+            continue
+        compact = re.sub(r"\s+", "", line)
+        normalized.append(compact if GB_GAMESHARK_RE.fullmatch(compact) else line)
+    return "\n".join(normalized)
+
+
+def invalid_cheat_lines(code: str, rom_path: Optional[str] = None) -> List[int]:
+    """Returns 1-based line numbers mGBA's GB parser cannot safely accept.
+
+    GBA parsing remains delegated to mGBA because it supports several larger
+    conditional formats. GB syntax is small and strict, so it can be checked
+    before claiming a cheat was enabled. Game Genie, CodeBreaker and VBA lines
+    are accepted alongside the usual eight-digit GameShark form.
+    """
+    if not is_gb_rom(rom_path):
+        return []
+    invalid = []
+    for number, line in enumerate(normalize_cheat_code(code, rom_path).splitlines(), 1):
+        if not any(pattern.fullmatch(line) for pattern in
+                   (GB_GAMESHARK_RE, GB_CODEBREAKER_RE, GB_GAME_GENIE_RE, GB_VBA_RE)):
+            invalid.append(number)
+    return invalid
+
+
+def cheat_code_error(code: str, rom_path: Optional[str] = None) -> Optional[str]:
+    """A short user-facing error for the first unsafe GB code line."""
+    invalid = invalid_cheat_lines(code, rom_path)
+    if not invalid:
+        return None
+    return (f"Line {invalid[0]}: invalid Game Boy code; GameShark uses "
+            "8 hex digits (e.g. 019947D3)")
+
+
 class CheatStore:
     """Per-game cheat list with persisted enabled/disabled state.
 
@@ -184,6 +253,8 @@ class CheatStore:
     def __init__(self, game_id: str, rom_path: Optional[str] = None,
                  data_dir: Optional[str] = None):
         self.game_id = game_id
+        self.rom_path = rom_path
+        self.is_gb = is_gb_rom(rom_path)
         self.ok = valid_game_id(game_id)
         self.root = game_dir(game_id, data_dir) if self.ok else ""
         self.metadata_path = os.path.join(self.root, CHEATS_METADATA) if self.ok else ""
@@ -213,7 +284,8 @@ class CheatStore:
                     not isinstance(name, str) or not isinstance(code, str):
                 continue
             seen.add(cid)
-            cleaned.append({"id": cid, "name": name, "code": code,
+            cleaned.append({"id": cid, "name": name,
+                            "code": normalize_cheat_code(code, self.rom_path),
                             "enabled": bool(item.get("enabled"))})
         return {"version": 1, "game_id": self.game_id, "cheats": cleaned}
 
@@ -231,8 +303,36 @@ class CheatStore:
         """Cheats belonging to this game only (never a global list)."""
         return [dict(item) for item in self._data["cheats"]]
 
+    def normalize_code(self, code: str) -> str:
+        return normalize_cheat_code(code, self.rom_path)
+
+    def code_error(self, code: str) -> Optional[str]:
+        return cheat_code_error(code, self.rom_path)
+
+    def validation_summary(self) -> Dict[str, int]:
+        """Counts useful for proving what the next mGBA start will receive."""
+        summary = {"sets": 0, "enabled_sets": 0, "active_sets": 0,
+                   "active_lines": 0, "invalid_lines": 0, "invalid_sets": 0}
+        for item in self._data["cheats"]:
+            summary["sets"] += 1
+            lines = normalize_cheat_code(item["code"], self.rom_path).splitlines()
+            invalid = invalid_cheat_lines(item["code"], self.rom_path)
+            if invalid:
+                summary["invalid_sets"] += 1
+                summary["invalid_lines"] += len(invalid)
+            if item["enabled"]:
+                summary["enabled_sets"] += 1
+                if not invalid:
+                    summary["active_sets"] += 1
+                    summary["active_lines"] += len(lines)
+        return summary
+
     def add_cheat(self, name: str, code: str, enabled: bool = False) -> Optional[str]:
-        if not self.ok or not isinstance(name, str) or not isinstance(code, str) or not name:
+        if not self.ok or not isinstance(name, str) or not isinstance(code, str):
+            return None
+        name = name.strip()
+        code = normalize_cheat_code(code, self.rom_path)
+        if not name or not code or self.code_error(code):
             return None
         cid = self._cheat_id(name, code)
         for item in self._data["cheats"]:
@@ -249,8 +349,8 @@ class CheatStore:
         if not self.ok or not isinstance(name, str) or not isinstance(code, str):
             return False
         name = name.strip()
-        code = "\n".join(line.strip() for line in code.splitlines() if line.strip())
-        if not name or not code:
+        code = normalize_cheat_code(code, self.rom_path)
+        if not name or not code or self.code_error(code):
             return False
         new_id = self._cheat_id(name, code)
         for item in self._data["cheats"]:
@@ -295,6 +395,8 @@ class CheatStore:
         except Exception:
             return 0
         known = {item["id"]: item for item in self._data["cheats"]}
+        known_by_code = {(item["name"], item["code"]): item
+                         for item in self._data["cheats"]}
         imported: List[Dict[str, Any]] = []
         name, code_lines, enabled = "", [], True
         next_disabled = False
@@ -304,10 +406,13 @@ class CheatStore:
             if not name and not code_lines:
                 return
             cheat_name = name or "Cheat"
-            code = "\n".join(line for line in code_lines if line)
+            code = normalize_cheat_code("\n".join(line for line in code_lines if line),
+                                        self.rom_path)
             cid = self._cheat_id(cheat_name, code)
-            if cid in known:                 # keep the user's persisted state
-                imported.append(dict(known[cid]))
+            previous = known.get(cid) or known_by_code.get((cheat_name, code))
+            if previous is not None:         # keep the user's persisted state
+                imported.append({"id": cid, "name": cheat_name, "code": code,
+                                 "enabled": previous["enabled"]})
             else:
                 imported.append({"id": cid, "name": cheat_name, "code": code,
                                  "enabled": enabled})
@@ -338,6 +443,8 @@ class CheatStore:
             return False
         for item in self._data["cheats"]:
             if item["id"] == cheat_id:
+                if enabled and self.code_error(item["code"]):
+                    return False
                 item["enabled"] = bool(enabled)
                 self._save()
                 self.write_native()
@@ -361,10 +468,14 @@ class CheatStore:
             return None
         lines: List[str] = []
         for item in self._data["cheats"]:
-            if not item["enabled"]:
+            # A legacy/imported invalid GB set stays visible for editing, but
+            # must never execute: mGBA can otherwise truncate a GBA code and
+            # write the wrong address. New invalid entries are rejected above.
+            invalid = bool(self.code_error(item["code"]))
+            if not item["enabled"] or invalid:
                 lines.append("!disabled")
             lines.append("# " + item["name"].replace("\n", " "))
-            lines.extend(item["code"].splitlines())
+            lines.extend(normalize_cheat_code(item["code"], self.rom_path).splitlines())
         payload = ("\n".join(lines) + "\n").encode("utf-8", errors="ignore")
         return self.native_path if _atomic_write(self.native_path, payload) else None
 

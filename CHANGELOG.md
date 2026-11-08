@@ -4,6 +4,25 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — Game Boy cheat validation and real mGBA application checks
+
+Suite: **532 passing, 1 skipped** (`make test`).
+
+### Fixed
+
+- **False cheat success on Pokémon Yellow and other GB/GBC games.** The editor previously accepted
+  any text even though mGBA uses a different GB parser; a GBA-style line can be truncated into an
+  unintended GB write, while malformed text produces no operation at all. New GB entries now require
+  GameShark, Game Genie, CodeBreaker or VBA syntax, with an inline error instead of false success.
+- **Unsafe legacy invalid GB sets** remain visible for editing but are emitted `!disabled`, and the
+  adapter logs the native file plus enabled/active/invalid counts. Spaced and lowercase eight-digit
+  GameShark lines are normalized before writing, and VBA RAM writes become equivalent GameShark
+  lines to avoid mGBA's VBA value-parsing bug. GBA multiline behavior is unchanged.
+- **End-to-end verification:** the exact `CheatStore` file was parsed by a locally built mGBA core;
+  `019947D3` produced the expected `D347 = 0x99` emulated-memory write, and an invalid trailing-data
+  variant stayed disabled with memory unchanged. Documentation now distinguishes GB codes from GBA
+  codes and notes that codes must match the ROM region/revision.
+
 ## [Unreleased] — Connected-only status icons, direct cheat editing and GBA boot animation
 
 Suite: **526 passing, 1 skipped** (`make test`). This pass addresses four pieces of real-appliance UI
