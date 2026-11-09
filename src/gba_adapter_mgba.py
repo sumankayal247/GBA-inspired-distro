@@ -28,6 +28,7 @@ import queue
 import re
 import threading
 import time
+import ctypes
 from typing import Optional
 
 # Ensure local src directory is on sys.path
@@ -1680,6 +1681,379 @@ def build_mgba_command(mgba_bin: str, content_path: str, save_dir: str,
     return cmd
 
 
+# ---------------------------------------------------------------------------
+# Presentation: does the frame actually reach the screen?
+#
+# mGBA and SDL report success when they cannot present: the emulation runs,
+# the window maps, the save is written, and the display stays black. The only
+# witness is the framebuffer itself, so a bare-X11 session samples the X11
+# root window (literally what the user is looking at) and, when it never
+# changes, relaunches the emulator through a different presentation path.
+#
+# The order of that path matters on real hardware:
+#   * a compositor redirects a fullscreen window, so DRI3 page-flip failures
+#     cannot happen - hardware OpenGL is then the fast, correct choice;
+#   * llvmpipe (LIBGL_ALWAYS_SOFTWARE=1) is the historic workaround for the
+#     no-compositor case, and at 1920x1080 it is exactly what makes a frame
+#     arrive late or never;
+#   * a window is the last resort, and proves the rest of the chain works.
+# ---------------------------------------------------------------------------
+
+DISPLAY_PROBE_DELAY = 2.5          # let SDL map and paint the window first
+DISPLAY_PROBE_INTERVAL = 1.0
+DISPLAY_PROBE_SAMPLES = 4          # consecutive flat samples before acting
+DISPLAY_PROBE_GRID = (32, 18)      # 576 points across the screen
+DISPLAY_COLOUR_TOLERANCE = 3       # per-channel, 0-255
+DISPLAY_MAX_RECOVERIES = 2         # leave the user playing, not restarting
+
+COMPOSITOR_BACKEND_DEFAULT = "xrender"
+
+
+class _XImageStruct(ctypes.Structure):
+    """Only the fields up to the pixel masks are needed to read pixels."""
+
+    _fields_ = [
+        ("width", ctypes.c_int),
+        ("height", ctypes.c_int),
+        ("xoffset", ctypes.c_int),
+        ("format", ctypes.c_int),
+        ("data", ctypes.c_void_p),
+        ("byte_order", ctypes.c_int),
+        ("bitmap_unit", ctypes.c_int),
+        ("bitmap_bit_order", ctypes.c_int),
+        ("bitmap_pad", ctypes.c_int),
+        ("depth", ctypes.c_int),
+        ("bytes_per_line", ctypes.c_int),
+        ("bits_per_pixel", ctypes.c_int),
+        ("red_mask", ctypes.c_ulong),
+        ("green_mask", ctypes.c_ulong),
+        ("blue_mask", ctypes.c_ulong),
+    ]
+
+
+_X11 = {}
+
+
+def _x11():
+    """Loads libX11 lazily; None when it is not usable here."""
+    if "lib" in _X11:
+        return _X11["lib"]
+    lib = None
+    try:
+        import ctypes.util
+        name = ctypes.util.find_library("X11") or "libX11.so.6"
+        lib = ctypes.CDLL(name)
+        lib.XOpenDisplay.restype = ctypes.c_void_p
+        lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        lib.XDefaultRootWindow.restype = ctypes.c_ulong
+        lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        lib.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.XGetImage.restype = ctypes.POINTER(_XImageStruct)
+        lib.XGetImage.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                  ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_uint, ctypes.c_uint,
+                                  ctypes.c_ulong, ctypes.c_int]
+        lib.XFree.argtypes = [ctypes.c_void_p]
+    except Exception as exc:                     # pragma: no cover - no X here
+        logger.debug("[display] libX11 unavailable: %s", exc)
+        lib = None
+    _X11["lib"] = lib
+    return lib
+
+
+def _channel(value: int, mask: int) -> int:
+    """Extracts one colour channel from a pixel, scaled to 0-255."""
+    if not mask:
+        return 0
+    shift = (mask & -mask).bit_length() - 1
+    bits = bin(mask).count("1")
+    raw = (value & mask) >> shift
+    if bits == 8:
+        return raw
+    return (raw * 255) // ((1 << bits) - 1)
+
+
+def x11_framebuffer_sample(env: dict = None, grid: tuple = DISPLAY_PROBE_GRID):
+    """Samples the X11 root window; returns [(r, g, b), ...] or None.
+
+    Failures return None rather than raising: a missing display or a server
+    without the extension must never break a session that is running fine.
+    """
+    env = os.environ if env is None else env
+    display = (env.get("DISPLAY") or "").strip()
+    lib = _x11()
+    if not display or lib is None:
+        return None
+    dpy = None
+    image = None
+    try:
+        dpy = lib.XOpenDisplay(display.encode())
+        if not dpy:
+            return None
+        width = lib.XDisplayWidth(dpy, 0)
+        height = lib.XDisplayHeight(dpy, 0)
+        if width <= 0 or height <= 0:
+            return None
+        root = lib.XDefaultRootWindow(dpy)
+        image = lib.XGetImage(dpy, root, 0, 0, width, height, ~0, 2)  # ZPixmap
+        if not image:
+            return None
+        img = image.contents
+        data = ctypes.cast(img.data, ctypes.POINTER(ctypes.c_ubyte))
+        bpp = max(1, img.bits_per_pixel // 8)
+        cols, rows = grid
+        samples = []
+        for row in range(rows):
+            y = min(height - 1, int((row + 0.5) * height / rows))
+            for col in range(cols):
+                x = min(width - 1, int((col + 0.5) * width / cols))
+                offset = y * img.bytes_per_line + x * bpp
+                value = 0
+                for byte in range(min(bpp, 4)):
+                    value |= data[offset + byte] << (8 * byte)
+                samples.append((_channel(value, img.red_mask),
+                                _channel(value, img.green_mask),
+                                _channel(value, img.blue_mask)))
+        return samples
+    except Exception as exc:
+        logger.debug("[display] screen sample failed: %s", exc)
+        return None
+    finally:
+        try:
+            if image:
+                lib.XFree(image)
+            if dpy:
+                lib.XCloseDisplay(dpy)
+        except Exception:
+            pass
+
+
+def screen_is_flat(samples, tolerance: int = DISPLAY_COLOUR_TOLERANCE) -> bool:
+    """True when every sampled pixel is effectively the same colour.
+
+    A rendered GBA frame is never uniform; a screen that never receives a
+    frame is. ``None``/empty input is *not* flat: an unreadable screen is not
+    evidence of a broken one, and must never trigger a restart.
+    """
+    if not samples:
+        return False
+    first = samples[0]
+    for pixel in samples[1:]:
+        for a, b in zip(first, pixel):
+            if abs(a - b) > tolerance:
+                return False
+    return True
+
+
+def _process_running(name: str) -> bool:
+    """Whether a process with this exact name is alive.
+
+    pgrep is used when present; /proc is the fallback, so an appliance
+    installed without procps still detects its compositor instead of deciding
+    no compositor exists (which would force llvmpipe needlessly).
+    """
+    try:
+        proc = subprocess.run(["pgrep", "-x", name], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=2.0)
+        return proc.returncode == 0
+    except Exception:
+        pass
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(os.path.join("/proc", entry, "comm"),
+                          "r", encoding="utf-8", errors="ignore") as handle:
+                    if handle.read().strip() == name:
+                        return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
+
+
+def compositor_processes() -> list:
+    """Names of running compositors (picom/compton)."""
+    return [name for name in ("picom", "compton") if _process_running(name)]
+
+
+def compositor_running() -> str:
+    running = compositor_processes()
+    return running[0] if running else ""
+
+
+def stop_compositors() -> list:
+    """Stops picom/compton so a fullscreen window presents directly."""
+    stopped = []
+    for name in compositor_processes():
+        try:
+            subprocess.run(["pkill", "-x", name], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=2.0)
+            stopped.append(name)
+        except Exception:
+            continue
+    return stopped
+
+
+def start_compositor(backend: str = COMPOSITOR_BACKEND_DEFAULT) -> str:
+    """Starts picom (or compton) with a *valid* command line.
+
+    `--vsync` is a flag, not an option: passing a value makes picom exit with
+    "picom doesn't accept positional arguments", which is how the appliance
+    ended up without a compositor at all.
+    """
+    backend = (backend or COMPOSITOR_BACKEND_DEFAULT).strip().lower()
+    if backend not in ("xrender", "glx"):
+        backend = COMPOSITOR_BACKEND_DEFAULT
+    for name in ("picom", "compton"):
+        if not shutil.which(name):
+            continue
+        try:
+            subprocess.run([name, "--daemon", "--backend", backend],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=5.0)
+        except Exception:
+            continue
+        time.sleep(0.4)
+        if compositor_running():
+            return name
+    return ""
+
+
+def wants_software_gl(env: dict, compositor: str = None) -> bool:
+    """Whether a bare-X11 mGBA run should be pushed onto llvmpipe.
+
+    Hardware OpenGL is the default whenever a compositor is running: the
+    compositor redirects the fullscreen window, so the DRI3 page-flip failure
+    the workaround existed for cannot happen, and llvmpipe at 1080p is far
+    more likely to stall a frame than a GPU blit.  Without a compositor the
+    historic workaround still applies.  `GBA_SOFTWARE_GL=1` /
+    `GBA_HARDWARE_GL=0` force software, `GBA_HARDWARE_GL=1` forbids it.
+    """
+    if env.get("GBA_SOFTWARE_GL") == "1" or env.get("GBA_HARDWARE_GL") == "0":
+        return True
+    if env.get("GBA_HARDWARE_GL") == "1":
+        return False
+    if compositor is None:
+        compositor = compositor_running()
+    return not compositor
+
+
+def presentation_steps(env: dict, windowed: bool, compositor: str = None) -> list:
+    """Presentation paths to try when the screen never shows a frame.
+
+    Each step is a dict: label (for the log), env updates, whether to stop the
+    compositor, and whether to run windowed.  Only paths that differ from the
+    current one are offered, so a session is never restarted for nothing.
+    """
+    if compositor is None:
+        compositor = compositor_running()
+    steps = []
+    if env.get("LIBGL_ALWAYS_SOFTWARE") != "1":
+        steps.append({"label": "software OpenGL (llvmpipe)", "windowed": windowed,
+                      "env": {"LIBGL_ALWAYS_SOFTWARE": "1"}, "stop_compositor": False})
+    if compositor:
+        steps.append({"label": "no compositor", "windowed": windowed,
+                      "env": {}, "stop_compositor": True})
+    if not windowed:
+        steps.append({"label": "windowed", "windowed": True,
+                      "env": {}, "stop_compositor": False})
+    return steps
+
+
+def display_probe_enabled(env: dict = None) -> bool:
+    """Whether to verify that pixels really reach the screen (bare X11 only)."""
+    env = os.environ if env is None else env
+    if (env.get("GBA_VERIFY_DISPLAY") or "1").strip() == "0":
+        return False
+    return bool((env.get("DISPLAY") or "").strip())
+
+
+class DisplayWatchdog(threading.Thread):
+    """Reports a screen that never receives a frame.
+
+    Samples the root window after the emulator has had time to map and paint.
+    Any change means frames are arriving and the watchdog stops for good; a
+    run of consecutive identical samples means the display is stuck, and the
+    runner relaunches through the next presentation step.
+    """
+
+    def __init__(self, env: dict, alive_check=None,
+                 delay: float = DISPLAY_PROBE_DELAY,
+                 interval: float = DISPLAY_PROBE_INTERVAL,
+                 samples: int = DISPLAY_PROBE_SAMPLES,
+                 sampler=None):
+        super().__init__(daemon=True, name="gba-display-watchdog")
+        self.env = env
+        self.alive_check = alive_check or (lambda: True)
+        self.delay = delay
+        self.interval = interval
+        self.samples = samples
+        self.sampler = sampler or (lambda: x11_framebuffer_sample(self.env))
+        self._lock = threading.Lock()
+        self._blank_reason = ""
+        self._halt = threading.Event()
+        self.observations = []
+
+    def _alive(self) -> bool:
+        try:
+            return not self._halt.is_set() and bool(self.alive_check())
+        except Exception:
+            return False
+
+    def run(self) -> None:
+        if self.delay and self._halt.wait(self.delay):
+            return
+        flat = 0
+        while self._alive() and flat < self.samples:
+            pixels = self.sampler()
+            if pixels is None:
+                # Not evidence either way: say so once and stop watching.
+                logger.info("[display] screen sampling unavailable; the "
+                            "picture cannot be verified this session")
+                return
+            is_flat = screen_is_flat(pixels)
+            colour = pixels[0] if pixels else None
+            self.observations.append((is_flat, colour))
+            if not is_flat:
+                if flat:
+                    logger.info("[display] picture is updating again after %d "
+                                "flat sample(s); no restart needed", flat)
+                else:
+                    logger.info("[display] picture verified: %d sampled pixels "
+                                "are not a single colour", len(pixels))
+                return
+            flat += 1
+            logger.info("[display] screen is a single colour %s (sample %d/%d); "
+                        "waiting to see whether it ever changes",
+                        colour, flat, self.samples)
+            if flat >= self.samples:
+                break
+            if self._halt.wait(self.interval):
+                return
+        if flat >= self.samples:
+            reason = ("the screen stayed a single colour (%s) for %d samples "
+                      "over %.1fs: mGBA is running but nothing is being "
+                      "presented" % (colour, flat,
+                                     self.delay + self.interval * (flat - 1)))
+            logger.error("[display] %s", reason)
+            with self._lock:
+                self._blank_reason = reason
+
+    def take_blank_reason(self) -> str:
+        with self._lock:
+            reason = self._blank_reason
+            self._blank_reason = ""
+            return reason
+
+    def stop(self) -> None:
+        self._halt.set()
+
+
 def retry_strategy(session: str, ret: int, elapsed: float, windowed: bool,
                    env: dict) -> Optional[tuple]:
     """
@@ -1688,9 +2062,12 @@ def retry_strategy(session: str, ret: int, elapsed: float, windowed: bool,
     A "black screen then back to the library" is almost always a video backend
     that could not present. The fallback depends on where we are running:
 
-    * bare X11: software rendering is the default (LIBGL_ALWAYS_SOFTWARE),
-      so a crash here usually means something other than GL; retry once
-      windowed with no driver pinning, so SDL negotiates for itself;
+    * bare X11: with a compositor the GPU draws (hardware OpenGL) and
+      without one llvmpipe is forced, so a crash here usually means something
+      other than GL; retry once windowed with no driver pinning, so SDL
+      negotiates for itself.  A *silent* failure (the process lives but the
+      screen stays black) never reaches this function: DisplayWatchdog
+      catches it and relaunches through presentation_steps().
     * desktop (x11/wayland): retry once windowed with no driver pinning;
     * bare console: the first DRM card may drive no output, so try the others.
 
@@ -1758,6 +2135,11 @@ class MgbaSessionRunner:
         self.stop_timeout = float(stop_timeout)
         self.child = None
         self.monitor = None
+        # Set by main(): returns the next presentation path to try when the
+        # screen shows no frame, or None when every path has been tried.
+        self.next_presentation_step = None
+        self.display_watchdog = None
+        self.display_recoveries = 0
         self.bindings = load_keybindings()
         self.exit_requested = False
         self.shutting_down = False
@@ -1881,6 +2263,102 @@ class MgbaSessionRunner:
             # an overlay can also be caught leaving a stale or misplaced window.
             threading.Thread(target=self._log_display_evidence, args=(self.child,),
                              daemon=True, name="gba-display-diag").start()
+        self._start_display_watchdog()
+
+    def _start_display_watchdog(self) -> None:
+        """Watches the real screen for a frame that never arrives."""
+        self._stop_display_watchdog()
+        if self.next_presentation_step is None or not display_probe_enabled(self.env):
+            return
+        # Only a compositor guarantees that the root window contains what is on
+        # the screen; with direct scanout XGetImage can return stale contents,
+        # and mistaking that for a black screen would restart a healthy game.
+        if not compositor_running():
+            logger.info("[display] no compositor is running, so the picture "
+                        "cannot be sampled reliably; the frame check is skipped "
+                        "for this launch")
+            return
+        child = self.child
+        watchdog = DisplayWatchdog(
+            self.env,
+            alive_check=(lambda: child is not None and child.poll() is None
+                         and not self.shutting_down),
+            sampler=self.screen_sampler,
+        )
+        watchdog.start()
+        self.display_watchdog = watchdog
+
+    def _stop_display_watchdog(self) -> None:
+        if self.display_watchdog is not None:
+            try:
+                self.display_watchdog.stop()
+            except Exception:
+                pass
+            self.display_watchdog = None
+
+    def screen_sampler(self):
+        """Sampling hook; tests replace this to simulate a display."""
+        return x11_framebuffer_sample(self.env)
+
+    def _recover_display(self, reason: str) -> None:
+        """Relaunches mGBA when the screen has shown no frame for seconds.
+
+        The state is captured first, so a false positive costs a brief restart
+        at the same frame rather than lost progress.
+        """
+        if self.display_recoveries >= DISPLAY_MAX_RECOVERIES:
+            logger.error("[display] giving up after %d presentation attempt(s). "
+                         "Run 'gba-selftest' and check the [display] lines above; "
+                         "the game itself is running and its save is safe.",
+                         self.display_recoveries)
+            self._stop_display_watchdog()
+            return
+        if self.build_command is None:
+            logger.error("[display] this launch cannot be relaunched (no "
+                         "session), so the picture cannot be recovered without "
+                         "restarting the game")
+            self._stop_display_watchdog()
+            return
+        step = self.next_presentation_step()
+        if not step:
+            logger.error("[display] no further presentation path to try. The "
+                         "emulator is running and the save is safe, but this "
+                         "machine cannot present it in any mode this build "
+                         "knows; the [display] and [x11] lines above are the "
+                         "evidence to report.")
+            self._stop_display_watchdog()
+            return
+        self.display_recoveries += 1
+        logger.warning("[display] %s. Retry %d/%d: %s", reason,
+                       self.display_recoveries, DISPLAY_MAX_RECOVERIES,
+                       step["label"])
+        state = None
+        try:
+            state = self.native.capture_runtime_state("display_state")
+        except Exception as exc:
+            logger.warning("[display] could not capture a state before the "
+                           "retry: %s (the game will restart from its save)", exc)
+        if not self.stop_emulator():
+            logger.error("[display] could not stop mGBA to change presentation; "
+                         "leaving the session as it is")
+            return
+        if step.get("stop_compositor"):
+            stopped = stop_compositors()
+            logger.warning("[display] stopped compositor(s): %s",
+                           ", ".join(stopped) or "(none running)")
+        for key, value in (step.get("env") or {}).items():
+            self.env[key] = value
+            logger.info("[display] %s=%s", key, value)
+        if step.get("windowed") is not None:
+            self.windowed = bool(step["windowed"])
+        try:
+            cmd = self.build_command(savestate=state)
+        except Exception as exc:
+            logger.error("[display] could not rebuild the mGBA command: %s", exc)
+            return
+        self.cmd = cmd
+        logger.info("[display] relaunching: %s", " ".join(cmd))
+        self._spawn(cmd)
 
     def _log_display_evidence(self, child) -> None:
         """Samples the display once mGBA has had a moment to map its window."""
@@ -2040,6 +2518,10 @@ class MgbaSessionRunner:
                     time.sleep(0.1)
                 if self.exit_requested:
                     break
+                if self.display_watchdog is not None:
+                    blank = self.display_watchdog.take_blank_reason()
+                    if blank:
+                        self._recover_display(blank)
                 child = self.child
                 if child is None or child.poll() is not None:
                     break
@@ -2056,6 +2538,7 @@ class MgbaSessionRunner:
                 ret = 0
         finally:
             self.shutting_down = True
+            self._stop_display_watchdog()
             # Rule: never leave mGBA stopped, running, or half-relaunched.
             if self.session is not None:
                 try:
@@ -2080,13 +2563,16 @@ class MgbaSessionRunner:
 
 def _run_mgba(cmd: list, env: dict, session=None, action_queue=None,
               native=None, build_command=None, overlay_size=None,
-              theme_name: str = "indigo", windowed: bool = False) -> int:
+              theme_name: str = "indigo", windowed: bool = False,
+              next_presentation_step=None) -> int:
     """Runs mGBA, streaming its log, and returns the exit status."""
-    return MgbaSessionRunner(
+    runner = MgbaSessionRunner(
         cmd, env, session=session, action_queue=action_queue, native=native,
         build_command=build_command, overlay_size=overlay_size,
         theme_name=theme_name, windowed=windowed,
-    ).run()
+    )
+    runner.next_presentation_step = next_presentation_step
+    return runner.run()
 
 
 def main():
@@ -2158,24 +2644,31 @@ def main():
         else:
             logger.info("Bare X11: SDL fullscreen (display size unknown)")
 
-    # Bare-X11 workaround: without a compositor, mGBA's OpenGL via GLX
-    # can't present frames to bare X11. The solution requires TWO things:
-    # 1. Software OpenGL (llvmpipe) to avoid AMD DRI3 page-flip failures
-    # 2. A compositor (picom/compton) to present the software-rendered frames
+    # Presentation policy for bare X11.
     #
-    # LIBGL_ALWAYS_SOFTWARE=1 forces Mesa to use llvmpipe (software OpenGL)
-    # instead of hardware radeonsi. This is slower but avoids DRI3 issues.
-    # The compositor (started in gba_session.sh) handles X11 presentation.
-    #
-    # Set GBA_HARDWARE_GL=1 to skip software fallback (will likely black-screen
-    # on bare X11 without a compositor).
+    # A compositor redirects the fullscreen window, so mGBA's OpenGL is
+    # composited instead of being scanned out directly: the old AMD/Intel DRI3
+    # page-flip failure cannot happen, and the GPU can do the blit. Forcing
+    # llvmpipe on every machine was the previous default; at 1920x1080 that is
+    # a full-screen CPU composite every frame and is exactly what competes
+    # with presentation on modern hardware. llvmpipe is still forced when no
+    # compositor is running (the case the workaround was written for), or when
+    # GBA_SOFTWARE_GL=1 / GBA_HARDWARE_GL=0 asks for it.
+    compositor = compositor_running()
     if bare_x11:
-        force_hw = env.get("GBA_HARDWARE_GL") == "1"
-        if not force_hw:
-            # Force software OpenGL rendering (llvmpipe) to avoid DRI3 issues
+        if wants_software_gl(env, compositor):
             env["LIBGL_ALWAYS_SOFTWARE"] = "1"
-            logger.info("Bare X11: LIBGL_ALWAYS_SOFTWARE=1 set to use software OpenGL "
-                        "(llvmpipe). A compositor (picom/compton) is required to present frames.")
+            reason = ("requested by GBA_SOFTWARE_GL/GBA_HARDWARE_GL"
+                      if (env.get("GBA_SOFTWARE_GL") == "1"
+                          or env.get("GBA_HARDWARE_GL") == "0")
+                      else "no compositor is running, so fullscreen OpenGL "
+                           "would present directly")
+            logger.info("Bare X11: software OpenGL (llvmpipe) because %s", reason)
+        else:
+            env.pop("LIBGL_ALWAYS_SOFTWARE", None)
+            logger.info("Bare X11: hardware OpenGL (compositor %s redirects the "
+                        "fullscreen window; llvmpipe only if the driver has no "
+                        "GPU)", compositor)
     logger.info("Display session=%s driver=%s windowed=%s scaling=%s screen=%s",
                 display_session(), env.get("SDL_VIDEODRIVER", "auto"),
                 is_windowed, display_scaling,
@@ -2285,13 +2778,18 @@ def main():
     else:
         logger.warning("Invalid game identity; in-game features disabled")
 
+    # Mutable: a black-screen recovery changes the path and relaunches, so the
+    # windowed flag and the environment must be read at (re)build time rather
+    # than captured once.
+    presentation = {"windowed": is_windowed, "tried": []}
+
     def make_command(windowed=None, size=None, fps_target=None, savestate=None):
         # Every (re)start re-writes and re-verifies the profile, so a mapping
         # changed in the shell before a relaunch is what the next game gets.
         ensure_mgba_config(config_dir)
         return build_mgba_command(
             mgba_bin, content_path, save_dir,
-            is_windowed if windowed is None else windowed,
+            presentation["windowed"] if windowed is None else windowed,
             display_scaling, screen if size is None else size,
             cheat_file=current_cheat_file(), cheats_dir=cheats_dir,
             savestate=savestate, fps_target=fps_target,
@@ -2305,12 +2803,31 @@ def main():
     cmd = make_command()
     logger.info("Executing mGBA: %s", " ".join(cmd))
 
+    def next_presentation_step():
+        """Next path to try when the screen never shows a frame.
+
+        Only a bare-X11 appliance session owns the whole screen and may
+        restart its compositor; on a desktop the user's compositor and window
+        are none of our business.
+        """
+        if not bare_x11 or not session or not reload_command:
+            return None
+        for step in presentation_steps(env, presentation["windowed"], compositor):
+            if step["label"] in presentation["tried"]:
+                continue
+            presentation["tried"].append(step["label"])
+            if step["windowed"] is not None:
+                presentation["windowed"] = step["windowed"]
+            return step
+        return None
+
     run_kwargs = dict(
         session=session, action_queue=actions, native=native,
         build_command=reload_command if session else None,
         overlay_size=screen or (960, 640),
         theme_name=settings.get("theme", "indigo"),
         windowed=is_windowed,
+        next_presentation_step=next_presentation_step,
     )
 
     started = time.monotonic()

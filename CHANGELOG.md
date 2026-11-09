@@ -4,6 +4,38 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — Black screen on modern GPUs: the compositor never ran and every frame was forced through llvmpipe
+
+Suite: **580 passing, 1 skipped** (`make test`).
+
+### Fixed
+
+- **The compositor never started, on any machine.** `gba-session` ran
+  `picom --daemon --backend glx --vsync none`; `--vsync` takes no argument, so picom rejected `none`
+  as a positional argument (`picom doesn't accept positional arguments`) and exited. Its stderr was
+  sent to `/dev/null` and the script still logged `compositor: picom started`. The bootstrap now
+  passes a valid command line, keeps the compositor's output in the boot log, and verifies with
+  `pgrep` that the daemon survived — a failure is reported instead of claimed.
+- **Software OpenGL is no longer forced on machines that do not need it.** The adapter exported
+  `LIBGL_ALWAYS_SOFTWARE=1` for every bare-X11 session as a workaround for a no-compositor DRI3
+  page-flip bug. On a 1920x1080 panel that turns every frame into a full-screen CPU composite and
+  starves presentation — which is why an older, smaller laptop survived while a modern one showed
+  black. A running compositor redirects the fullscreen window, so hardware OpenGL is now the
+  default and llvmpipe stays as the fallback for a session without one (`GBA_SOFTWARE_GL=1` /
+  `GBA_HARDWARE_GL=0` still force it).
+- **The picture is now verified instead of assumed.** A watchdog samples the X11 root window
+  through `libX11` (`XGetImage`, no extra packages) after the window maps. A screen that stays a
+  single colour for four consecutive samples relaunches mGBA with its state captured first —
+  software OpenGL, then without the compositor, then windowed — so a false positive costs a brief
+  restart at the same frame, never progress. Unsampleable screens are never treated as failures.
+- A compositor that is missing, reject its arguments, or dies no longer leaves a session claiming a
+  working presentation stack; the log states what is running and what will be tried.
+
+### Added
+
+- `GBA_COMPOSITOR_BACKEND=xrender|glx|none`, `GBA_SOFTWARE_GL`/`GBA_HARDWARE_GL` and
+  `GBA_VERIFY_DISPLAY=0` escape hatches, and `[display]` log lines for the whole decision chain.
+
 ## [Unreleased] — In-game A/B fixed: bindings now reach the section mGBA reads
 
 Suite: **546 passing, 1 skipped** (`make test`).

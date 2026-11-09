@@ -19,19 +19,67 @@ if [ -n "${DISPLAY:-}" ]; then
         echo "[session]   Install: sudo apt install matchbox-window-manager" >&2
     fi
 
-    # Start a compositor with GLX backend. The xrender backend cannot composite
-    # GLX surfaces; only --backend glx works with OpenGL windows.
-    # picom is modern and actively maintained; compton is its predecessor.
-    if command -v picom >/dev/null 2>&1; then
-        picom --daemon --backend glx --vsync none 2>/dev/null &
-        echo "[session] compositor: picom started (glx backend)" >&2
-    elif command -v compton >/dev/null 2>&1; then
-        compton --daemon --backend glx --vsync none 2>/dev/null &
-        echo "[session] compositor: compton started (glx backend)" >&2
+    # --- compositor ----------------------------------------------------------
+    # Two faults used to hide here, and together they explain "the game runs
+    # but the screen is black on one laptop and fine on another":
+    #
+    # 1. `picom --vsync` takes NO argument. The old command passed `none`,
+    #    which picom rejects as a positional argument ("picom doesn't accept
+    #    positional arguments") and exits immediately. Its stderr went to
+    #    /dev/null and the script printed "compositor: picom started" anyway,
+    #    so NO compositor has ever run - on any machine.
+    # 2. The GLX backend is CPU-bound whenever software OpenGL (llvmpipe) is
+    #    in use, and at 1920x1080 that is a full-screen GLX composite every
+    #    frame. The xrender backend composites the same windows without GL,
+    #    so it is the default; GBA_COMPOSITOR_BACKEND=glx restores the old
+    #    attempt and `none` disables compositing for this session.
+    #
+    # The compositor is only worth having if it is really running, so its
+    # stderr stays in the session log and the result is checked.
+    GBA_COMPOSITOR_BACKEND="${GBA_COMPOSITOR_BACKEND:-xrender}"
+    export GBA_COMPOSITOR_BACKEND
+    GBA_COMPOSITOR="none"
+    if [ "$GBA_COMPOSITOR_BACKEND" = "none" ]; then
+        echo "[session] compositor: disabled (GBA_COMPOSITOR_BACKEND=none)" >&2
     else
-        echo "[session] WARNING: no compositor found; OpenGL windows may not display" >&2
-        echo "[session]   Install: sudo apt install picom" >&2
+        COMPOSITOR_BIN=""
+        if command -v picom >/dev/null 2>&1; then
+            COMPOSITOR_BIN="picom"
+        elif command -v compton >/dev/null 2>&1; then
+            COMPOSITOR_BIN="compton"
+        fi
+        if [ -n "$COMPOSITOR_BIN" ] && ! command -v pgrep >/dev/null 2>&1; then
+            # Without procps we cannot prove a daemon survived, so say that
+            # instead of claiming a compositor that may not exist.
+            "$COMPOSITOR_BIN" --daemon --backend "$GBA_COMPOSITOR_BACKEND" &
+            sleep 0.7
+            GBA_COMPOSITOR="$COMPOSITOR_BIN"
+            echo "[session] compositor: requested $COMPOSITOR_BIN (backend $GBA_COMPOSITOR_BACKEND); pgrep is missing, so the result is unverified" >&2
+        elif [ -n "$COMPOSITOR_BIN" ]; then
+            compositor_before="$(pgrep -c -x "$COMPOSITOR_BIN" 2>/dev/null || true)"
+            compositor_before="${compositor_before:-0}"
+            # No `2>/dev/null`: a rejected option must reach the boot log, and
+            # no `--vsync` argument either - it is a flag, not an option.
+            "$COMPOSITOR_BIN" --daemon --backend "$GBA_COMPOSITOR_BACKEND" &
+            sleep 0.7
+            compositor_after="$(pgrep -c -x "$COMPOSITOR_BIN" 2>/dev/null || true)"
+            compositor_after="${compositor_after:-0}"
+            if [ "$compositor_after" -gt "$compositor_before" ]; then
+                GBA_COMPOSITOR="$COMPOSITOR_BIN"
+                echo "[session] compositor: $COMPOSITOR_BIN running (backend $GBA_COMPOSITOR_BACKEND, pid $(pgrep -x "$COMPOSITOR_BIN" | head -1))" >&2
+            elif [ "$compositor_after" -gt 0 ]; then
+                # An older instance from a previous session owns the overlay.
+                GBA_COMPOSITOR="$COMPOSITOR_BIN"
+                echo "[session] compositor: $COMPOSITOR_BIN already running (backend requested: $GBA_COMPOSITOR_BACKEND)" >&2
+            else
+                echo "[session] WARNING: $COMPOSITOR_BIN exited immediately with backend $GBA_COMPOSITOR_BACKEND; the reason is in the log above. Continuing without a compositor." >&2
+            fi
+        else
+            echo "[session] WARNING: no compositor found (picom/compton); a fullscreen OpenGL window may not present" >&2
+            echo "[session]   Install: sudo apt install picom" >&2
+        fi
     fi
+    export GBA_COMPOSITOR
 
     # Give WM and compositor time to initialize before apps start
     sleep 0.5
