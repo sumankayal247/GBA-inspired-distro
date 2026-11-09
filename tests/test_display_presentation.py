@@ -15,7 +15,9 @@ that determine whether a frame arrives -
 
 import ctypes
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -371,6 +373,150 @@ class WatchdogActivation(unittest.TestCase):
         with mock.patch.object(adapter, "compositor_running", return_value="picom"):
             runner._start_display_watchdog()
         self.assertIsNone(runner.display_watchdog)
+
+
+class CompositorSelfHealing(unittest.TestCase):
+    """A stale session script must not be able to break a session.
+
+    /usr/local/bin/gba-session is an installed copy: replacing the adapter
+    without re-running the installer leaves the old, broken compositor command
+    behind. The adapter therefore starts a compositor itself instead of only
+    reporting that none is running.
+    """
+
+    def test_an_existing_compositor_is_left_alone(self):
+        with mock.patch.object(adapter, "compositor_running", return_value="picom"), \
+                mock.patch.object(adapter, "start_compositor") as started:
+            self.assertEqual(adapter.ensure_compositor({}), "picom")
+        started.assert_not_called()
+
+    def test_a_missing_compositor_is_started_and_the_stale_install_named(self):
+        with mock.patch.object(adapter, "compositor_running", return_value=""), \
+                mock.patch.object(adapter, "start_compositor",
+                                  return_value="picom") as started, \
+                self.assertLogs(adapter.logger, level="WARNING") as logs:
+            self.assertEqual(adapter.ensure_compositor({}), "picom")
+        started.assert_called_once_with("xrender")
+        joined = "\n".join(logs.output)
+        self.assertIn("started picom", joined)
+        self.assertIn("install.sh --apply --repair", joined)
+
+    def test_the_requested_backend_is_honoured(self):
+        with mock.patch.object(adapter, "compositor_running", return_value=""), \
+                mock.patch.object(adapter, "start_compositor",
+                                  return_value="compton") as started:
+            adapter.ensure_compositor({"GBA_COMPOSITOR_BACKEND": "glx"})
+        started.assert_called_once_with("glx")
+
+    def test_both_switches_can_disable_compositing(self):
+        for env in ({"GBA_COMPOSITOR": "none"},
+                    {"GBA_COMPOSITOR_BACKEND": "none"}):
+            with mock.patch.object(adapter, "compositor_running", return_value="") as running, \
+                    mock.patch.object(adapter, "start_compositor",
+                                      return_value="") as started:
+                result = adapter.ensure_compositor(dict(env))
+            if env.get("GBA_COMPOSITOR") == "none":
+                self.assertEqual(result, "")
+                started.assert_not_called()
+            else:
+                # A `none` backend still starts the default one: "none" means
+                # "do not composite", which GBA_COMPOSITOR already expresses.
+                started.assert_called_once_with("xrender")
+
+    def test_an_unstartable_compositor_says_what_to_install(self):
+        with mock.patch.object(adapter, "compositor_running", return_value=""), \
+                mock.patch.object(adapter, "start_compositor", return_value=""), \
+                self.assertLogs(adapter.logger, level="ERROR") as logs:
+            self.assertEqual(adapter.ensure_compositor({}), "")
+        self.assertIn("apt install picom", "\n".join(logs.output))
+
+    def test_the_adapter_starts_it_before_choosing_the_gl_path(self):
+        """Wiring check: detection alone was the gap that left a black screen."""
+        import inspect
+        source = inspect.getsource(adapter.main)
+        self.assertIn("ensure_compositor(env)", source)
+        self.assertLess(source.index("ensure_compositor(env)"),
+                        source.index("wants_software_gl(env, compositor)"))
+
+
+class SessionScriptFreshness(unittest.TestCase):
+    """`gba-selftest` must catch an installed script older than the build."""
+
+    def setUp(self):
+        import gba_selftest
+        self.selftest = gba_selftest
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.installed = os.path.join(self.dir, "gba-session")
+        self.shipped = os.path.join(os.path.dirname(adapter.__file__),
+                                    "gba_session.sh")
+
+    def check(self):
+        with mock.patch.dict(os.environ, {"GBA_SESSION_RUNNER": self.installed}):
+            return self.selftest.check_session_script()
+
+    def write(self, text):
+        with open(self.installed, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_the_old_broken_script_fails_with_the_repair_command(self):
+        self.write('#!/bin/bash\npicom --daemon --backend glx --vsync none\n')
+        result = self.check()
+        self.assertEqual(result.status, "FAIL")
+        self.assertIn("--vsync", result.detail)
+        self.assertIn("--apply --repair", result.hint)
+
+    def test_a_current_script_passes(self):
+        with open(self.shipped, encoding="utf-8") as handle:
+            self.write(handle.read())
+        self.assertEqual(self.check().status, "PASS")
+
+    def test_a_diverged_script_warns(self):
+        self.write("#!/bin/bash\n# something else\n")
+        result = self.check()
+        self.assertEqual(result.status, "WARN")
+        self.assertIn("differs", result.detail)
+
+    def test_an_explicit_reference_copy_wins(self):
+        self.write("#!/bin/bash\n# installed\n")
+        reference = os.path.join(self.dir, "reference.sh")
+        with open(reference, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/bash\n# installed\n")
+        with mock.patch.dict(os.environ,
+                             {"GBA_SESSION_REFERENCE": reference}):
+            result = self.check()
+        self.assertEqual(result.status, "PASS")
+
+    def test_without_a_reference_copy_the_command_is_still_judged(self):
+        self.write("#!/bin/bash\n# looks current\n")
+        with mock.patch.object(self.selftest, "_session_reference_copies",
+                               return_value=[]):
+            result = self.check()
+        self.assertEqual(result.status, "PASS")
+        self.assertIn("no reference copy", result.detail)
+
+    def test_the_installed_layout_finds_its_reference_copy(self):
+        """$INSTALL_DIR/bin/gba-selftest must see $INSTALL_DIR/src/gba_session.sh."""
+        root = os.path.join(self.dir, "opt")
+        os.makedirs(os.path.join(root, "bin"))
+        os.makedirs(os.path.join(root, "src"))
+        reference = os.path.join(root, "src", "gba_session.sh")
+        shutil.copyfile(self.shipped, reference)
+        fake = os.path.join(root, "bin", "gba-selftest.py")
+        with mock.patch.object(self.selftest, "__file__", fake):
+            found = self.selftest._session_reference_copies()
+        self.assertEqual(found[0], reference)
+        # ...and the old script then fails against it.
+        self.write('#!/bin/bash\npicom --daemon --backend glx --vsync none\n')
+        with mock.patch.dict(os.environ,
+                             {"GBA_SESSION_REFERENCE": reference}):
+            self.assertEqual(self.check().status, "FAIL")
+
+    def test_a_missing_script_warns(self):
+        os.unlink(self.installed) if os.path.exists(self.installed) else None
+        result = self.check()
+        self.assertEqual(result.status, "WARN")
+        self.assertIn("missing", result.detail)
 
 
 class SessionScriptTests(unittest.TestCase):

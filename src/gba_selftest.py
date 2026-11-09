@@ -328,6 +328,74 @@ def check_compositor() -> Check:
                  "Install one: sudo apt install picom")
 
 
+def _session_reference_copies() -> list:
+    """Where a copy of the shipped session script may live.
+
+    Installed next to the self-test ($INSTALL_DIR/src) by the installer, or
+    beside/in front of this file when running straight from a checkout.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [os.environ.get("GBA_SESSION_REFERENCE", ""),
+                  os.path.join(here, "gba_session.sh"),
+                  os.path.join(here, os.pardir, "src", "gba_session.sh"),
+                  os.path.join(here, os.pardir, "gba_session.sh"),
+                  "/opt/gba-distro/src/gba_session.sh"]
+    out = []
+    for path in candidates:
+        if not path:
+            continue
+        path = os.path.abspath(path)
+        if os.path.isfile(path) and path not in out:
+            out.append(path)
+    return out
+
+
+def check_session_script() -> Check:
+    """Compares the *installed* session script with the one this build ships.
+
+    /usr/local/bin/gba-session is an installed copy. An update that replaces
+    the adapter without re-running the installer leaves the old copy behind, so
+    the boot keeps using a fixed-looking program that is not fixed. That is how
+    a machine can be current in the repository and still fail every boot.
+    """
+    installed = os.environ.get("GBA_SESSION_RUNNER", "/usr/local/bin/gba-session")
+    repair = ("Re-run the installer so the wrappers are refreshed: "
+              "sudo ./scripts/install.sh --apply --repair")
+    if not os.path.isfile(installed):
+        return Check("session", WARN, f"{installed} is missing", repair)
+    try:
+        with open(installed, "r", encoding="utf-8", errors="ignore") as handle:
+            current = handle.read()
+    except OSError as exc:
+        return Check("session", WARN, f"cannot read {installed}: {exc}", repair)
+
+    if "--vsync none" in current:
+        return Check("session", FAIL,
+                     f"{installed} still passes an argument to picom's --vsync, "
+                     "so picom exits and no compositor runs",
+                     repair)
+
+    references = _session_reference_copies()
+    compare = os.environ.get("GBA_SESSION_REFERENCE", "")
+    if compare:
+        references = [os.path.abspath(compare)] + [r for r in references
+                                                   if r != os.path.abspath(compare)]
+    for reference in references:
+        try:
+            with open(reference, "r", encoding="utf-8", errors="ignore") as handle:
+                expected = handle.read()
+        except OSError:
+            continue
+        if current == expected:
+            return Check("session", PASS,
+                         f"{installed} matches {reference}")
+        return Check("session", WARN,
+                     f"{installed} differs from {reference}", repair)
+    return Check("session", PASS,
+                 f"{installed} has the current compositor command "
+                 "(no reference copy to compare against)")
+
+
 def check_presentation() -> Check:
     """Reports the presentation path a game will get, and whether it is readable.
 
@@ -422,8 +490,8 @@ def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
     checks: List[Check] = [check_python(), check_fonts(), check_pty(),
                            check_display(), check_mgba(), check_mtp(),
                            check_native_hotkeys(), check_compositor(),
-                           check_presentation(), check_window_manager(),
-                           check_diagnostics()]
+                           check_presentation(), check_session_script(),
+                           check_window_manager(), check_diagnostics()]
     checks.extend(check_modules())
     checks.extend(check_pygame())
     checks.extend(check_storage(data_dir, games_dir))

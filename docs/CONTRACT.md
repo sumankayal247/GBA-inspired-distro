@@ -483,6 +483,13 @@ The installer is the only part of the system that may write outside `/data` and
 - **IN7** [TEST: T-INSTALL-7] The ISO build MUST fail loudly, listing every missing prerequisite, and
   MUST write only inside its build directory. The produced image MUST boot on BIOS and UEFI and MUST
   offer an install entry, a safe-graphics entry, a shell entry and a "boot the internal disk" entry.
+- **IN9** [TEST: T-INSTALL-9] An update MUST refresh every installed copy of a shipped file, and the
+  install MUST prove it did: `scripts/install.sh` compares the copy it writes to
+  `/usr/local/bin/gba-session` against the shipped `src/gba_session.sh` and fails loudly if they
+  differ, `gba-selftest` reports an installed session script that is older than the build or that
+  still contains a known-bad command, and the installer ships a reference copy under
+  `$INSTALL_DIR/src` for that comparison. No defect fix may depend solely on the user re-running the
+  installer: a program MUST repair what it can at runtime and name the stale file it found.
 - **IN8** [TEST: T-INSTALL-8] `gba-selftest` MUST check interpreter, fonts, terminal, display
   session, emulator, module imports, storage and configuration, and MUST exit 0 only when no check
   fails (warnings are acceptable). It MUST NOT write outside its data directory.
@@ -617,6 +624,7 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 | T-INSTALL-6 | Grep the shell scripts for disk-writing commands. | None found outside `gba_installer.py`. | IN6 |
 | T-INSTALL-7 | `scripts/build_iso.sh --check` on a host without the tools; then a full build. | First run lists every missing tool and exits non-zero; second run produces a hybrid ISO. | IN7 |
 | T-INSTALL-8 | `gba-selftest` on a machine with and without mGBA/pygame. | Exit 0 with warnings when only optional parts are missing; exit 1 and a named check when something required is missing. | IN8 |
+| T-INSTALL-9 | Copy the previous release's `gba-session` over `/usr/local/bin/gba-session`, then update only the adapter and boot. | The install refuses to leave a copy that differs from the shipped script; `gba-selftest` names the stale file and prints the `--apply --repair` command; the adapter starts a compositor itself and logs the warning instead of showing a black screen. | IN9 |
 | T-DISPLAY-1 | Force mGBA to exit 1 immediately: once under X11, once on a bare console with two DRM cards. | First retries windowed; second retries the other card; a clean exit and a 30 s session are not retried. | D7 |
 | T-DISPLAY-2 | Boot the appliance on a hybrid-GPU laptop. | `SDL_VIDEO_KMSDRM_DEVICE` is set explicitly; no black screen from an output-less card. | D8 |
 | T-DISPLAY-3 | Boot the appliance on a modern GPU at 1920x1080 and start a game. | The log shows `compositor: picom running (backend xrender)`, `Bare X11: hardware OpenGL`, and `[display] picture verified`. If the screen stays black, the log shows the flat-colour samples and at most two `[display] Retry n/2: ...` relaunches before a picture appears; no game progress is lost because each relaunch resumes the captured state. | D9 |

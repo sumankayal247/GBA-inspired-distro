@@ -432,6 +432,7 @@ make screenshots   # regenerates the four README images
 | Terminal is unavailable | The shell needs a PTY; check that `/dev/pts` is mounted (`SHELL=/bin/sh src/gba_launcher.py` still works for a quick test). |
 | Xbox-style pad exits games | The SELECT+START, Guide, and `Esc` combinations are the system exit gestures — see the launch screen. |
 | Everything is broken | At the GRUB menu pick `GBA OS (safe graphics / recovery)`, or add `gba_mode=0` to the kernel line for a normal login prompt. The recovery console (option 4) exports your saves first. |
+| A fix from a new release does not seem to be running | The boot log keeps using a *copy* of `gba-session` made at install time. Compare them: `gba-selftest` prints a `session` line — `matches this build` is current, `differs from ...` means the installed script is older, and `still passes an argument to picom's --vsync` is the pre-fix file. Either way, refresh the copies with `sudo ./scripts/install.sh --apply --repair` and reboot. The adapter also compensates: if no compositor is running on a bare-X11 session it starts one itself and logs `The installed session script is stale` with that exact command. |
 | A component is missing | Run `gba-selftest`; every FAIL line names the package to install. |
 | Install failed half way | Your boot menu was not modified — the machine still starts its usual system. Re-run the setup with another target. |
 

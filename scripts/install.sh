@@ -318,6 +318,9 @@ install_files() {
     gb_run install -m 0755 "$REPO_DIR/src/gba_installer.py"   "$INSTALL_DIR/src/gba_installer.py"
     gb_run install -m 0755 "$REPO_DIR/src/gba_setup.py"      "$INSTALL_DIR/bin/gba-setup"
     gb_run install -m 0755 "$REPO_DIR/src/gba_init.sh"        "$INSTALL_DIR/bin/gba-init"
+    # Kept as the reference copy: gba-selftest compares /usr/local/bin/gba-session
+    # against this file, which is how a half-applied update gets caught.
+    gb_run install -m 0644 "$REPO_DIR/src/gba_session.sh"     "$INSTALL_DIR/src/gba_session.sh"
     gb_run install -m 0755 "$REPO_DIR/src/gba_adapter_mgba.py" "$INSTALL_DIR/handlers/mgba-adapter"
 
     local font
@@ -386,6 +389,17 @@ install_wrappers() {
 
     install -m 0755 "$REPO_DIR/src/gba_session.sh" "$SESSION_RUNNER"
     chmod 0755 "$SESSION_RUNNER"
+    # A copy that silently stays behind is how a fixed compositor command can
+    # never run: the adapter is new, /usr/local/bin/gba-session is not.
+    if ! cmp -s "$REPO_DIR/src/gba_session.sh" "$SESSION_RUNNER"; then
+        gb_die "Could not refresh $SESSION_RUNNER (the copy differs from
+$REPO_DIR/src/gba_session.sh). Remove it and re-run with --apply --repair."
+    fi
+    local session_sha="unknown"
+    if command -v git >/dev/null 2>&1; then
+        session_sha="$(git -C "$REPO_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+    fi
+    gb_ok "$SESSION_RUNNER refreshed (commit $session_sha)"
 
     cat > "$TTY_WRAPPER" << 'EOF_TTY'
 #!/bin/bash
