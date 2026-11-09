@@ -1924,6 +1924,43 @@ def start_compositor(backend: str = COMPOSITOR_BACKEND_DEFAULT) -> str:
     return ""
 
 
+def ensure_compositor(env: dict, backend: str = None) -> str:
+    """Returns a running compositor, starting one if the session did not.
+
+    The appliance normally gets its compositor from `gba-session`, but that is
+    an installed copy in /usr/local/bin: an update that replaces the adapter
+    without re-running the installer leaves the old script in place. That is
+    exactly how a machine keeps booting with the `picom --vsync none` bug -
+    the adapter reporting "no compositor is running" is evidence of a stale
+    install, not a fix. Starting one here makes the emulator independent of
+    whether the session script on disk is current.
+    """
+    running = compositor_running()
+    if running:
+        return running
+    if (env.get("GBA_COMPOSITOR") or "").strip().lower() == "none":
+        logger.info("[display] compositing disabled by GBA_COMPOSITOR=none")
+        return ""
+    backend = (backend or env.get("GBA_COMPOSITOR_BACKEND")
+               or COMPOSITOR_BACKEND_DEFAULT).strip().lower()
+    if backend == "none":
+        backend = COMPOSITOR_BACKEND_DEFAULT
+    started = start_compositor(backend)
+    if started:
+        logger.warning("[display] no compositor was running; started %s "
+                       "(backend %s) from the adapter itself. The installed "
+                       "session script is stale - re-run "
+                       "'sudo ./scripts/install.sh --apply --repair' so "
+                       "/usr/local/bin/gba-session is refreshed.",
+                       started, backend)
+        return started
+    logger.error("[display] no compositor is running and none could be "
+                 "started (install picom: sudo apt install picom). Fullscreen "
+                 "OpenGL will not be composited; llvmpipe is used instead and "
+                 "the frame check is unavailable.")
+    return ""
+
+
 def wants_software_gl(env: dict, compositor: str = None) -> bool:
     """Whether a bare-X11 mGBA run should be pushed onto llvmpipe.
 
@@ -2654,7 +2691,11 @@ def main():
     # with presentation on modern hardware. llvmpipe is still forced when no
     # compositor is running (the case the workaround was written for), or when
     # GBA_SOFTWARE_GL=1 / GBA_HARDWARE_GL=0 asks for it.
-    compositor = compositor_running()
+    # Trust the running process, not the session script on disk: an upgrade
+    # that replaced this adapter without re-running the installer leaves the
+    # old compositor command behind, and "no compositor" is the state that
+    # produces a black screen on hardware where direct fullscreen GL fails.
+    compositor = ensure_compositor(env) if bare_x11 else compositor_running()
     if bare_x11:
         if wants_software_gl(env, compositor):
             env["LIBGL_ALWAYS_SOFTWARE"] = "1"

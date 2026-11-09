@@ -901,3 +901,35 @@ that legitimately shows one flat colour for four seconds costs one restart that 
 frame. Desktop sessions are never touched (the ladder exists only for a bare-X11 appliance session),
 and `GBA_VERIFY_DISPLAY=0`, `GBA_COMPOSITOR_BACKEND=glx|none` and `GBA_HARDWARE_GL=0` restore any
 previous behaviour.
+
+## D-058 — A fix is not shipped until the *installed* copy is proven current
+
+**Date.** 2026-11-09
+**Status.** Accepted
+
+**Context.** The compositor defect of D-057 was fixed and merged, yet the next boot log from the
+affected laptop contained *both* eras of code: the old line `compositor: picom started (glx backend)`
+and the new line `no compositor is running, so the picture cannot be sampled reliably`. The new
+script never prints "picom started" and would have printed `picom running (backend xrender, pid …)`,
+so `/usr/local/bin/gba-session` was still the previous release while `src/gba_adapter_mgba.py` had
+been updated. The fix existed; it never ran. Reading the adapter's "no compositor" line as the fix
+was itself the error: it was evidence that the installed script was stale.
+
+**Decision.** The installed state is treated as part of the product.
+
+1. `scripts/install.sh` verifies byte-for-byte that `/usr/local/bin/gba-session` matches the shipped
+   `src/gba_session.sh` and exits non-zero if it does not, so a half-applied update cannot be
+   reported as a successful install. It ships a reference copy to `$INSTALL_DIR/src/gba_session.sh`.
+2. `gba-selftest` (run at every boot by the tty wrapper) compares the installed script against that
+   reference copy, fails outright if it still passes an argument to `--vsync`, and prints the exact
+   repair command. A missing reference copy does not silently pass as "current".
+3. The adapter no longer depends on the session script to have a compositor: `ensure_compositor()`
+   starts one itself on a bare-X11 session and logs a warning naming the stale file and the repair
+   command.
+
+**Consequences.** A boot can no longer be broken by an installed script that lags behind the adapter;
+the failure becomes one visible log line plus a working session. The installer fails loudly rather
+than finishing quietly with a stale wrapper, and the self-test distinguishes "current", "older than
+this build" and "contains the known-bad `--vsync none`". Cost: one extra `cmp` per install and one
+file read per boot; and a hand-edited `/usr/local/bin/gba-session` now reports as stale, which is
+the intended behaviour.

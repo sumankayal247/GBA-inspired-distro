@@ -6,7 +6,7 @@ contract version where applicable.
 
 ## [Unreleased] — Black screen on modern GPUs: the compositor never ran and every frame was forced through llvmpipe
 
-Suite: **580 passing, 1 skipped** (`make test`).
+Suite: **600 passing, 1 skipped** (`make test`).
 
 ### Fixed
 
@@ -31,10 +31,21 @@ Suite: **580 passing, 1 skipped** (`make test`).
 - A compositor that is missing, reject its arguments, or dies no longer leaves a session claiming a
   working presentation stack; the log states what is running and what will be tried.
 
+- **A fix that was merged but never installed.** The boot log from the affected laptop contained
+  both the old line (`compositor: picom started (glx backend)`) and the new one (`no compositor is
+  running …`): the adapter had been updated while `/usr/local/bin/gba-session` was still the
+  previous release, so the repaired compositor command never ran. The adapter now starts a
+  compositor itself when it finds none on a bare-X11 session and logs a warning naming the stale
+  file and `sudo ./scripts/install.sh --apply --repair`; `gba-selftest` gained a `session` check
+  that reports an installed script older than the build, and the installer verifies the copy it
+  wrote instead of assuming it landed.
+
 ### Added
 
 - `GBA_COMPOSITOR_BACKEND=xrender|glx|none`, `GBA_SOFTWARE_GL`/`GBA_HARDWARE_GL` and
   `GBA_VERIFY_DISPLAY=0` escape hatches, and `[display]` log lines for the whole decision chain.
+- `gba-selftest` prints a `session` line ("matches this build" / "differs from …" / "still passes an
+  argument to picom's `--vsync`"), so a stale install is visible before a game is launched.
 
 ## [Unreleased] — In-game A/B fixed: bindings now reach the section mGBA reads
 
