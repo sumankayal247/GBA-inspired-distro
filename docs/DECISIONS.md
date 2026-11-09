@@ -933,3 +933,69 @@ than finishing quietly with a stale wrapper, and the self-test distinguishes "cu
 this build" and "contains the known-bad `--vsync none`". Cost: one extra `cmp` per install and one
 file read per boot; and a hand-edited `/usr/local/bin/gba-session` now reports as stale, which is
 the intended behaviour.
+
+## D-059 — The compositor is a process to be proven, not a command to be run
+
+**Date.** 2026-11-09
+**Status.** Accepted
+
+**Context.** The boot log from the affected laptop (`boot_2026-11-09_13-45-43.log`) finally showed a
+*current* session script failing honestly:
+
+```
+[session] window manager: matchbox-window-manager started
+[session] WARNING: picom exited immediately with backend xrender; the reason is in the log above.
+[session] WARNING: no compositor could be started ...
+[display] no compositor is running, so the picture cannot be sampled reliably; the frame check is skipped
+```
+
+The previous release's lesson was that picom must be *verified*. This log proved that verification
+alone is not enough: the compositor was started, checked and gone, and the session then fell back to
+the one presentation path that is both black on this hardware and unverifiable.
+
+**Evidence.** picom's own source (v11.2) explains both why it exits and why the exit was invisible:
+`--daemon` makes picom fork, and once daemonized it runs `fclose(stdout) || fclose(stderr) ||
+fclose(stdin)` and `setsid()` (`src/picom.c`), so a later failure writes nowhere and the PID the
+shell recorded belongs to a parent that had already exited. The same file shows the two failures that
+cannot be retried into success: `redirect_start()` logs "Another composite manager is already running"
+when `xcb_composite_redirect_subwindows` fails, and `session_init()` exits with "No composite
+extension" when the X server has none. A third, very common one is a config file that fails to parse,
+which picom reports and exits on before it ever touches the overlay.
+
+**Decision.** Starting the compositor is a four-part procedure, in the session script and again in the
+adapter (so a stale script cannot reintroduce the failure):
+
+1. Wait until the X server accepts a connection (`xdpyinfo`/`xset`, ≤3 s) before asking a client to
+   talk to it.
+2. Reuse a compositor that is already running instead of starting a second one.
+3. Run it as a tracked child without `--daemon`: its stderr goes to the boot log, `kill -0` proves it
+   survived ~1.2 s, and its first error line is repeated in the verdict.
+4. Retry only where a retry can work: a parse failure jumps straight to `--config /dev/null`, an
+   unusable backend falls to the other one, an occupied overlay or a missing Composite extension stop
+   the ladder. `GBA_COMPOSITOR_BACKEND=none` still disables all of it.
+
+And when no compositor can run: a bare-X11 session starts **windowed**, not fullscreen. A windowed
+surface is copied into the framebuffer by the X server, so the picture does not depend on a direct
+fullscreen scanout - the path that is black here - and unlike a fullscreen window it can be read back,
+so the frame check stays enabled instead of being skipped.
+
+**Consequences.** A boot can no longer end in "no compositor, fullscreen, no verification". Every
+failure to start now prints the compositor's own reason plus what happens instead, and the fallback is
+a path that is both visible and checkable. Cost: up to ~3.6 s of retries on a machine where the
+compositor genuinely cannot run, and windowed (not fullscreen) presentation on such a machine, which
+is a real trade - a slightly smaller picture instead of a black one. `GBA_COMPOSITOR_BACKEND=none`,
+`GBA_COMPOSITOR=none` and `GBA_SOFTWARE_GL=1` still restore any previous behaviour.
+
+### D-059 addendum — status is not intent
+
+The first boot after D-059's code existed still failed, and the log named why in one line:
+`[display] compositing disabled by GBA_COMPOSITOR=none`. `gba-session` had tried three times, failed,
+and exported the result the way it always had — `GBA_COMPOSITOR=none` — while the adapter read that
+value as the *request* to leave the screen uncomposited. The retry built for this exact case was
+skipped by a string that meant the opposite of what it was read as.
+
+Fixed by separating the two: `GBA_COMPOSITOR` now only ever holds a running compositor's name (empty
+when there is none), `GBA_COMPOSITOR_REASON` carries the session's verdict into the adapter's log, and
+`GBA_COMPOSITOR_DISABLED=1`/`GBA_COMPOSITOR_BACKEND=none` is the only way to ask for no compositing.
+A stale script that still exports `none` on failure is retried rather than obeyed, which matters
+because installed scripts lag behind adapters (D-058).

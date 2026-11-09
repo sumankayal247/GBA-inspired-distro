@@ -26,6 +26,7 @@ import glob
 import json
 import queue
 import re
+import tempfile
 import threading
 import time
 import ctypes
@@ -1899,28 +1900,164 @@ def stop_compositors() -> list:
     return stopped
 
 
-def start_compositor(backend: str = COMPOSITOR_BACKEND_DEFAULT) -> str:
-    """Starts picom (or compton) with a *valid* command line.
+COMPOSITOR_ATTEMPT_WAIT = 1.2
+
+# Where the compositor's own output went, so a later exit can still be read.
+COMPOSITOR_LOG_PATH = ""
+
+
+def compositor_attempts(backend: str = None, env: dict = None) -> list:
+    """Ordered `(backend, config)` attempts, best first.
+
+    A compositor fails for reasons that are not ours to fix, so each attempt
+    after the first changes exactly one thing: the backend, or the config file
+    (a broken `~/.config/picom.conf` kills picom before it ever reaches the
+    overlay). GLX is not attempted when there is no GPU.
+    """
+    env = os.environ if env is None else env
+    backend = (backend or env.get("GBA_COMPOSITOR_BACKEND")
+               or COMPOSITOR_BACKEND_DEFAULT).strip().lower()
+    if backend not in ("xrender", "glx"):
+        backend = COMPOSITOR_BACKEND_DEFAULT
+    other = "glx" if backend == "xrender" else "xrender"
+    attempts = [(backend, None)]
+    if other != "glx" or os.path.exists("/dev/dri"):
+        attempts.append((other, None))
+    attempts.append((backend, os.devnull))
+    seen, ordered = set(), []
+    for item in attempts:
+        if item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
+
+
+def compositor_config_files() -> list:
+    """The picom config files this user's compositor would read, if any.
+
+    A config that no longer parses (an option removed in picom 10/11, a
+    half-written edit) makes picom exit before it touches the overlay, and its
+    message names the file but not what to do about it.
+    """
+    home = os.environ.get("HOME") or ""
+    base = (os.environ.get("XDG_CONFIG_HOME")
+            or (os.path.join(home, ".config") if home else ""))
+    candidates = []
+    if base:
+        candidates.extend([os.path.join(base, "picom", "picom.conf"),
+                           os.path.join(base, "picom.conf")])
+    candidates.append("/etc/xdg/picom.conf")
+    return [path for path in candidates if os.path.isfile(path)]
+
+
+def _compositor_reason(path: str, name: str) -> str:
+    """The line that explains an exit, out of the attempt's captured output."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            lines = [line.strip() for line in handle if line.strip()]
+    except OSError:
+        return f"{name} exited without leaving a message"
+    for line in lines:
+        lowered = line.lower()
+        if ("fatal" in lowered or "error" in lowered or "cannot" in lowered
+                or "can't" in lowered or "failed" in lowered):
+            return line
+    return lines[-1] if lines else f"{name} exited without leaving a message"
+
+
+def _start_compositor_process(name: str, backend: str,
+                              config: str = None) -> tuple:
+    """One attempt: returns `(pid, reason)`; pid is None when it did not survive.
+
+    Deliberately *no* `--daemon`. picom's own `src/picom.c` closes stdout,
+    stderr and stdin and calls `setsid()` once it has daemonized, so a
+    daemonized failure is invisible in the boot log and the parent that the
+    shell spawned is gone long before the compositor is proven to work. As our
+    own child its stderr is readable and its exit status is real.
+    """
+    binary = shutil.which(name) or name
+    argv = [binary, "--backend", backend]
+    if config:
+        argv.extend(["--config", config])
+    handle = None
+    path = ""
+    try:
+        fd, path = tempfile.mkstemp(prefix="gba-compositor-", suffix=".log")
+        handle = os.fdopen(fd, "wb")
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                stdout=handle, stderr=subprocess.STDOUT,
+                                start_new_session=True, cwd="/")
+    except Exception as exc:  # missing binary, no permission, no /tmp ...
+        if handle is not None:
+            handle.close()
+        return None, f"{name} could not be started: {exc}"
+    try:
+        deadline = time.monotonic() + COMPOSITOR_ATTEMPT_WAIT
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        if proc.poll() is None:
+            global COMPOSITOR_LOG_PATH
+            COMPOSITOR_LOG_PATH = path
+            return proc.pid, ""
+        return None, _compositor_reason(path, name)
+    finally:
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+
+def start_compositor(backend: str = None, env: dict = None) -> str:
+    """Starts picom (or compton) and proves that it stayed up.
 
     `--vsync` is a flag, not an option: passing a value makes picom exit with
     "picom doesn't accept positional arguments", which is how the appliance
-    ended up without a compositor at all.
+    ended up without a compositor at all. Every failure is now reported with
+    the compositor's own words, and the two failure modes that cannot be fixed
+    by trying again - an overlay that another manager owns, and an X server
+    without the Composite extension - are handled instead of retried blindly.
     """
-    backend = (backend or COMPOSITOR_BACKEND_DEFAULT).strip().lower()
-    if backend not in ("xrender", "glx"):
-        backend = COMPOSITOR_BACKEND_DEFAULT
     for name in ("picom", "compton"):
         if not shutil.which(name):
             continue
-        try:
-            subprocess.run([name, "--daemon", "--backend", backend],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=5.0)
-        except Exception:
-            continue
-        time.sleep(0.4)
-        if compositor_running():
-            return name
+        skipped = set()
+        for attempt_backend, config in compositor_attempts(backend, env):
+            if config is None and attempt_backend in skipped:
+                continue
+            pid, reason = _start_compositor_process(name, attempt_backend, config)
+            if pid:
+                logger.info("[display] %s started (backend %s, pid %s%s)",
+                            name, attempt_backend, pid,
+                            ", default config" if config else "")
+                if COMPOSITOR_LOG_PATH and COMPOSITOR_LOG_PATH != os.devnull:
+                    logger.info("[display] %s output -> %s (an exit later is "
+                                "recorded there)", name, COMPOSITOR_LOG_PATH)
+                return name
+            logger.warning("[display] %s exited with backend %s%s: %s",
+                           name, attempt_backend,
+                           " (default config)" if config else "", reason)
+            lowered = reason.lower()
+            if "config" in lowered:
+                # The user's config file is the problem: the other backend
+                # would fail identically, so go straight to the default config.
+                skipped.add(attempt_backend)
+                continue
+            if "another composite manager" in lowered:
+                existing = compositor_running()
+                if existing:
+                    logger.info("[display] another compositor owns the screen; "
+                                "keeping %s instead of starting a second one",
+                                existing)
+                    return existing
+                return ""
+            if "no composite extension" in lowered:
+                logger.error("[display] the X server has no Composite "
+                             "extension, so no compositor can run on it")
+                return ""
+            if "open display" in lowered:
+                return ""
     return ""
 
 
@@ -1938,14 +2075,29 @@ def ensure_compositor(env: dict, backend: str = None) -> str:
     running = compositor_running()
     if running:
         return running
-    if (env.get("GBA_COMPOSITOR") or "").strip().lower() == "none":
-        logger.info("[display] compositing disabled by GBA_COMPOSITOR=none")
+    # `GBA_COMPOSITOR` is a *status* the session script exports ("picom", or
+    # nothing when it could not start one), not a request: reading its old
+    # `none` value as "the user disabled compositing" is what made the adapter
+    # skip the one retry that exists for exactly this case (boot log
+    # boot_2026-11-09_13-45-43.log, `[display] compositing disabled by
+    # GBA_COMPOSITOR=none`). Only an explicit request disables it now.
+    disabled = ((env.get("GBA_COMPOSITOR_DISABLED") or "").strip() == "1"
+                or (env.get("GBA_COMPOSITOR_BACKEND") or "").strip().lower()
+                == "none")
+    if disabled:
+        logger.info("[display] compositing disabled on request "
+                    "(GBA_COMPOSITOR_BACKEND=none or GBA_COMPOSITOR_DISABLED=1)")
         return ""
+    reason = (env.get("GBA_COMPOSITOR_REASON") or "").strip()
+    if reason:
+        logger.warning("[display] the session script could not start a "
+                       "compositor (%s); trying again now that the session is "
+                       "up", reason)
     backend = (backend or env.get("GBA_COMPOSITOR_BACKEND")
                or COMPOSITOR_BACKEND_DEFAULT).strip().lower()
     if backend == "none":
         backend = COMPOSITOR_BACKEND_DEFAULT
-    started = start_compositor(backend)
+    started = start_compositor(backend, env)
     if started:
         logger.warning("[display] no compositor was running; started %s "
                        "(backend %s) from the adapter itself. The installed "
@@ -1954,14 +2106,22 @@ def ensure_compositor(env: dict, backend: str = None) -> str:
                        "/usr/local/bin/gba-session is refreshed.",
                        started, backend)
         return started
+    configs = compositor_config_files()
+    if configs:
+        logger.error("[display] a compositor config file is present (%s); if "
+                     "picom reports it cannot parse it, fix or delete it - the "
+                     "default-config attempt already ignores it",
+                     ", ".join(configs))
     logger.error("[display] no compositor is running and none could be "
-                 "started (install picom: sudo apt install picom). Fullscreen "
-                 "OpenGL will not be composited; llvmpipe is used instead and "
-                 "the frame check is unavailable.")
+                 "started (if picom is not installed: sudo apt install picom); "
+                 "the reasons are logged above. A composited fullscreen window "
+                 "is not available, so this session starts windowed instead of "
+                 "fullscreen and keeps the frame check enabled.")
     return ""
 
 
-def wants_software_gl(env: dict, compositor: str = None) -> bool:
+def wants_software_gl(env: dict, compositor: str = None,
+                      windowed: bool = False) -> bool:
     """Whether a bare-X11 mGBA run should be pushed onto llvmpipe.
 
     Hardware OpenGL is the default whenever a compositor is running: the
@@ -1977,7 +2137,12 @@ def wants_software_gl(env: dict, compositor: str = None) -> bool:
         return False
     if compositor is None:
         compositor = compositor_running()
-    return not compositor
+    if compositor:
+        return False
+    # Without a compositor a *fullscreen* GL window may be scanned out
+    # directly, which is the path that goes black on some drivers; a windowed
+    # one is copied by the X server. llvmpipe is only for the fullscreen case.
+    return not windowed
 
 
 def presentation_steps(env: dict, windowed: bool, compositor: str = None) -> list:
@@ -2308,12 +2473,14 @@ class MgbaSessionRunner:
         if self.next_presentation_step is None or not display_probe_enabled(self.env):
             return
         # Only a compositor guarantees that the root window contains what is on
-        # the screen; with direct scanout XGetImage can return stale contents,
-        # and mistaking that for a black screen would restart a healthy game.
-        if not compositor_running():
-            logger.info("[display] no compositor is running, so the picture "
-                        "cannot be sampled reliably; the frame check is skipped "
-                        "for this launch")
+        # the screen for a *fullscreen* window: with direct scanout XGetImage
+        # can return stale contents, and mistaking that for a black screen
+        # would restart a healthy game. A windowed one is copied into the
+        # framebuffer by the X server, so it stays readable without one.
+        if not compositor_running() and not self.windowed:
+            logger.info("[display] no compositor and a fullscreen window: the "
+                        "picture cannot be sampled (direct scanout), so the "
+                        "frame check is skipped for this launch")
             return
         child = self.child
         watchdog = DisplayWatchdog(
@@ -2696,8 +2863,20 @@ def main():
     # old compositor command behind, and "no compositor" is the state that
     # produces a black screen on hardware where direct fullscreen GL fails.
     compositor = ensure_compositor(env) if bare_x11 else compositor_running()
+    # No compositor means a fullscreen GL window may be scanned out directly -
+    # the path that draws nothing on some drivers, and the one whose output
+    # cannot be sampled, so the black screen could not even be detected. A
+    # window is copied into the framebuffer by the X server instead: it needs
+    # no compositor, and the frame check can read it. So on a bare-X11 session
+    # that could not get a compositor, start windowed rather than fullscreen.
+    compositor_window_fallback = bool(bare_x11 and not compositor)
+    if compositor_window_fallback:
+        logger.warning("[display] no compositor is available: starting windowed "
+                       "instead of fullscreen so the X server presents the "
+                       "picture and the frame check still applies")
+    effective_windowed = is_windowed or compositor_window_fallback
     if bare_x11:
-        if wants_software_gl(env, compositor):
+        if wants_software_gl(env, compositor, windowed=effective_windowed):
             env["LIBGL_ALWAYS_SOFTWARE"] = "1"
             reason = ("requested by GBA_SOFTWARE_GL/GBA_HARDWARE_GL"
                       if (env.get("GBA_SOFTWARE_GL") == "1"
@@ -2712,7 +2891,7 @@ def main():
                         "GPU)", compositor)
     logger.info("Display session=%s driver=%s windowed=%s scaling=%s screen=%s",
                 display_session(), env.get("SDL_VIDEODRIVER", "auto"),
-                is_windowed, display_scaling,
+                effective_windowed, display_scaling,
                 f"{screen[0]}x{screen[1]}" if screen else "unknown")
     if display_session() == "console":
         # A card with nothing wired to it emulates perfectly and shows nothing,
@@ -2822,7 +3001,7 @@ def main():
     # Mutable: a black-screen recovery changes the path and relaunches, so the
     # windowed flag and the environment must be read at (re)build time rather
     # than captured once.
-    presentation = {"windowed": is_windowed, "tried": []}
+    presentation = {"windowed": effective_windowed, "tried": []}
 
     def make_command(windowed=None, size=None, fps_target=None, savestate=None):
         # Every (re)start re-writes and re-verifies the profile, so a mapping
@@ -2867,7 +3046,7 @@ def main():
         build_command=reload_command if session else None,
         overlay_size=screen or (960, 640),
         theme_name=settings.get("theme", "indigo"),
-        windowed=is_windowed,
+        windowed=effective_windowed,
         next_presentation_step=next_presentation_step,
     )
 
@@ -2881,7 +3060,7 @@ def main():
     # without our driver pin instead of bouncing the user to the library.
     # On bare X11 the DRI3 page-flipping can also fail silently, so if windowed
     # also fails, escalate to full software rendering.
-    strategy = retry_strategy(display_session(), ret, elapsed, is_windowed, env)
+    strategy = retry_strategy(display_session(), ret, elapsed, effective_windowed, env)
     if strategy and strategy[0] == "windowed":
         logger.warning("mGBA failed early; retrying once in a window without SDL video pinning")
         retry_env = dict(os.environ)

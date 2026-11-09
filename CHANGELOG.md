@@ -6,7 +6,7 @@ contract version where applicable.
 
 ## [Unreleased] — Black screen on modern GPUs: the compositor never ran and every frame was forced through llvmpipe
 
-Suite: **600 passing, 1 skipped** (`make test`).
+Suite: **630 passing, 1 skipped** (`make test`).
 
 ### Fixed
 
@@ -40,10 +40,40 @@ Suite: **600 passing, 1 skipped** (`make test`).
   that reports an installed script older than the build, and the installer verifies the copy it
   wrote instead of assuming it landed.
 
+- **picom could still exit at boot, and the session then ran fullscreen with no verification.**
+  The next boot log showed a current script doing the right thing for the wrong outcome: picom was
+  started, exited, and the session continued with no compositor while the frame check was skipped -
+  the exact combination that goes black. picom's source explains why: `--daemon` makes it close its
+  own stdout/stderr and detach, so the reason was invisible; and "Another composite manager is
+  already running" or "No composite extension" cannot be retried into success. The compositor is now
+  a tracked child without `--daemon` (real PID, real exit, its own error line in the log), started
+  only after the X server accepts connections, reusing one that already runs, retried with the default
+  config when the user's `picom.conf` does not parse, and retried with the other backend when one
+  cannot initialise. A missing Composite extension is named instead of retried.
+- **No compositor no longer means "fullscreen, unverifiable".** A bare-X11 session that cannot get a
+  compositor now starts windowed: the X server presents a window even when a direct fullscreen
+  scanout fails, and a window can be read back, so the frame check keeps running instead of being
+  skipped.
+
+- **The adapter was told "no compositor" and read it as "do not composite".** The next boot log
+  showed `[display] compositing disabled by GBA_COMPOSITOR=none` immediately after the session's
+  `picom exited immediately`: `gba-session` exports `GBA_COMPOSITOR` as a *status* ("picom", or
+  `none` when nothing came up), and the adapter treated that `none` as the user's request, so the
+  retry that exists for exactly this case never ran. Status and intent are now separate:
+  `GBA_COMPOSITOR` is only ever the running compositor's name, `GBA_COMPOSITOR_REASON` carries the
+  session's verdict, and `GBA_COMPOSITOR_DISABLED=1` (or `GBA_COMPOSITOR_BACKEND=none`) is the only
+  thing that stops the adapter from trying. A legacy `GBA_COMPOSITOR=none` is retried, not obeyed.
+- **The boot-time self-test no longer cries wolf.** It runs before `xinit`, so "picom installed but
+  not running" was true and meaningless; without `$DISPLAY` it now says the session starts it.
+- A compositor that cannot start now says which `picom.conf` exists and that the default-config
+  attempt ignores it, instead of only suggesting `apt install picom`.
+
 ### Added
 
 - `GBA_COMPOSITOR_BACKEND=xrender|glx|none`, `GBA_SOFTWARE_GL`/`GBA_HARDWARE_GL` and
   `GBA_VERIFY_DISPLAY=0` escape hatches, and `[display]` log lines for the whole decision chain.
+- `gba-selftest`'s compositor hint no longer suggests `picom --daemon` (it hides its own errors) and
+  the session log states every failed attempt with the compositor's own words.
 - `gba-selftest` prints a `session` line ("matches this build" / "differs from …" / "still passes an
   argument to picom's `--vsync`"), so a stale install is visible before a game is launched.
 

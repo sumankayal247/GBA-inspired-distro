@@ -16,6 +16,7 @@ that determine whether a frame arrives -
 import ctypes
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -313,7 +314,18 @@ class SelfTestReporting(unittest.TestCase):
 
     def check(self):
         import gba_selftest
-        return gba_selftest.check_compositor()
+        # A displayed session: without $DISPLAY the boot-time check correctly
+        # reports "not started yet" and proves nothing either way.
+        with mock.patch.dict(os.environ, {"DISPLAY": ":0"}):
+            return gba_selftest.check_compositor()
+
+    def test_before_the_x_server_starts_nothing_is_reported_as_broken(self):
+        import gba_selftest
+        env = {k: v for k, v in os.environ.items() if k != "DISPLAY"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            result = gba_selftest.check_compositor()
+        self.assertEqual(result.status, "PASS")
+        self.assertIn("no X server at this point", result.detail)
 
     def test_a_running_compositor_passes(self):
         with mock.patch.object(adapter, "compositor_running", return_value="picom"):
@@ -350,15 +362,26 @@ class WatchdogActivation(unittest.TestCase):
         runner.child = None
         runner.shutting_down = False
         runner.display_watchdog = None
+        runner.windowed = False
         runner.next_presentation_step = lambda: {"label": "x"}
         runner.screen_sampler = lambda: BLACK
         return runner
 
-    def test_no_watchdog_without_a_compositor(self):
+    def test_no_watchdog_for_a_fullscreen_window_without_a_compositor(self):
+        """Direct scanout makes the root window unreadable: do not judge it."""
         runner = self.runner()
         with mock.patch.object(adapter, "compositor_running", return_value=""):
             runner._start_display_watchdog()
         self.assertIsNone(runner.display_watchdog)
+
+    def test_a_window_is_sampled_even_without_a_compositor(self):
+        """The X server copies a window into the framebuffer, so it is readable."""
+        runner = self.runner()
+        runner.windowed = True
+        with mock.patch.object(adapter, "compositor_running", return_value=""):
+            runner._start_display_watchdog()
+        self.assertIsNotNone(runner.display_watchdog)
+        runner._stop_display_watchdog()
 
     def test_a_compositor_enables_the_check(self):
         runner = self.runner()
@@ -396,7 +419,7 @@ class CompositorSelfHealing(unittest.TestCase):
                                   return_value="picom") as started, \
                 self.assertLogs(adapter.logger, level="WARNING") as logs:
             self.assertEqual(adapter.ensure_compositor({}), "picom")
-        started.assert_called_once_with("xrender")
+        started.assert_called_once_with("xrender", {})
         joined = "\n".join(logs.output)
         self.assertIn("started picom", joined)
         self.assertIn("install.sh --apply --repair", joined)
@@ -406,22 +429,41 @@ class CompositorSelfHealing(unittest.TestCase):
                 mock.patch.object(adapter, "start_compositor",
                                   return_value="compton") as started:
             adapter.ensure_compositor({"GBA_COMPOSITOR_BACKEND": "glx"})
-        started.assert_called_once_with("glx")
+        started.assert_called_once_with("glx", {"GBA_COMPOSITOR_BACKEND": "glx"})
 
-    def test_both_switches_can_disable_compositing(self):
-        for env in ({"GBA_COMPOSITOR": "none"},
-                    {"GBA_COMPOSITOR_BACKEND": "none"}):
-            with mock.patch.object(adapter, "compositor_running", return_value="") as running, \
-                    mock.patch.object(adapter, "start_compositor",
-                                      return_value="") as started:
-                result = adapter.ensure_compositor(dict(env))
-            if env.get("GBA_COMPOSITOR") == "none":
-                self.assertEqual(result, "")
-                started.assert_not_called()
-            else:
-                # A `none` backend still starts the default one: "none" means
-                # "do not composite", which GBA_COMPOSITOR already expresses.
-                started.assert_called_once_with("xrender")
+    def test_only_an_explicit_request_disables_compositing(self):
+        for env in ({"GBA_COMPOSITOR_BACKEND": "none"},
+                    {"GBA_COMPOSITOR_DISABLED": "1"}):
+            with mock.patch.object(adapter, "compositor_running", return_value=""), \
+                    mock.patch.object(adapter, "start_compositor") as started:
+                self.assertEqual(adapter.ensure_compositor(dict(env)), "")
+            started.assert_not_called()
+
+    def test_a_script_that_reported_none_is_retried_here(self):
+        """The boot log that broke this: `compositing disabled by GBA_COMPOSITOR=none`.
+
+        GBA_COMPOSITOR is the session script's *status* ("picom" or nothing),
+        not a request. Reading its legacy `none` as a request skipped the only
+        retry that exists for a compositor that failed at boot.
+        """
+        env = {"GBA_COMPOSITOR": "none"}
+        with mock.patch.object(adapter, "compositor_running", return_value=""), \
+                mock.patch.object(adapter, "start_compositor",
+                                  return_value="picom") as started, \
+                self.assertLogs(adapter.logger, level="WARNING") as logs:
+            self.assertEqual(adapter.ensure_compositor(env), "picom")
+        started.assert_called_once_with(adapter.COMPOSITOR_BACKEND_DEFAULT, env)
+        self.assertNotIn("disabled on request", "\n".join(logs.output))
+
+    def test_the_sessions_own_reason_is_carried_into_the_adapter_log(self):
+        env = {"GBA_COMPOSITOR": "",
+               "GBA_COMPOSITOR_REASON": "no compositor could be started after 3 attempt(s)"}
+        with mock.patch.object(adapter, "compositor_running", return_value=""), \
+                mock.patch.object(adapter, "start_compositor", return_value="picom"), \
+                self.assertLogs(adapter.logger, level="WARNING") as logs:
+            adapter.ensure_compositor(env)
+        self.assertIn("no compositor could be started after 3 attempt(s)",
+                      "\n".join(logs.output))
 
     def test_an_unstartable_compositor_says_what_to_install(self):
         with mock.patch.object(adapter, "compositor_running", return_value=""), \
@@ -436,7 +478,144 @@ class CompositorSelfHealing(unittest.TestCase):
         source = inspect.getsource(adapter.main)
         self.assertIn("ensure_compositor(env)", source)
         self.assertLess(source.index("ensure_compositor(env)"),
-                        source.index("wants_software_gl(env, compositor)"))
+                        source.index("wants_software_gl(env, compositor,"))
+
+
+class CompositorAttempts(unittest.TestCase):
+    """Every way a compositor can be started, and what each failure means."""
+
+    def test_the_configured_backend_is_tried_first_and_the_config_last(self):
+        with mock.patch.object(adapter.os.path, "exists", return_value=True):
+            attempts = adapter.compositor_attempts("xrender", {})
+        self.assertEqual(attempts[0], ("xrender", None))
+        self.assertIn(("glx", None), attempts)
+        self.assertEqual(attempts[-1], ("xrender", adapter.os.devnull))
+
+    def test_glx_is_not_attempted_without_a_gpu(self):
+        with mock.patch.object(adapter.os.path, "exists", return_value=False):
+            attempts = adapter.compositor_attempts("xrender", {})
+        self.assertNotIn(("glx", None), attempts)
+
+    def test_an_unknown_backend_falls_back_to_the_default(self):
+        with mock.patch.object(adapter.os.path, "exists", return_value=True):
+            attempts = adapter.compositor_attempts("banana", {})
+        self.assertEqual(attempts[0][0], adapter.COMPOSITOR_BACKEND_DEFAULT)
+
+    def test_the_reason_is_the_compositors_own_error_line(self):
+        path = os.path.join(tempfile.mkdtemp(), "picom.log")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), ignore_errors=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("info: v11.2\n"
+                         "FATAL ERROR: Another composite manager is already running\n")
+        self.assertIn("Another composite manager",
+                      adapter._compositor_reason(path, "picom"))
+
+    def test_a_silent_exit_still_says_something(self):
+        path = os.path.join(tempfile.mkdtemp(), "picom.log")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), ignore_errors=True)
+        open(path, "w", encoding="utf-8").close()
+        self.assertIn("without leaving a message",
+                      adapter._compositor_reason(path, "picom"))
+
+
+class StartingARealCompositor(unittest.TestCase):
+    """start_compositor() against stub binaries, not mocks.
+
+    This is the path that runs on a machine whose session script is older than
+    the adapter, so it has to survive the same failures the shell does.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.bin = os.path.join(self.dir, "bin")
+        os.makedirs(self.bin)
+        self.addCleanup(mock.patch.stopall)
+        patcher = mock.patch.dict(os.environ, {"PATH": self.bin + ":/usr/bin:/bin"})
+        patcher.start()
+        self.addCleanup(adapter.stop_compositors)
+
+    def stub(self, body):
+        path = os.path.join(self.bin, "picom")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/bash\n" + body)
+        os.chmod(path, 0o755)
+
+    def test_a_compositor_that_stays_up_is_returned_with_its_pid(self):
+        self.stub("exec sleep 20\n")
+        with mock.patch.object(adapter, "compositor_running", return_value=""), \
+                self.assertLogs(adapter.logger, level="INFO") as logs:
+            self.assertEqual(adapter.start_compositor("xrender"), "picom")
+        joined = "\n".join(logs.output)
+        self.assertIn("picom started (backend xrender, pid ", joined)
+
+    def test_no_daemon_flag_is_passed_to_the_compositor(self):
+        """`--daemon` closes picom's stderr and detaches the PID we verify."""
+        self.stub('printf "%%s\\n" "$*" > "%s"\nexec sleep 5\n'
+                  % os.path.join(self.dir, "argv"))
+        with mock.patch.object(adapter, "compositor_running", return_value=""):
+            adapter.start_compositor("xrender")
+        with open(os.path.join(self.dir, "argv"), encoding="utf-8") as handle:
+            argv = handle.read()
+        self.assertNotIn("--daemon", argv)
+        self.assertIn("--backend xrender", argv)
+
+    def test_a_broken_config_is_retried_with_the_default_one(self):
+        calls = os.path.join(self.dir, "calls")
+        self.stub('echo "$*" >> %s\ncase "$*" in *--config*) exec sleep 20 ;; '
+                  '*) echo "Failed to load config file" >&2; exit 1 ;; esac\n' % calls)
+        with mock.patch.object(adapter, "compositor_running", return_value=""), \
+                self.assertLogs(adapter.logger, level="WARNING") as logs:
+            self.assertEqual(adapter.start_compositor("xrender"), "picom")
+        self.assertIn("Failed to load config file", "\n".join(logs.output))
+        with open(calls, encoding="utf-8") as handle:
+            attempts = [line.strip() for line in handle if line.strip()]
+        # xrender with the user's config, then xrender with the default one:
+        # a config error is not a reason to try another backend.
+        self.assertEqual(len(attempts), 2, attempts)
+        self.assertIn("--config", attempts[1])
+
+    def test_an_unfixable_failure_is_reported_with_the_reason(self):
+        self.stub('echo "session_init FATAL ERROR: no screens found" >&2\nexit 1\n')
+        with mock.patch.object(adapter, "compositor_running", return_value=""), \
+                self.assertLogs(adapter.logger, level="WARNING") as logs:
+            self.assertEqual(adapter.start_compositor("xrender"), "")
+        self.assertIn("no screens found", "\n".join(logs.output))
+
+    def test_another_compositor_is_kept_instead_of_fought(self):
+        self.stub('echo "FATAL ERROR: Another composite manager is already running" >&2\n'
+                  'exit 1\n')
+        with mock.patch.object(adapter, "compositor_running",
+                               return_value="compton"), \
+                self.assertLogs(adapter.logger, level="INFO") as logs:
+            self.assertEqual(adapter.start_compositor("xrender"), "compton")
+        self.assertIn("keeping compton", "\n".join(logs.output))
+
+    def test_a_window_without_a_compositor_needs_no_llvmpipe(self):
+        self.assertFalse(adapter.wants_software_gl({}, compositor="", windowed=True))
+        self.assertTrue(adapter.wants_software_gl({}, compositor="", windowed=False))
+
+    def test_a_picom_config_file_is_named_when_nothing_starts(self):
+        home = self.dir
+        conf = os.path.join(home, ".config", "picom", "picom.conf")
+        os.makedirs(os.path.dirname(conf), exist_ok=True)
+        open(conf, "w", encoding="utf-8").close()
+        self.stub('echo "Failed to load config file" >&2\nexit 1\n')
+        with mock.patch.dict(os.environ, {"HOME": home, "XDG_CONFIG_HOME": ""}), \
+                mock.patch.object(adapter, "compositor_running", return_value=""), \
+                self.assertLogs(adapter.logger, level="ERROR") as logs:
+            self.assertEqual(adapter.start_compositor("xrender"), "")
+            adapter.ensure_compositor({})
+        self.assertIn(conf, "\n".join(logs.output))
+
+    def test_the_windowed_fallback_is_wired_into_the_launch_path(self):
+        import inspect
+        source = inspect.getsource(adapter.main)
+        self.assertIn("compositor_window_fallback", source)
+        # The fallback must change what mGBA is started with, and the frame
+        # check must know about it.
+        self.assertIn('presentation = {"windowed": effective_windowed', source)
+        self.assertIn("windowed=effective_windowed", source)
 
 
 class SessionScriptFreshness(unittest.TestCase):
@@ -519,6 +698,237 @@ class SessionScriptFreshness(unittest.TestCase):
         self.assertIn("missing", result.detail)
 
 
+SESSION_SCRIPT = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "src", "gba_session.sh")
+
+
+def _extract_compositor_functions() -> str:
+    """Pulls the compositor functions out of gba_session.sh, verbatim.
+
+    The boot path is shell, so it is tested as shell: the functions that
+    actually run at boot are sourced into a throw-away shell and driven with
+    stub binaries. Nothing about the order of `if`s is asserted - only what a
+    machine would have logged.
+    """
+    text = open(SESSION_SCRIPT, encoding="utf-8").read()
+    chunks = []
+    for name in ("wait_for_x_display", "composite_extension",
+                 "compositor_reason", "compositor_attempt",
+                 "start_session_compositor"):
+        start = text.index(f"{name}() {{")
+        end = text.index("\n}\n", start) + 3
+        chunks.append(text[start:end])
+    return "\n".join(chunks)
+
+
+class CompositorStartup(unittest.TestCase):
+    """Drives src/gba_session.sh's compositor block on stub binaries.
+
+    The reported boot log said "picom exited immediately ... the reason is in
+    the log above" and then the session ran with no compositor, which is the
+    black screen. Every way that can happen now has a defined outcome, and this
+    is where those outcomes are pinned down.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.bin = os.path.join(self.dir, "bin")
+        os.makedirs(self.bin)
+        self.env = {
+            "PATH": self.bin + ":/usr/bin:/bin",
+            "DISPLAY": ":0",
+            "HOME": self.dir,
+            "GBA_COMPOSITOR_BACKEND": "xrender",
+        }
+        self.write("xdpyinfo", '#!/bin/bash\necho "  Composite"\nexit 0\n')
+        self.write("pgrep", "#!/bin/bash\nexit 1\n")
+        self.functions = os.path.join(self.dir, "functions.sh")
+        with open(self.functions, "w", encoding="utf-8") as handle:
+            handle.write(_extract_compositor_functions())
+
+    def write(self, name, body):
+        path = os.path.join(self.bin, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        os.chmod(path, 0o755)
+        return path
+
+    def run_session(self, **env):
+        """Runs the block; returns (log output, compositor name)."""
+        full = dict(self.env, **env)
+        script = ('. "%s"; start_session_compositor; '
+                  'echo "RESULT=$GBA_COMPOSITOR"; '
+                  'echo "REASON=$GBA_COMPOSITOR_REASON"; '
+                  'echo "DISABLED=$GBA_COMPOSITOR_DISABLED"; '
+                  'kill "$COMPOSITOR_PID" 2>/dev/null; exit 0' % self.functions)
+        proc = subprocess.run(["bash", "-c", script], env=full, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=60)
+        output = proc.stdout
+        result = ""
+        for line in output.splitlines():
+            if line.startswith("RESULT="):
+                result = line.split("=", 1)[1].strip()
+        return output, result
+
+    def exported(self, output):
+        """The variables the session script hands to the adapter."""
+        values = {}
+        for line in output.splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key in ("RESULT", "REASON", "DISABLED"):
+                values[key] = value
+        return values
+
+    # -- the ways it can work -------------------------------------------------
+
+    def test_a_compositor_that_stays_up_is_reported_running(self):
+        self.write("picom", "#!/bin/bash\nexec sleep 30\n")
+        output, result = self.run_session()
+        self.assertEqual(result, "picom")
+        self.assertIn("compositor: picom running (backend xrender, pid ", output)
+
+    def test_a_broken_config_is_bypassed_with_the_default_one(self):
+        """A config error is not a backend error: do not try the other one."""
+        calls = os.path.join(self.dir, "calls")
+        self.write("picom", """#!/bin/bash
+echo "$*" >> %s
+case "$*" in
+  *--config*) exec sleep 30 ;;
+  *) echo "Failed to load config file picom.conf: syntax error" >&2; exit 1 ;;
+esac
+""" % calls)
+        output, result = self.run_session()
+        self.assertEqual(result, "picom")
+        self.assertIn("syntax error", output)
+        self.assertIn("running (backend xrender", output)
+        with open(calls, encoding="utf-8") as handle:
+            attempts = [line.strip() for line in handle if line.strip()]
+        self.assertEqual(len(attempts), 2, attempts)
+        self.assertIn("--config /dev/null", attempts[1])
+        self.assertNotIn("glx", attempts[1])
+
+    def test_the_other_backend_is_tried(self):
+        self.write("picom", """#!/bin/bash
+case "$*" in
+  *glx*) exec sleep 30 ;;
+  *) echo "xrender backend unavailable" >&2; exit 1 ;;
+esac
+""")
+        output, result = self.run_session()
+        self.assertEqual(result, "picom")
+        self.assertIn("running (backend glx", output)
+
+    def test_the_x_server_is_waited_for(self):
+        counter = os.path.join(self.dir, "xdpyinfo.calls")
+        self.write("xdpyinfo", """#!/bin/bash
+count=0
+[ -f "%s" ] && count=$(cat "%s")
+count=$((count + 1))
+echo "$count" > "%s"
+if [ "$count" -lt 3 ]; then exit 1; fi
+echo "  Composite"
+""" % (counter, counter, counter))
+        self.write("picom", "#!/bin/bash\nsleep 30\n")
+        output, result = self.run_session()
+        self.assertEqual(result, "picom")
+        self.assertNotIn("did not accept a connection", output)
+
+    def test_an_existing_compositor_is_reused_not_duplicated(self):
+        marker = os.path.join(self.dir, "started")
+        self.write("pgrep", "#!/bin/bash\nexit 0\n")
+        self.write("picom", "#!/bin/bash\necho started > %s\nexec sleep 30\n" % marker)
+        output, result = self.run_session()
+        self.assertEqual(result, "picom")
+        self.assertIn("already running (reusing it)", output)
+        self.assertFalse(os.path.exists(marker),
+                         "a second compositor was started over a live one")
+
+    # -- the ways it can fail, each with a defined outcome --------------------
+
+    def test_a_failure_repeats_the_compositors_own_words(self):
+        self.write("picom", '#!/bin/bash\n'
+                            'echo "session_init FATAL ERROR: Failed to create GLX context" >&2\n'
+                            'exit 1\n')
+        output, result = self.run_session()
+        self.assertEqual(result, "")
+        self.assertIn("Failed to create GLX context", output)
+        self.assertIn("no compositor could be started",
+                      self.exported(output)["REASON"])
+
+    def test_giving_up_says_what_happens_instead(self):
+        self.write("picom", '#!/bin/bash\necho "cannot initialise anything" >&2\nexit 1\n')
+        output, result = self.run_session()
+        self.assertEqual(result, "")
+        self.assertIn("attempt(s); continuing without one", output)
+        self.assertIn("starts such a session windowed instead", output)
+
+    def test_another_compositor_is_not_retried_three_times(self):
+        self.write("picom", '#!/bin/bash\n'
+                            'echo "FATAL ERROR: Another composite manager is already running" >&2\n'
+                            'exit 1\n')
+        output, result = self.run_session()
+        self.assertEqual(result, "")
+        self.assertEqual(output.count("exited with backend"), 1)
+        self.assertIn("another compositor already owns the screen",
+                      self.exported(output)["REASON"])
+
+    def test_a_missing_composite_extension_is_named_before_starting_anything(self):
+        marker = os.path.join(self.dir, "started")
+        self.write("xdpyinfo", '#!/bin/bash\necho "  RANDR"\nexit 0\n')
+        self.write("picom", "#!/bin/bash\necho started > %s\nsleep 30\n" % marker)
+        output, result = self.run_session()
+        self.assertEqual(result, "")
+        self.assertIn("the X server has no Composite extension",
+                      self.exported(output)["REASON"])
+        self.assertFalse(os.path.exists(marker))
+
+    def test_compositing_can_be_switched_off(self):
+        output, result = self.run_session(GBA_COMPOSITOR_BACKEND="none")
+        self.assertEqual(result, "")
+        self.assertIn("disabled (GBA_COMPOSITOR_DISABLED=1)", output)
+        self.assertIn("DISABLED=1", output)
+        self.assertIn("REASON=disabled on request", output)
+
+    def test_a_caller_can_still_ask_for_no_compositing(self):
+        output, result = self.run_session(GBA_COMPOSITOR="none")
+        self.assertEqual(result, "")
+        self.assertIn("DISABLED=1", output)
+
+    def test_the_adapter_retries_what_the_session_could_not_start(self):
+        """End-to-end across the boundary: script failure -> adapter retry.
+
+        This is the machine from boot_2026-11-09_13-45-43.log: the session
+        could not start picom, exported its status, and the adapter has to try
+        again instead of reading that status as "the user said no".
+        """
+        self.write("picom", '#!/bin/bash\necho "Failed to create GLX context" >&2\nexit 1\n')
+        output, result = self.run_session()
+        exported = self.exported(output)
+        self.assertEqual(result, "")
+        self.assertEqual(exported["DISABLED"], "")
+        env = {"GBA_COMPOSITOR": exported["RESULT"],
+               "GBA_COMPOSITOR_REASON": exported["REASON"],
+               "GBA_COMPOSITOR_DISABLED": exported["DISABLED"]}
+        with mock.patch.object(adapter, "compositor_running", return_value=""), \
+                mock.patch.object(adapter, "start_compositor",
+                                  return_value="picom") as started, \
+                self.assertLogs(adapter.logger, level="WARNING") as logs:
+            self.assertEqual(adapter.ensure_compositor(env), "picom")
+        started.assert_called_once()
+        self.assertIn("no compositor could be started", "\n".join(logs.output))
+
+    def test_no_daemon_flag_reaches_the_compositor(self):
+        """`--daemon` closes picom's stderr and detaches the PID we verify."""
+        with open(SESSION_SCRIPT, encoding="utf-8") as handle:
+            code_lines = [line for line in handle
+                          if line.lstrip().startswith(("\"$COMPOSITOR_BIN\"", "$COMPOSITOR_BIN"))]
+        self.assertTrue(code_lines, "compositor invocation not found")
+        for line in code_lines:
+            self.assertNotIn("--daemon", line)
+
+
 class SessionScriptTests(unittest.TestCase):
     """src/gba_session.sh must start a compositor that can actually run."""
 
@@ -537,18 +947,25 @@ class SessionScriptTests(unittest.TestCase):
                 self.assertNotIn("--vsync", code)
 
     def test_the_compositor_runs_with_a_valid_backend(self):
-        self.assertIn('--backend "$GBA_COMPOSITOR_BACKEND"', self.text)
+        self.assertIn('--backend "$backend"', self.text)
         self.assertIn('GBA_COMPOSITOR_BACKEND="${GBA_COMPOSITOR_BACKEND:-xrender}"',
                       self.text)
+        # The configured backend is tried first, then the other one.
+        self.assertIn('COMPOSITOR_ATTEMPTS=("$GBA_COMPOSITOR_BACKEND|"', self.text)
 
     def test_compositor_errors_are_not_hidden(self):
+        # Its own output goes to a file that is read back when it dies; the
+        # old one-liner sent stderr to /dev/null and claimed success.
         for line in self.text.splitlines():
-            if "COMPOSITOR_BIN\" --daemon" in line:
+            if line.lstrip().startswith(("\"$COMPOSITOR_BIN\"", "$COMPOSITOR_BIN")):
                 self.assertNotIn("2>/dev/null", line)
+        self.assertIn('>"$log" 2>&1', self.text)
+        self.assertIn('COMPOSITOR_REASON="$(compositor_reason "$log")"', self.text)
 
     def test_a_dead_compositor_is_reported_and_not_claimed(self):
-        self.assertIn("exited immediately", self.text)
+        self.assertIn("exited with backend", self.text)
         self.assertIn("pgrep", self.text)
+        self.assertIn("kill -0 \"$COMPOSITOR_PID\"", self.text)
 
     def test_the_backend_is_exported_to_the_adapter(self):
         self.assertIn("export GBA_COMPOSITOR", self.text)
