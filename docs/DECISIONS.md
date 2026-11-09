@@ -859,3 +859,45 @@ exact pre-fix file being rejected), the merge that preserves other mGBA preferen
 resolution, and that the spawned child keeps the `XDG_CONFIG_HOME` pointing at the verified file.
 A future mGBA rename of the section would now fail loudly in the session log instead of silently
 reversing the controls.
+
+## D-057 Presentation is a verified pipeline: a real compositor, GPU OpenGL by default, pixels as evidence
+
+**Status:** Accepted
+
+**Decision.** A bare-X11 appliance session starts a compositor with a command line the compositor
+accepts, records whether it actually stayed alive, and exports the result (`GBA_COMPOSITOR`,
+`GBA_COMPOSITOR_BACKEND`). The adapter then chooses the OpenGL path from that fact — hardware
+OpenGL when a compositor is running, llvmpipe (the historic `LIBGL_ALWAYS_SOFTWARE=1` workaround)
+only when nothing is redirecting the fullscreen window — and finally *verifies the picture* by
+sampling the X11 root window with `libX11` (no extra packages). Four consecutive flat samples
+relaunch mGBA through the next path (software OpenGL → no compositor → windowed), with the native
+state captured first.
+
+**Why.** Two independent faults made "the game runs, the screen is black" machine-dependent:
+
+1. `picom --daemon --backend glx --vsync none`. `--vsync` is a flag, so `none` became a positional
+   argument and picom exited immediately (`picom doesn't accept positional arguments`, verified in
+   `src/options.c`, which rejects positional arguments outright). Its stderr went to `/dev/null`
+   while the script printed "compositor: picom started", so **no compositor ever ran**, and the
+   `glx`-vs-`xrender` reasoning in the old comments described a process that did not exist.
+2. Without a compositor the adapter forced `LIBGL_ALWAYS_SOFTWARE=1`, i.e. llvmpipe, for every
+   fullscreen session. On a 1080p panel that is a full-screen CPU composite per frame; at 60 Hz it
+   cannot keep up, so frames arrive late or never. A smaller, older laptop survives the same
+   configuration, which is exactly the reported "works on my old laptop" asymmetry.
+
+**Evidence.** `mSDLInitBindings…`/`mSDLGLCommonInit` in mgba-sdl 0.10.5 show that when a GL
+context can be created mGBA renders through its own GL path; llvmpipe therefore *is* the frame
+producer whenever software GL is forced. The session script was executed against stub binaries
+(one that exits like real picom on a bad argument, one that stays up) and now reports
+`picom exited immediately …` and `picom running (backend xrender, pid …)` respectively. The XImage
+field offsets used by the sampler (`data` @16, `byte_order` @24, `depth` @40, `bytes_per_line` @44,
+`bits_per_pixel` @48, masks @56/64/72) match Xlib's LP64 layout and are covered by tests that
+decode a synthetic framebuffer.
+
+**Consequences.** Hardware rather than the CPU draws the frame; the compositor is proven to exist;
+and when nothing appears the appliance no longer sits on a black screen — it converges, in at most
+two relaunches, on the configuration that works on *that* machine and names it in the log. A game
+that legitimately shows one flat colour for four seconds costs one restart that resumes at the same
+frame. Desktop sessions are never touched (the ladder exists only for a bare-X11 appliance session),
+and `GBA_VERIFY_DISPLAY=0`, `GBA_COMPOSITOR_BACKEND=glx|none` and `GBA_HARDWARE_GL=0` restore any
+previous behaviour.

@@ -299,19 +299,68 @@ def mtp_report(attempt_mount: bool = True) -> str:
 
 
 def check_compositor() -> Check:
-    """Bare X11 needs a compositor for GL presentation and window focus.
+    """Reports whether a compositor is *running*, not merely installed.
 
-    Without picom or compton, mGBA's OpenGL (even llvmpipe) can't present
-    frames to bare X11, and SDL2 pauses rendering waiting for focus/expose
-    events that Matchbox doesn't send. The gba_session.sh script starts the
-    compositor automatically if one is found.
+    This check used to pass on the presence of the picom binary, which is how
+    the appliance shipped a compositor that could never start: the boot script
+    passed `--vsync none`, picom rejects positional arguments and exited, and
+    the failure went to /dev/null. A compositor only helps if it is alive.
     """
-    found = [c for c in COMPOSITORS if shutil.which(c)]
-    if found:
-        return Check("compositor", PASS, f"{found[0]} available")
+    installed = [c for c in COMPOSITORS if shutil.which(c)]
+    running = ""
+    backend = os.environ.get("GBA_COMPOSITOR_BACKEND", "xrender")
+    try:
+        import gba_adapter_mgba as adapter
+        running = adapter.compositor_running()
+    except Exception:
+        running = ""
+    if running:
+        return Check("compositor", PASS, f"{running} running (backend {backend})")
+    if installed:
+        return Check("compositor", WARN,
+                     f"{installed[0]} installed but not running",
+                     "Run gba-session (it starts the compositor), or start it "
+                     "manually: picom --daemon --backend xrender. Never pass an "
+                     "argument to --vsync: picom treats it as a positional "
+                     "argument and exits.")
     return Check("compositor", WARN, "no compositor found (picom/compton)",
                  "Bare X11 games need a compositor for GL presentation. "
                  "Install one: sudo apt install picom")
+
+
+def check_presentation() -> Check:
+    """Reports the presentation path a game will get, and whether it is readable.
+
+    Answers the two questions a black screen raises: does the GPU draw the
+    frame or does llvmpipe, and can the adapter see the screen at all (which is
+    what lets it notice a frame that never arrives)?
+    """
+    try:
+        import config
+        import gba_adapter_mgba as adapter
+    except Exception as exc:
+        return Check("presentation", WARN, f"could not inspect: {exc}")
+    try:
+        session = config.display_session()
+        if session != "x11":
+            return Check("presentation", PASS,
+                         f"{session} session: presentation is verified by the "
+                         "adapter's window/connector evidence")
+        compositor = adapter.compositor_running()
+        software = adapter.wants_software_gl(os.environ, compositor)
+        path = "software OpenGL (llvmpipe)" if software else "hardware OpenGL"
+        sampling = adapter.x11_framebuffer_sample()
+        if sampling is None:
+            return Check("presentation", WARN,
+                         f"{path}; screen sampling unavailable",
+                         "The adapter cannot read the screen, so a black picture "
+                         "cannot be detected. Check that DISPLAY is set and "
+                         "libX11 is installed.")
+        return Check("presentation", PASS,
+                     f"{path}; screen sampling OK ({len(sampling)} px), "
+                     f"verify with GBA_VERIFY_DISPLAY=0 to disable")
+    except Exception as exc:
+        return Check("presentation", WARN, f"could not inspect: {exc}")
 
 
 def check_window_manager() -> Check:
@@ -373,7 +422,8 @@ def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
     checks: List[Check] = [check_python(), check_fonts(), check_pty(),
                            check_display(), check_mgba(), check_mtp(),
                            check_native_hotkeys(), check_compositor(),
-                           check_window_manager(), check_diagnostics()]
+                           check_presentation(), check_window_manager(),
+                           check_diagnostics()]
     checks.extend(check_modules())
     checks.extend(check_pygame())
     checks.extend(check_storage(data_dir, games_dir))

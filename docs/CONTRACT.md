@@ -374,6 +374,15 @@ Parameters (provisional): N = 3, M = 30.
   headless machine MUST NOT be retried.
 - **D8** [TEST: T-DISPLAY-2] On a bare console the adapter MUST pin `SDL_VIDEO_KMSDRM_DEVICE` to a
   specific card rather than letting SDL choose among several GPUs.
+- **D9** [TEST: T-DISPLAY-3] A bare-X11 session MUST run with a compositor that was verified to have
+  started, using a command line the compositor accepts (`--vsync` is a flag: passing a value makes
+  picom exit and silently removes compositing). Forcing software OpenGL (llvmpipe) MUST NOT be the
+  default when a compositor is redirecting the fullscreen window; it remains the fallback for a
+  session without one (see D-057). The adapter MUST verify that a frame reaches the screen by
+  sampling the X11 root window, and a screen that stays a single colour MUST trigger a bounded
+  relaunch through the next presentation path (software OpenGL, then without the compositor, then
+  windowed) with the emulator state captured first, so no progress is lost. An unsampleable screen
+  MUST NOT be treated as a failure.
 - **D6** [TEST: T-AV-2] The frame-pacing strategy (vsync vs audio-driven timing) MUST be documented in
   `DECISIONS.md` with measurements.
 
@@ -610,6 +619,7 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 | T-INSTALL-8 | `gba-selftest` on a machine with and without mGBA/pygame. | Exit 0 with warnings when only optional parts are missing; exit 1 and a named check when something required is missing. | IN8 |
 | T-DISPLAY-1 | Force mGBA to exit 1 immediately: once under X11, once on a bare console with two DRM cards. | First retries windowed; second retries the other card; a clean exit and a 30 s session are not retried. | D7 |
 | T-DISPLAY-2 | Boot the appliance on a hybrid-GPU laptop. | `SDL_VIDEO_KMSDRM_DEVICE` is set explicitly; no black screen from an output-less card. | D8 |
+| T-DISPLAY-3 | Boot the appliance on a modern GPU at 1920x1080 and start a game. | The log shows `compositor: picom running (backend xrender)`, `Bare X11: hardware OpenGL`, and `[display] picture verified`. If the screen stays black, the log shows the flat-colour samples and at most two `[display] Retry n/2: ...` relaunches before a picture appears; no game progress is lost because each relaunch resumes the captured state. | D9 |
 | T-FALLBACK-1 | Import the launcher with pygame unavailable. | Exit 103, message naming the fix, no traceback. | F4 |
 | T-FALLBACK-2 | Boot with `gba_mode=0`, then with `gba_safe=1`, then without python3. | Shell, recovery console, and rescue shell respectively; never a black screen. | F5 |
 
