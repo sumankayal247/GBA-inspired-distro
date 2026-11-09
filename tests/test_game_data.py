@@ -135,6 +135,63 @@ class TestCheats(StorageTestCase):
             f.write("{broken json")
         self.assertEqual(self.cheats().cheats(), [])
 
+    def test_gb_gameshark_is_normalized_and_other_gb_formats_are_supported(self):
+        store = self.cheats(rom="Pokemon Yellow.gbc")
+        cid = store.add_cheat("Money", "01 99 47 d3", enabled=True)
+        self.assertIsNotNone(cid)
+        self.assertEqual(store.cheats()[0]["code"], "019947D3")
+        for name, code in (("Game Genie", "123-456-789"),
+                           ("CodeBreaker", "D34700-99"),
+                           ("VBA", "D347:99")):
+            self.assertIsNotNone(store.add_cheat(name, code, enabled=True))
+        with open(store.native_path, encoding="utf-8") as native:
+            payload = native.read()
+        self.assertIn("019947D3", payload)
+        self.assertNotIn("!disabled", payload)
+        restarted = self.cheats(rom="Pokemon Yellow.gbc")
+        self.assertTrue(restarted.cheats()[0]["enabled"])
+        self.assertEqual(restarted.cheats()[-1]["code"], "019947D3")  # VBA converted
+        self.assertEqual(restarted.validation_summary()["invalid_lines"], 0)
+        self.assertEqual(restarted.validation_summary()["active_lines"], 4)
+
+    def test_gb_rejects_gba_codes_instead_of_letting_mgba_truncate_them(self):
+        store = self.cheats(rom="Pokemon Yellow.gbc")
+        self.assertIsNone(store.add_cheat("Wrong platform", "01234567 89ABCDEF",
+                                          enabled=True))
+        self.assertEqual(store.cheats(), [])
+        cid = store.add_cheat("Valid", "019947D3", enabled=True)
+        self.assertFalse(store.update_cheat(cid, "Valid", "01234567 89ABCDEF"))
+        self.assertEqual(store.cheats()[0]["code"], "019947D3")
+        self.assertIn("Line 1", store.code_error("NOT-A-CHEAT"))
+
+    def test_legacy_invalid_gb_set_is_preserved_but_forced_disabled(self):
+        store = self.cheats(rom="Pokemon Yellow.gbc")
+        os.makedirs(os.path.dirname(store.native_path), exist_ok=True)
+        with open(store.native_path, "w", encoding="utf-8") as native:
+            native.write("# Wrong platform\n01234567 89ABCDEF\n")
+        imported = self.cheats(rom="Pokemon Yellow.gbc")
+        self.assertEqual(len(imported.cheats()), 1)
+        self.assertTrue(imported.cheats()[0]["enabled"])
+        self.assertEqual(imported.validation_summary()["invalid_sets"], 1)
+        self.assertEqual(imported.validation_summary()["active_lines"], 0)
+        imported.write_native()
+        with open(imported.native_path, encoding="utf-8") as native:
+            payload = native.read()
+        self.assertIn("!disabled\n# Wrong platform", payload)
+        self.assertIn("01234567 89ABCDEF", payload)  # retained so the user can edit it
+        # The safety directive must not erase the persisted UI enabled choice;
+        # it only prevents mGBA from executing a known-invalid set.
+        restarted = self.cheats(rom="Pokemon Yellow.gbc")
+        self.assertTrue(restarted.cheats()[0]["enabled"])
+        cid = restarted.cheats()[0]["id"]
+        self.assertTrue(restarted.set_enabled(cid, False))
+        self.assertFalse(restarted.set_enabled(cid, True))
+
+    def test_gba_multiline_code_format_is_not_rejected_by_gb_validation(self):
+        store = self.cheats(rom="game.gba")
+        self.assertIsNotNone(store.add_cheat("GBA", "01234567 89ABCDEF", enabled=True))
+        self.assertEqual(store.validation_summary()["invalid_lines"], 0)
+
 
 class TestSaveStateStorage(StorageTestCase):
     def test_exactly_nine_slots_all_empty(self):

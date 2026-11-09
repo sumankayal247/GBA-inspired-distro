@@ -287,6 +287,17 @@ and `Shift+Enter` inserts a code newline. New cheats start enabled; edits preser
 enabled/disabled choice. GameShark, Action Replay and CodeBreaker text uses the same native mGBA
 format as manually imported cheats, so no file-manager trip is needed.
 
+**Use codes for the game's actual platform.** Pokémon Yellow is a Game Boy game, so GBA Action
+Replay/GameShark codes will not work. GB/GBC entries accept eight-digit GameShark codes (for example
+`019947D3`; spaced forms such as `01 99 47 D3` are normalized), Game Genie `XXX-XXX[-XXX]`,
+CodeBreaker `XXXXXX-XX`, and VBA `AAAA:VV` lines (converted to the equivalent GameShark RAM write).
+Invalid GB lines are rejected with an editor
+message instead of producing a false “added and enabled” success. An invalid set from an older
+profile remains available to edit but is deliberately written `!disabled`, because mGBA can
+otherwise truncate a GBA-style code and write the wrong Game Boy address. Launch diagnostics report
+the native file, enabled sets, valid enabled lines and invalid sets. Syntax validation cannot prove
+that a code targets the correct ROM region/revision, so use codes published for the exact game dump.
+
 Cheats are loaded through mGBA's own `-c <file>` mechanism (`cheatAutoload=0` when a game has none,
 so no global list leaks in); adding, editing or toggling one persists immediately and the restart
 above picks it up, so the change is active in the running game. Save/load use mGBA's native state hotkeys — sent only while

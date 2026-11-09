@@ -194,6 +194,32 @@ class TestCheatsOverlay(SessionTestCase):
         model.move(1)                           # wraps from Add to first cheat
         self.assertEqual(model.selected_item()["name"], "One")
 
+    def test_gb_editor_explains_invalid_code_and_accepts_spaced_gameshark(self):
+        gb_store = CheatStore(GAME_A, "Pokemon Yellow.gbc", data_dir=self.data_dir)
+        model = CheatsOverlayModel(gb_store)
+        self.assertEqual(model.code_placeholder, "019947D3")
+        self.assertIn("GB GameShark", model.device_hint)
+        model.begin_add()
+        model.insert_text("Wrong platform")
+        model.switch_field(1)
+        model.insert_text("01234567 89abcdef")
+        self.assertFalse(model.save_draft())
+        self.assertIn("invalid Game Boy code", model.message)
+        self.assertEqual(gb_store.cheats(), [])
+        model.draft_code = "01 99 47 d3"
+        self.assertTrue(model.save_draft())
+        self.assertEqual(gb_store.cheats()[0]["code"], "019947D3")
+        self.assertTrue(gb_store.cheats()[0]["enabled"])
+
+        with open(gb_store.native_path, "w", encoding="utf-8") as native:
+            native.write("# Legacy wrong platform\n01234567 89ABCDEF\n")
+        legacy = CheatsOverlayModel(CheatStore(
+            GAME_A, "Pokemon Yellow.gbc", data_dir=self.data_dir))
+        self.assertTrue(legacy.items()[0]["invalid"])
+        self.assertTrue(legacy.toggle())          # enabled legacy row can be turned off
+        self.assertFalse(legacy.toggle())         # but cannot be turned back on
+        self.assertIn("invalid Game Boy code", legacy.message)
+
 
 class NoOverlayBackend(FakeBackend):
     """A backend that cannot take the display for an overlay (no injection)."""
