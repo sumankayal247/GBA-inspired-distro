@@ -383,6 +383,14 @@ Parameters (provisional): N = 3, M = 30.
   relaunch through the next presentation path (software OpenGL, then without the compositor, then
   windowed) with the emulator state captured first, so no progress is lost. An unsampleable screen
   MUST NOT be treated as a failure.
+- **D10** [TEST: T-DISPLAY-4] Starting a compositor MUST NOT depend on the user's config, on the
+  X server being ready when the session script runs, or on no other compositor being present: the
+  compositor is started as a tracked child (never with `--daemon`, which closes its stderr and
+  detaches the PID), the X server's readiness is waited for, a running compositor is reused, a broken
+  config file is bypassed with the default one, an unusable backend is replaced by the other one, and
+  a missing Composite extension is reported instead of retried. When no compositor can be started, a
+  bare-X11 session MUST start windowed rather than fullscreen - the X server then presents the
+  picture and the frame check stays enabled - and MUST NOT silently claim a composited presentation.
 - **D6** [TEST: T-AV-2] The frame-pacing strategy (vsync vs audio-driven timing) MUST be documented in
   `DECISIONS.md` with measurements.
 
@@ -627,6 +635,7 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 | T-INSTALL-9 | Copy the previous release's `gba-session` over `/usr/local/bin/gba-session`, then update only the adapter and boot. | The install refuses to leave a copy that differs from the shipped script; `gba-selftest` names the stale file and prints the `--apply --repair` command; the adapter starts a compositor itself and logs the warning instead of showing a black screen. | IN9 |
 | T-DISPLAY-1 | Force mGBA to exit 1 immediately: once under X11, once on a bare console with two DRM cards. | First retries windowed; second retries the other card; a clean exit and a 30 s session are not retried. | D7 |
 | T-DISPLAY-2 | Boot the appliance on a hybrid-GPU laptop. | `SDL_VIDEO_KMSDRM_DEVICE` is set explicitly; no black screen from an output-less card. | D8 |
+| T-DISPLAY-4 | Boot with: (a) a broken `~/.config/picom.conf`, (b) another compositor already running, (c) `DISPLAY` not yet accepting connections, (d) an X server without Composite. | (a) picom starts with the default config; (b) the running compositor is reused, not fought; (c) the session waits, then reports success or the compositor's own error line; (d) the log names the missing extension and no attempt is made. If none can start, the session is windowed and the log says so. | D10 |
 | T-DISPLAY-3 | Boot the appliance on a modern GPU at 1920x1080 and start a game. | The log shows `compositor: picom running (backend xrender)`, `Bare X11: hardware OpenGL`, and `[display] picture verified`. If the screen stays black, the log shows the flat-colour samples and at most two `[display] Retry n/2: ...` relaunches before a picture appears; no game progress is lost because each relaunch resumes the captured state. | D9 |
 | T-FALLBACK-1 | Import the launcher with pygame unavailable. | Exit 103, message naming the fix, no traceback. | F4 |
 | T-FALLBACK-2 | Boot with `gba_mode=0`, then with `gba_safe=1`, then without python3. | Shell, recovery console, and rescue shell respectively; never a black screen. | F5 |

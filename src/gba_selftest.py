@@ -307,6 +307,13 @@ def check_compositor() -> Check:
     the failure went to /dev/null. A compositor only helps if it is alive.
     """
     installed = [c for c in COMPOSITORS if shutil.which(c)]
+    if not (os.environ.get("DISPLAY") or "").strip():
+        # The boot-time self-test runs before xinit: nothing can be compositing
+        # yet, and reporting that as a problem sent the reader looking for a
+        # fault that was not there ("picom installed but not running").
+        return Check("compositor", PASS,
+                     "not running yet: no X server at this point in the boot "
+                     "(the session starts it)")
     running = ""
     backend = os.environ.get("GBA_COMPOSITOR_BACKEND", "xrender")
     try:
@@ -319,9 +326,12 @@ def check_compositor() -> Check:
     if installed:
         return Check("compositor", WARN,
                      f"{installed[0]} installed but not running",
-                     "Run gba-session (it starts the compositor), or start it "
-                     "manually: picom --daemon --backend xrender. Never pass an "
-                     "argument to --vsync: picom treats it as a positional "
+                     "Run gba-session (it starts the compositor and records "
+                     "the compositor's own reason when it cannot), or start it "
+                     "manually: picom --backend xrender & . Do not add "
+                     "--daemon: picom closes its own stderr once it daemonizes, "
+                     "which is how a real failure became invisible. Never pass "
+                     "an argument to --vsync: picom treats it as a positional "
                      "argument and exits.")
     return Check("compositor", WARN, "no compositor found (picom/compton)",
                  "Bare X11 games need a compositor for GL presentation. "

@@ -1,6 +1,237 @@
 #!/bin/bash
 # Shared X11 / KMS appliance session. Keep the automounter in the same user
 # context as the launcher; udisks2 uses the system bus, not a desktop session.
+#
+# --- compositor helpers ------------------------------------------------------
+# A compositor is only useful if it is *proven* to be running, and every reason
+# it can fail has to end up in the boot log. These helpers do three things the
+# old one-liner did not:
+#
+#   * they wait for the X server to accept connections before asking another
+#     client to talk to it (picom racing xinit is "Can't open display"),
+#   * they run the compositor as a tracked child instead of with `--daemon`,
+#     because picom's own src/picom.c closes stdout/stderr and calls setsid()
+#     once it has daemonized - a daemonized failure is invisible, and the
+#     process the shell forked is gone before the compositor is proven,
+#   * they retry along the ways a compositor can still succeed (other backend,
+#     default config) and print the compositor's own words when every way
+#     failed, instead of "the reason is in the log above".
+wait_for_x_display() {
+    [ -n "${DISPLAY:-}" ] || return 1
+    local i
+    for i in $(seq 1 30); do
+        if command -v xdpyinfo >/dev/null 2>&1; then
+            xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && return 0
+        elif command -v xset >/dev/null 2>&1; then
+            xset -display "$DISPLAY" q >/dev/null 2>&1 && return 0
+        else
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+composite_extension() {
+    # ok | missing | unknown (no xdpyinfo to ask with)
+    command -v xdpyinfo >/dev/null 2>&1 || { echo unknown; return 0; }
+    if xdpyinfo -display "${DISPLAY:-}" 2>/dev/null | grep -qw Composite; then
+        echo ok
+    else
+        echo missing
+    fi
+}
+
+compositor_reason() {
+    # One line that explains an exit, taken from the attempt's own output.
+    local reason
+    reason="$(grep -m1 -iE 'fatal|error|cannot|can.t|failed' "$1" 2>/dev/null || true)"
+    if [ -z "$reason" ]; then
+        reason="$(tail -n 1 "$1" 2>/dev/null || true)"
+    fi
+    if [ -z "$reason" ]; then
+        reason="exited without leaving a message"
+    fi
+    printf '%s' "$reason"
+}
+
+compositor_attempt() {
+    # $1 backend, $2 config path ("" = the user's own config).
+    # Returns 0 only when the process is still alive after ~1.2s.
+    local backend="$1" config="$2" log i
+    log="/run/gba/compositor.log"
+    mkdir -p /run/gba 2>/dev/null || log="/tmp/gba-compositor.log"
+    : > "$log" 2>/dev/null || log=/dev/null
+    if [ -n "$config" ]; then
+        "$COMPOSITOR_BIN" --backend "$backend" --config "$config" >"$log" 2>&1 &
+    else
+        "$COMPOSITOR_BIN" --backend "$backend" >"$log" 2>&1 &
+    fi
+    COMPOSITOR_PID=$!
+    for i in $(seq 1 12); do
+        kill -0 "$COMPOSITOR_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$COMPOSITOR_PID" 2>/dev/null; then
+        COMPOSITOR_LOG="$log"
+        return 0
+    fi
+    COMPOSITOR_REASON="$(compositor_reason "$log")"
+    if [ -n "$config" ]; then
+        echo "[session] compositor: $COMPOSITOR_BIN exited with backend $backend and the default config: $COMPOSITOR_REASON" >&2
+    else
+        echo "[session] compositor: $COMPOSITOR_BIN exited with backend $backend: $COMPOSITOR_REASON" >&2
+    fi
+    [ "$log" = "/dev/null" ] || rm -f "$log" 2>/dev/null || true
+    return 1
+}
+
+start_session_compositor() {
+# --- compositor ----------------------------------------------------------
+# Three faults used to hide here, and together they explain "the game runs
+# but the screen is black on one laptop and fine on another":
+#
+# 1. `picom --vsync` takes NO argument. The old command passed `none`,
+#    which picom rejects as a positional argument ("picom doesn't accept
+#    positional arguments") and exits immediately. Its stderr went to
+#    /dev/null and the script printed "compositor: picom started" anyway,
+#    so NO compositor has ever run - on any machine.
+# 2. The GLX backend is CPU-bound whenever software OpenGL (llvmpipe) is
+#    in use, and at 1920x1080 that is a full-screen GLX composite every
+#    frame. The xrender backend composites the same windows without GL,
+#    so it is the default; GBA_COMPOSITOR_BACKEND=glx restores the old
+#    attempt and `none` disables compositing for this session.
+# 3. `--daemon` hid every later failure (picom closes its own stderr when
+#    it daemonizes) and made the survival check meaningless. See the
+#    helpers above: tracked child, real exit, real reason.
+#
+# The reasons a compositor still fails on a machine that is otherwise
+# fine, all handled below without a human reading the log first:
+#   * the X server is not accepting connections yet      -> wait for it
+#   * another compositor already owns the overlay        -> reuse it
+#   * the X server has no Composite extension            -> say so, skip
+#   * a broken ~/.config/picom.conf                      -> retry with none
+#   * the backend cannot initialise on this GPU          -> try the other
+GBA_COMPOSITOR_BACKEND="${GBA_COMPOSITOR_BACKEND:-xrender}"
+export GBA_COMPOSITOR_BACKEND
+# Status, not intent: empty means "no compositor is running". The reason is
+# kept in GBA_COMPOSITOR_REASON, and GBA_COMPOSITOR_DISABLED marks the one case
+# where no compositor is *wanted* - otherwise the adapter retries once the
+# session is fully up, which is a different moment from this one.
+GBA_COMPOSITOR_REQUEST="${GBA_COMPOSITOR:-}"
+GBA_COMPOSITOR=""
+GBA_COMPOSITOR_REASON=""
+GBA_COMPOSITOR_DISABLED=""
+# A caller can still ask for no compositing by exporting GBA_COMPOSITOR=none
+# before the session; that is the only way that value is a request, and it is
+# converted into the explicit marker here so the adapter cannot confuse it with
+# the status "nothing came up".
+if [ "$GBA_COMPOSITOR_REQUEST" = "none" ] || [ "$GBA_COMPOSITOR_BACKEND" = "none" ]; then
+    GBA_COMPOSITOR_DISABLED=1
+    GBA_COMPOSITOR=""
+    GBA_COMPOSITOR_REASON="disabled on request"
+    echo "[session] compositor: disabled (GBA_COMPOSITOR_DISABLED=1)" >&2
+else
+    COMPOSITOR_BIN=""
+    if command -v picom >/dev/null 2>&1; then
+        COMPOSITOR_BIN="picom"
+    elif command -v compton >/dev/null 2>&1; then
+        COMPOSITOR_BIN="compton"
+    fi
+    COMPOSITOR_EXISTING=""
+    if command -v pgrep >/dev/null 2>&1; then
+        for candidate in picom compton; do
+            if pgrep -x "$candidate" >/dev/null 2>&1; then
+                COMPOSITOR_EXISTING="$candidate"
+                break
+            fi
+        done
+    fi
+    if [ -n "$COMPOSITOR_EXISTING" ]; then
+        # Starting a second one is not harmless: picom registers
+        # _NET_WM_CM_Sn, finds the overlay taken and exits with "Another
+        # composite manager is already running" - losing a compositor that
+        # was working.
+        GBA_COMPOSITOR="$COMPOSITOR_EXISTING"
+        echo "[session] compositor: $COMPOSITOR_EXISTING already running (reusing it)" >&2
+    elif [ -z "$COMPOSITOR_BIN" ]; then
+        GBA_COMPOSITOR_REASON="no compositor installed (picom/compton)"
+        echo "[session] WARNING: no compositor found (picom/compton); a fullscreen OpenGL window may show nothing" >&2
+        echo "[session]   Install: sudo apt install picom" >&2
+    else
+        if ! wait_for_x_display; then
+            echo "[session] WARNING: $DISPLAY did not accept a connection within 3s; starting $COMPOSITOR_BIN anyway" >&2
+        fi
+        if [ "$(composite_extension)" = "missing" ]; then
+            GBA_COMPOSITOR_REASON="the X server has no Composite extension"
+            echo "[session] compositor: the X server has no Composite extension, so no compositor can ever run; continuing without one" >&2
+        else
+            COMPOSITOR_OTHER="glx"
+            [ "$GBA_COMPOSITOR_BACKEND" = "glx" ] && COMPOSITOR_OTHER="xrender"
+            COMPOSITOR_ATTEMPTS=("$GBA_COMPOSITOR_BACKEND|" \
+                                 "$COMPOSITOR_OTHER|" \
+                                 "$GBA_COMPOSITOR_BACKEND|/dev/null")
+            COMPOSITOR_TRIED=0
+            COMPOSITOR_VERDICT=""
+            COMPOSITOR_ONLY_DEFAULT=0
+            for attempt in "${COMPOSITOR_ATTEMPTS[@]}"; do
+                if [ "$COMPOSITOR_ONLY_DEFAULT" = "1" ] && [ -z "${attempt#*|}" ]; then
+                    # The user's config file is the problem: another backend
+                    # would fail exactly the same way, so go straight to the
+                    # default-config attempt.
+                    continue
+                fi
+                COMPOSITOR_TRIED=$((COMPOSITOR_TRIED + 1))
+                attempt_backend="${attempt%%|*}"
+                attempt_config="${attempt#*|}"
+                if compositor_attempt "$attempt_backend" "$attempt_config"; then
+                    GBA_COMPOSITOR="$COMPOSITOR_BIN"
+                    echo "[session] compositor: $COMPOSITOR_BIN running (backend $attempt_backend, pid $COMPOSITOR_PID)" >&2
+                    # Keep its output: a compositor that dies later leaves the
+                    # reason there instead of nowhere at all.
+                    if [ "$COMPOSITOR_LOG" != "/dev/null" ]; then
+                        echo "[session] compositor: $COMPOSITOR_BIN output -> $COMPOSITOR_LOG" >&2
+                    fi
+                    break
+                fi
+                # Three failures are worth no second try: the overlay belongs to somebody
+                # else, the X server refuses connections, or it has no Composite extension.
+                COMPOSITOR_LOWER="$(printf '%s' "$COMPOSITOR_REASON" | tr 'A-Z' 'a-z')"
+                case "$COMPOSITOR_LOWER" in
+                    *config*)
+                        echo "[session] compositor: picom could not read a config file; the next attempt ignores it, and you can fix or delete $HOME/.config/picom/picom.conf" >&2
+                        COMPOSITOR_ONLY_DEFAULT=1
+                        continue
+                        ;;
+                    *"another composite manager"*)
+                        COMPOSITOR_VERDICT="another compositor already owns the screen"
+                        break
+                        ;;
+                    *"open display"*)
+                        COMPOSITOR_VERDICT="the X server refused the connection ($COMPOSITOR_REASON)"
+                        break
+                        ;;
+                    *composite*extension*)
+                        COMPOSITOR_VERDICT="the X server has no Composite extension ($COMPOSITOR_REASON)"
+                        break
+                        ;;
+                esac
+            done
+            if [ -z "$GBA_COMPOSITOR" ]; then
+                [ -n "$COMPOSITOR_VERDICT" ] || \
+                    COMPOSITOR_VERDICT="no compositor could be started after $COMPOSITOR_TRIED attempt(s)"
+                GBA_COMPOSITOR_REASON="$COMPOSITOR_VERDICT"
+                echo "[session] WARNING: compositor: $COMPOSITOR_VERDICT; continuing without one. On a driver where a fullscreen OpenGL window cannot present by itself this is a black screen - the adapter starts such a session windowed instead, and its own log line says so." >&2
+            fi
+        fi
+    fi
+fi
+    export GBA_COMPOSITOR GBA_COMPOSITOR_REASON GBA_COMPOSITOR_DISABLED
+    if [ -n "$GBA_COMPOSITOR_REASON" ] && [ -z "$GBA_COMPOSITOR_DISABLED" ]; then
+        echo "[session] compositor: passing the reason to the adapter: $GBA_COMPOSITOR_REASON" >&2
+    fi
+}
+
 if [ -n "${DISPLAY:-}" ]; then
     export GBA_BARE_X11=1
     xhost +local: >/dev/null 2>&1 || true
@@ -20,66 +251,10 @@ if [ -n "${DISPLAY:-}" ]; then
     fi
 
     # --- compositor ----------------------------------------------------------
-    # Two faults used to hide here, and together they explain "the game runs
-    # but the screen is black on one laptop and fine on another":
-    #
-    # 1. `picom --vsync` takes NO argument. The old command passed `none`,
-    #    which picom rejects as a positional argument ("picom doesn't accept
-    #    positional arguments") and exits immediately. Its stderr went to
-    #    /dev/null and the script printed "compositor: picom started" anyway,
-    #    so NO compositor has ever run - on any machine.
-    # 2. The GLX backend is CPU-bound whenever software OpenGL (llvmpipe) is
-    #    in use, and at 1920x1080 that is a full-screen GLX composite every
-    #    frame. The xrender backend composites the same windows without GL,
-    #    so it is the default; GBA_COMPOSITOR_BACKEND=glx restores the old
-    #    attempt and `none` disables compositing for this session.
-    #
-    # The compositor is only worth having if it is really running, so its
-    # stderr stays in the session log and the result is checked.
-    GBA_COMPOSITOR_BACKEND="${GBA_COMPOSITOR_BACKEND:-xrender}"
-    export GBA_COMPOSITOR_BACKEND
-    GBA_COMPOSITOR="none"
-    if [ "$GBA_COMPOSITOR_BACKEND" = "none" ]; then
-        echo "[session] compositor: disabled (GBA_COMPOSITOR_BACKEND=none)" >&2
-    else
-        COMPOSITOR_BIN=""
-        if command -v picom >/dev/null 2>&1; then
-            COMPOSITOR_BIN="picom"
-        elif command -v compton >/dev/null 2>&1; then
-            COMPOSITOR_BIN="compton"
-        fi
-        if [ -n "$COMPOSITOR_BIN" ] && ! command -v pgrep >/dev/null 2>&1; then
-            # Without procps we cannot prove a daemon survived, so say that
-            # instead of claiming a compositor that may not exist.
-            "$COMPOSITOR_BIN" --daemon --backend "$GBA_COMPOSITOR_BACKEND" &
-            sleep 0.7
-            GBA_COMPOSITOR="$COMPOSITOR_BIN"
-            echo "[session] compositor: requested $COMPOSITOR_BIN (backend $GBA_COMPOSITOR_BACKEND); pgrep is missing, so the result is unverified" >&2
-        elif [ -n "$COMPOSITOR_BIN" ]; then
-            compositor_before="$(pgrep -c -x "$COMPOSITOR_BIN" 2>/dev/null || true)"
-            compositor_before="${compositor_before:-0}"
-            # No `2>/dev/null`: a rejected option must reach the boot log, and
-            # no `--vsync` argument either - it is a flag, not an option.
-            "$COMPOSITOR_BIN" --daemon --backend "$GBA_COMPOSITOR_BACKEND" &
-            sleep 0.7
-            compositor_after="$(pgrep -c -x "$COMPOSITOR_BIN" 2>/dev/null || true)"
-            compositor_after="${compositor_after:-0}"
-            if [ "$compositor_after" -gt "$compositor_before" ]; then
-                GBA_COMPOSITOR="$COMPOSITOR_BIN"
-                echo "[session] compositor: $COMPOSITOR_BIN running (backend $GBA_COMPOSITOR_BACKEND, pid $(pgrep -x "$COMPOSITOR_BIN" | head -1))" >&2
-            elif [ "$compositor_after" -gt 0 ]; then
-                # An older instance from a previous session owns the overlay.
-                GBA_COMPOSITOR="$COMPOSITOR_BIN"
-                echo "[session] compositor: $COMPOSITOR_BIN already running (backend requested: $GBA_COMPOSITOR_BACKEND)" >&2
-            else
-                echo "[session] WARNING: $COMPOSITOR_BIN exited immediately with backend $GBA_COMPOSITOR_BACKEND; the reason is in the log above. Continuing without a compositor." >&2
-            fi
-        else
-            echo "[session] WARNING: no compositor found (picom/compton); a fullscreen OpenGL window may not present" >&2
-            echo "[session]   Install: sudo apt install picom" >&2
-        fi
-    fi
-    export GBA_COMPOSITOR
+    # The whole decision - reuse, wait for X, check Composite, try the other
+    # backend, try the default config, report the compositor's own reason - is
+    # one function, so it can be tested without a machine to boot.
+    start_session_compositor
 
     # Give WM and compositor time to initialize before apps start
     sleep 0.5
