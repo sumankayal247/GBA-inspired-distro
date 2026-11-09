@@ -225,7 +225,24 @@ Browser: `Ctrl+L` types an address, `Tab` / `1`–`9` pick a link, `Enter` opens
 
 All ten GBA buttons are remappable under **SETTINGS → Controls → Remap buttons**; the same profile
 drives both the shell and mGBA (written into the handler's `config.ini`), so a gamepad behaves
-identically in the two. Reserved shell keys (Esc, Tab, arrows, Ctrl/Alt) and duplicate assignments
+identically in the two.
+
+The bindings go into `[gba.input.SDLK]` — the only section mGBA's SDL frontend reads for the
+keyboard (it builds the name from `GBAInputInfo.platformName` plus the `SDLK` binding id). Anything
+written elsewhere is ignored without an error and the game quietly keeps mGBA's built-in
+`X` = `A` / `Z` = `B` defaults, which is why an earlier release could report success while the
+controls were still swapped in-game. Each launch re-writes the file, merges it into the existing
+mGBA config (your other mGBA settings are kept) and re-reads it with mGBA's own lookup rules. To
+check what the emulator will get:
+
+```bash
+grep -A11 '\[gba.input.SDLK\]' "${XDG_CONFIG_HOME:-$HOME/.config}/mgba/config.ini"
+grep -i 'keyboard profile' "$(ls -t /data/logs/*.log | head -1)"
+```
+
+The session log must say `mGBA keyboard profile verified ... A=122 B=120` (122 = `Z`, 120 = `X`).
+If it says anything else it also says why — a Qt build of mGBA or a `portable.ini` next to the
+binary both make mGBA read a different profile. Reserved shell keys (Esc, Tab, arrows, Ctrl/Alt) and duplicate assignments
 are rejected with an inline explanation. The default profile changed in this release: `Z` is now
 **A** and `X` is **B** (they were swapped). A profile you customised is never overwritten — only a
 stored profile that is still exactly the old stock pair is migrated.
