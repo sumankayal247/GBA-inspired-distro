@@ -304,6 +304,27 @@ def resolve_event_keycode(event) -> int:
         return SCANCODE_TO_KEYCODE[scancode]
     return event.key
 
+# The exact config section mGBA's SDL frontend reads keyboard bindings from.
+#
+# mGBA builds the name in src/core/input.c as
+#   "<platformName>.input.<binding>"   (4 chars, 'SDLK' for keys)
+# where the platform name comes from the input map the frontend initialises,
+# and the SDL port always initialises it with GBAInputInfo (platformName
+# "gba").  It then looks up "key" + keyId[i] inside that section, which gives
+# exactly the names this project already uses (keyA, keyB, keySelect, ...).
+#
+# Earlier releases of this project wrote [input.SDLK]; mGBA never reads that
+# section, so every game silently fell back to mGBA's built-in X=A / Z=B
+# defaults while the shell kept using Z=A / X=B.  That is the "controls are
+# swapped as soon as a game starts" bug, and no amount of rewriting the old
+# section could fix it.
+MGBA_INPUT_SECTION = "gba.input.SDLK"
+
+# Sections older releases wrote.  mGBA ignores them, but an existing profile
+# there may still hold bindings a user chose, so it is read as a fallback and
+# kept in sync when present.
+MGBA_STALE_INPUT_SECTIONS = ("input.SDLK",)
+
 # The shipped defaults before the Z -> A / X -> B correction. The reversed pair
 # identifies profiles written by older installs; migration changes only that
 # pair and preserves every unrelated custom binding.
@@ -391,22 +412,47 @@ def load_keybindings() -> dict:
         except Exception:
             pass
 
-    # 2. Try mGBA config.ini
+    # 2. Try the mGBA config the emulator itself reads, then (only as a
+    #    fallback) the section older releases wrote into it.
     mgba_cfg = os.path.expanduser("~/.config/mgba/config.ini")
     if os.path.isfile(mgba_cfg):
-        try:
-            cp = configparser.ConfigParser()
-            cp.optionxform = str
-            cp.read(mgba_cfg)
-            if "input.SDLK" in cp:
-                for k in bindings.keys():
-                    if k in cp["input.SDLK"]:
-                        bindings[k] = int(cp["input.SDLK"][k])
-                return sanitize_keybindings(migrate_legacy_keybindings(bindings))
-        except Exception:
-            pass
+        loaded = read_mgba_keybindings(mgba_cfg)
+        if loaded is not None:
+            bindings.update({k: v for k, v in loaded.items() if k in bindings})
+            return sanitize_keybindings(migrate_legacy_keybindings(bindings))
 
     return sanitize_keybindings(bindings)
+
+
+def read_mgba_keybindings(path: str) -> Optional[dict]:
+    """Reads bindings from an mGBA config.ini the way mGBA reads them.
+
+    The live section ([gba.input.SDLK]) wins.  The legacy [input.SDLK] section
+    older releases wrote is only used when the live one is absent, so a stale
+    swapped pair can never override a profile mGBA is actually honouring.
+    Returns None when the file holds neither section.
+    """
+    import configparser
+    try:
+        cp = configparser.ConfigParser()
+        cp.optionxform = str
+        cp.read(path)
+    except Exception:
+        return None
+    for section in (MGBA_INPUT_SECTION,) + MGBA_STALE_INPUT_SECTIONS:
+        if section not in cp:
+            continue
+        found = {}
+        for key in DEFAULT_KEYBINDINGS:
+            if key in cp[section]:
+                try:
+                    found[key] = int(cp[section][key])
+                except (TypeError, ValueError):
+                    continue
+        if found:
+            return found
+    return None
+
 
 def save_keybindings(bindings: dict) -> None:
     """Persists keybindings to both JSON config and mGBA config.ini."""
@@ -457,10 +503,18 @@ def save_keybindings(bindings: dict) -> None:
                     "lockAspectRatio": "1",
                     "lockIntegerScaling": "0"
                 }
-            if "input.SDLK" not in cp:
-                cp["input.SDLK"] = {}
+            # Always write the section mGBA actually reads.
+            if MGBA_INPUT_SECTION not in cp:
+                cp[MGBA_INPUT_SECTION] = {}
             for k, v in bindings.items():
-                cp["input.SDLK"][k] = str(v)
+                cp[MGBA_INPUT_SECTION][k] = str(v)
+            # Keep a stale section in step if an older release left one behind,
+            # so the file cannot show two different A/B pairs.
+            for section in MGBA_STALE_INPUT_SECTIONS:
+                if section not in cp:
+                    continue
+                for k, v in bindings.items():
+                    cp[section][k] = str(v)
             with open(p, "w", encoding="utf-8") as f:
                 cp.write(f)
         except Exception:

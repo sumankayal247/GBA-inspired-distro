@@ -12,6 +12,7 @@ import shutil
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 import common
+import config
 from gba_adapter_mgba import (
     retry_strategy,
     sync_directory,
@@ -140,12 +141,28 @@ class TestAdapterContract(unittest.TestCase):
         self.assertNotIn("-f", windowed)
         self.assertIn("-3", windowed)
 
+    @staticmethod
+    def ini(config_dir, section=None):
+        """A config.ini section, parsed the way mGBA parses it."""
+        import configparser
+        cp = configparser.ConfigParser()
+        cp.optionxform = str
+        cp.read(os.path.join(config_dir, "config.ini"))
+        return cp[section or common.MGBA_INPUT_SECTION]
+
     def test_h1_shared_input_profile_written_into_config_dir(self):
         """I3/H5: the emulator config is derived from the shared profile."""
         config_dir = os.path.join(self.test_dir, "config", "handlers", "mgba-adapter")
         home = tempfile.mkdtemp()
         old_home = os.environ.get("HOME")
         os.environ["HOME"] = home
+        # keybindings.json lives in the data dir: isolate it as well, or this
+        # test writes a custom profile into the developer's checkout and the
+        # next test reads it back.
+        data_dir = mock.patch.object(common, "get_data_dir", lambda: home)
+        data_dir.start()
+        settings_dir = mock.patch.object(config, "get_data_dir", lambda: home)
+        settings_dir.start()
         try:
             bindings = dict(common.DEFAULT_KEYBINDINGS)
             bindings["keyA"] = 113  # F2
@@ -154,16 +171,16 @@ class TestAdapterContract(unittest.TestCase):
             from gba_adapter_mgba import ensure_mgba_config
             ensure_mgba_config(config_dir)
 
-            with open(os.path.join(config_dir, "config.ini"), "r") as f:
-                content = f.read()
-            self.assertIn("keyA=113", content)
-            self.assertIn("fullscreen=1", content)
+            self.assertEqual(self.ini(config_dir)["keyA"], "113")
+            self.assertEqual(self.ini(config_dir, "ports.sdl")["fullscreen"], "1")
             # Display scaling is honoured too.
             common.save_display_config({"scaling": "stretch"})
             ensure_mgba_config(config_dir)
-            with open(os.path.join(config_dir, "config.ini"), "r") as f:
-                self.assertIn("lockIntegerScaling=0", f.read())
+            self.assertEqual(
+                self.ini(config_dir, "ports.sdl")["lockIntegerScaling"], "0")
         finally:
+            settings_dir.stop()
+            data_dir.stop()
             if old_home is not None:
                 os.environ["HOME"] = old_home
             shutil.rmtree(home, ignore_errors=True)
@@ -180,10 +197,9 @@ class TestAdapterContract(unittest.TestCase):
                 common.save_keybindings(dict(common.DEFAULT_KEYBINDINGS))
                 from gba_adapter_mgba import ensure_mgba_config
                 ensure_mgba_config(config_dir)
-                with open(os.path.join(config_dir, "config.ini"), "r") as f:
-                    content = f.read()
-                self.assertIn("keyA=122", content)     # Z
-                self.assertIn("keyB=120", content)     # X
+                section = self.ini(config_dir)
+                self.assertEqual(section["keyA"], "122")   # Z
+                self.assertEqual(section["keyB"], "120")   # X
             finally:
                 shutil.rmtree(home, ignore_errors=True)
 
@@ -200,11 +216,10 @@ class TestAdapterContract(unittest.TestCase):
             try:
                 from gba_adapter_mgba import ensure_mgba_config
                 ensure_mgba_config(config_dir)
-                with open(os.path.join(config_dir, "config.ini"), "r") as f:
-                    content = f.read()
-                self.assertIn("keyA=122", content)     # Z = A
-                self.assertIn("keyB=120", content)     # X = B
-                self.assertIn("keyR=114", content)     # unrelated custom key survives
+                section = self.ini(config_dir)
+                self.assertEqual(section["keyA"], "122")   # Z = A
+                self.assertEqual(section["keyB"], "120")   # X = B
+                self.assertEqual(section["keyR"], "114")   # custom key survives
             finally:
                 shutil.rmtree(home, ignore_errors=True)
 
@@ -306,7 +321,8 @@ class TestDisplayGeometry(unittest.TestCase):
 
     def test_config_template_disables_rewind(self):
         import gba_adapter_mgba
-        self.assertIn("rewindEnable=0", gba_adapter_mgba.MIGBA_CONFIG_TEMPLATE)
+        self.assertIn("rewindEnable", gba_adapter_mgba.MIGBA_CONFIG_TEMPLATE)
+        self.assertIn("= 0", gba_adapter_mgba.MIGBA_CONFIG_TEMPLATE)
 
 
 if __name__ == "__main__":

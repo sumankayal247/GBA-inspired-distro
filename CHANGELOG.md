@@ -4,6 +4,28 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — In-game A/B fixed: bindings now reach the section mGBA reads
+
+Suite: **546 passing, 1 skipped** (`make test`).
+
+### Fixed
+
+- **`Z` = `A` / `X` = `B` really applies in-game now.** The shell and the emulator disagreed
+  because the profile was written into `[input.SDLK]`, a section mGBA's SDL frontend never reads.
+  mGBA builds its section as `<platform>.input.<binding>` from `GBAInputInfo` (`platformName`
+  `gba`) and the `SDLK` key id, so the live name is `[gba.input.SDLK]`; the profile is now written
+  there by both the adapter and `save_keybindings()`, and read from there too. Proof against a
+  locally built mGBA 0.10.5 (`mCoreConfigLoadPath` + `mInputMapLoad`, the same calls the SDL
+  frontend makes): the old file resolves `Z` → `B` and `X` → `A` (mGBA's built-in defaults, the
+  reported bug), the corrected file resolves `Z` → `A` and `X` → `B`.
+- **Config no longer clobbered.** The adapter rewrote `config.ini` from a bare template on every
+  launch; it now merges only the settings this distro owns, so other mGBA preferences survive.
+- **Silent failures are now loud.** After writing, the adapter re-reads the file with mGBA's lookup
+  rules and logs `mGBA keyboard profile verified ... A=122 B=120`, or an error naming the file and
+  the mismatch. A Qt mGBA build or a `portable.ini` beside the binary (both of which move the
+  config mGBA reads) is reported instead of being mistaken for success. The profile is also
+  re-written and re-verified on every relaunch, so a mapping changed before a restart applies.
+
 ## [Unreleased] — Game Boy cheat validation and real mGBA application checks
 
 Suite: **532 passing, 1 skipped** (`make test`).

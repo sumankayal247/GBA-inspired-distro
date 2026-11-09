@@ -341,8 +341,13 @@ Parameters (provisional): N = 3, M = 30.
 - **I4** [TEST: T-INPUT-3] Controllers MUST be usable when connected after boot.
 - **I5** [REVIEW] USB controllers are in scope for Phase 1. Bluetooth is not.
 - **I6** [TEST: T-INPUT-1, T-INPUT-4] The shipped keyboard profile MUST map `Z` to the GBA `A`
-  button and `X` to `B` (`DEFAULT_KEYBINDINGS` = 122/120, and the same values written into the
-  mGBA `config.ini`). An unversioned/v1/v2 stored profile containing the legacy reversed A/B pair
+  button and `X` to `B` (`DEFAULT_KEYBINDINGS` = 122/120). The same values MUST be written into the
+  section mGBA's SDL frontend actually parses, `[gba.input.SDLK]` in
+  `$XDG_CONFIG_HOME/mgba/config.ini` (mGBA forms this from `GBAInputInfo.platformName` + the
+  `SDLK` binding id and looks up `keyA`/`keyB` inside it). A profile written anywhere else is
+  silently ignored and the game falls back to mGBA's built-in `X` = `A` / `Z` = `B`, so the launch
+  log MUST state that the profile was verified for the file mGBA will read, and MUST report the
+  reason when a Qt build or a `portable.ini` redirects the emulator's config. An unversioned/v1/v2 stored profile containing the legacy reversed A/B pair
   MUST have that pair repaired even when other buttons are customised, and those other custom
   bindings MUST survive. A profile saved by the current profile version is an explicit user choice
   and MUST NOT be overwritten by later default migrations.
@@ -557,7 +562,7 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 
 | ID | Procedure | Pass criteria | Verifies |
 |---|---|---|---|
-| T-INPUT-4 | Fresh install: press `Z` then `X` in a game; then import a legacy profile and a customised one. | `Z` acts as `A`, `X` as `B`; the untouched legacy profile is migrated; a customised profile keeps every custom binding. | I6 |
+| T-INPUT-4 | Fresh install: press `Z` then `X` in a game; then import a legacy profile and a customised one. | `Z` acts as `A`, `X` as `B`; the untouched legacy profile is migrated; a customised profile keeps every custom binding. The session log contains `mGBA keyboard profile verified ... A=122 B=120`, and `[gba.input.SDLK]` in the config mGBA reads carries those values. | I6 |
 
 ### Saves
 

@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common import (
     setup_logging, load_keybindings, load_display_config, DEFAULT_KEYBINDINGS,
-    compute_content_id, extract_gba_title,
+    compute_content_id, extract_gba_title, MGBA_INPUT_SECTION,
 )
 import config as settings_store
 from config import (
@@ -136,24 +136,53 @@ def evdev_button_map(bindings: dict):
             result[code] = button_id
     return result
 
-MIGBA_CONFIG_TEMPLATE = """[ports.sdl]
-fullscreen={fullscreen}
-lockAspectRatio={aspect}
-lockIntegerScaling={integer}
-rewindEnable=0
+def _render_mgba_config(bindings: dict, integer: bool, windowed: bool,
+                        existing: str = "") -> str:
+    """Renders the managed part of mGBA's config.ini.
 
-[input.SDLK]
-keyUp={keyUp}
-keyDown={keyDown}
-keyLeft={keyLeft}
-keyRight={keyRight}
-keyA={keyA}
-keyB={keyB}
-keyL={keyL}
-keyR={keyR}
-keyStart={keyStart}
-keySelect={keySelect}
-"""
+    Only the keys this distro owns are set: display/rewind options and the
+    keyboard profile.  Anything already in the file (audio device, BIOS path,
+    hotkeys, other mGBA preferences) is preserved instead of being replaced by
+    a bare template, which is what previous releases did on every launch.
+
+    The bindings go into MGBA_INPUT_SECTION, the only section mGBA reads for
+    the SDL port.  Writing them anywhere else is a silent no-op: mGBA keeps
+    its compiled-in X=A / Z=B defaults, which is exactly the reversed-in-game
+    bug this function exists to prevent.
+    """
+    import configparser
+    import io
+
+    cp = configparser.ConfigParser()
+    cp.optionxform = str          # mGBA option names are case sensitive
+    if existing:
+        try:
+            cp.read_string(existing)
+        except Exception:
+            cp = configparser.ConfigParser()
+            cp.optionxform = str
+
+    if "ports.sdl" not in cp:
+        cp["ports.sdl"] = {}
+    cp["ports.sdl"]["fullscreen"] = "0" if windowed else "1"
+    cp["ports.sdl"]["lockAspectRatio"] = "1"
+    cp["ports.sdl"]["lockIntegerScaling"] = "1" if integer else "0"
+    cp["ports.sdl"]["rewindEnable"] = "0"
+
+    if MGBA_INPUT_SECTION not in cp:
+        cp[MGBA_INPUT_SECTION] = {}
+    for key in DEFAULT_KEYBINDINGS:
+        cp[MGBA_INPUT_SECTION][key] = str(
+            bindings.get(key, DEFAULT_KEYBINDINGS[key]))
+
+    out = io.StringIO()
+    cp.write(out)
+    return out.getvalue()
+
+
+# What a fresh mGBA config looks like: kept as a constant for tests and docs.
+MIGBA_CONFIG_TEMPLATE = _render_mgba_config(
+    dict(DEFAULT_KEYBINDINGS), integer=True, windowed=False)
 
 
 def find_mgba_binary() -> str:
@@ -161,6 +190,8 @@ def find_mgba_binary() -> str:
         "/usr/games/mgba",
         "/usr/local/bin/mgba",
         "/usr/bin/mgba",
+        "/usr/bin/mgba-sdl",
+        "/usr/games/mgba-sdl",
     ]
     for c in candidates:
         if os.path.isfile(c) and os.access(c, os.X_OK):
@@ -177,21 +208,13 @@ def _write_mgba_config(config_file: str, windowed: bool = False) -> None:
     bindings = load_keybindings()
     display = load_display_config()
     integer = display.get("scaling", "integer") == "integer"
-    content = MIGBA_CONFIG_TEMPLATE.format(
-        fullscreen="0" if windowed else "1",
-        aspect="1",
-        integer="1" if integer else "0",
-        keyUp=bindings.get("keyUp", DEFAULT_KEYBINDINGS["keyUp"]),
-        keyDown=bindings.get("keyDown", DEFAULT_KEYBINDINGS["keyDown"]),
-        keyLeft=bindings.get("keyLeft", DEFAULT_KEYBINDINGS["keyLeft"]),
-        keyRight=bindings.get("keyRight", DEFAULT_KEYBINDINGS["keyRight"]),
-        keyA=bindings.get("keyA", DEFAULT_KEYBINDINGS["keyA"]),
-        keyB=bindings.get("keyB", DEFAULT_KEYBINDINGS["keyB"]),
-        keyL=bindings.get("keyL", DEFAULT_KEYBINDINGS["keyL"]),
-        keyR=bindings.get("keyR", DEFAULT_KEYBINDINGS["keyR"]),
-        keyStart=bindings.get("keyStart", DEFAULT_KEYBINDINGS["keyStart"]),
-        keySelect=bindings.get("keySelect", DEFAULT_KEYBINDINGS["keySelect"]),
-    )
+    existing = ""
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            existing = f.read()
+    except Exception:
+        existing = ""
+    content = _render_mgba_config(bindings, integer, windowed, existing)
     os.makedirs(os.path.dirname(config_file) or ".", exist_ok=True)
     tmp = config_file + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -203,13 +226,90 @@ def mgba_config_path(config_dir: str = None) -> str:
     """
     Where mGBA will actually look for its config.
 
-    mGBA resolves `$XDG_CONFIG_HOME/mgba/config.ini`. We point XDG_CONFIG_HOME
-    at SYS_CONFIG_DIR so the handler stays inside its sandbox (H5) and can be
-    certain the file it writes is the file mGBA reads.
+    mGBA resolves `$XDG_CONFIG_HOME/mgba/config.ini` (when XDG_CONFIG_HOME is
+    absolute) and otherwise `$HOME/.config/mgba/config.ini`.  We point
+    XDG_CONFIG_HOME at SYS_CONFIG_DIR so the handler stays inside its sandbox
+    (H5) and can be certain the file it writes is the file mGBA reads.
     """
     if config_dir:
         return os.path.join(config_dir, "mgba", "config.ini")
-    return os.path.join(os.path.expanduser("~"), ".config", "mgba", "config.ini")
+    return resolve_mgba_config_path()
+
+
+def resolve_mgba_config_path(env: dict = None) -> str:
+    """Mirrors mCoreConfigDirectory() in mGBA's src/core/config.c."""
+    env = os.environ if env is None else env
+    xdg = (env.get("XDG_CONFIG_HOME") or "").strip()
+    if xdg.startswith("/"):
+        return os.path.join(xdg, "mgba", "config.ini")
+    home = env.get("HOME") or os.path.expanduser("~")
+    return os.path.join(home, ".config", "mgba", "config.ini")
+
+
+def verify_mgba_bindings(config_file: str, bindings: dict = None) -> list:
+    """Checks the file mGBA will parse, using mGBA's own lookup rules.
+
+    mGBA reads `key` + keyId from `<platform>.input.SDLK`; the ids are A, B,
+    Select, Start, Right, Left, Up, Down, R and L, which are exactly the key
+    names this project stores.  Returns a list of human-readable problems, so
+    an empty list means the bindings will really reach the emulator.
+    """
+    import configparser
+
+    bindings = dict(load_keybindings() if bindings is None else bindings)
+    if not os.path.isfile(config_file):
+        return ["%s does not exist, so mGBA will use its defaults" % config_file]
+    cp = configparser.ConfigParser()
+    cp.optionxform = str
+    try:
+        cp.read(config_file)
+    except Exception as exc:
+        return ["%s cannot be parsed by mGBA (%s)" % (config_file, exc)]
+
+    problems = []
+    if MGBA_INPUT_SECTION not in cp:
+        problems.append(
+            "%s has no [%s] section; mGBA ignores every other section and "
+            "falls back to X=A/Z=B" % (config_file, MGBA_INPUT_SECTION))
+        return problems
+    for key in DEFAULT_KEYBINDINGS:
+        expected = str(int(bindings.get(key, DEFAULT_KEYBINDINGS[key])))
+        actual = cp[MGBA_INPUT_SECTION].get(key)
+        if actual is None:
+            problems.append("%s is missing from [%s]" % (key, MGBA_INPUT_SECTION))
+        elif actual.strip() != expected:
+            problems.append("[%s] %s=%s but the profile says %s"
+                            % (MGBA_INPUT_SECTION, key, actual.strip(), expected))
+    return problems
+
+
+def config_redirection_warning(mgba_bin: str, config_file: str = None) -> str:
+    """Explains when mGBA will not read the config this handler wrote.
+
+    Two situations defeat a perfectly correct profile without any error:
+    a Qt build (it has its own binding section and Qt key codes) and a
+    `portable.ini` next to the binary (mGBA then keeps config.ini beside the
+    executable instead of in $XDG_CONFIG_HOME).  Returning a message here is
+    what turns a silent wrong-controls session into a logged reason.
+    """
+    name = os.path.basename(mgba_bin).lower()
+    if "qt" in name:
+        return ("%s is the Qt build of mGBA; its keyboard bindings live in "
+                "[gba.input.Qt] with Qt key codes, so the SDL profile written "
+                "here is ignored. Install mgba-sdl (the package this distro "
+                "expects) or remap the controls inside mGBA itself." % mgba_bin)
+    try:
+        bindir = os.path.dirname(os.path.abspath(mgba_bin))
+        portable = os.path.join(bindir, "portable.ini")
+        if os.path.isfile(portable):
+            return ("%s has %s, so mGBA reads %s instead of %s; delete "
+                    "portable.ini or move the install to use the managed "
+                    "profile." % (mgba_bin, portable,
+                                  os.path.join(bindir, "config.ini"),
+                                  config_file or "the managed config"))
+    except Exception:
+        pass
+    return ""
 
 
 def ensure_mgba_config(config_dir: str = None) -> None:
@@ -218,23 +318,50 @@ def ensure_mgba_config(config_dir: str = None) -> None:
 
     When `config_dir` (SYS_CONFIG_DIR) is given the config stays inside the
     handler's own directory (H5); otherwise the user profile is used.
+
+    The written file is re-read with mGBA's lookup rules and the result is
+    logged, so a session log states whether the controls will actually be
+    applied instead of only that a config file was written.
     """
     if config_dir:
         os.environ["XDG_CONFIG_HOME"] = config_dir
     config_file = mgba_config_path(config_dir)
+    windowed = os.environ.get("GBA_WINDOWED") == "1"
 
     try:
-        _write_mgba_config(config_file, windowed=os.environ.get("GBA_WINDOWED") == "1")
+        _write_mgba_config(config_file, windowed=windowed)
         # Keep a copy at the historically documented location so existing
         # installs, docs and tests that read SYS_CONFIG_DIR/config.ini agree
         # with what mGBA actually loads.
         if config_dir:
             legacy = os.path.join(config_dir, "config.ini")
             if os.path.abspath(legacy) != os.path.abspath(config_file):
-                _write_mgba_config(legacy, windowed=os.environ.get("GBA_WINDOWED") == "1")
+                _write_mgba_config(legacy, windowed=windowed)
         logger.info("mGBA config prepared at %s", config_file)
     except Exception as e:
         logger.warning("Could not initialize mGBA config: %s", e)
+        return
+
+    live_path = resolve_mgba_config_path()
+    if os.path.abspath(live_path) != os.path.abspath(config_file):
+        # Either XDG_CONFIG_HOME/HOME point somewhere else, or a portable.ini
+        # next to the binary redirects mGBA.  Say so instead of pretending.
+        try:
+            _write_mgba_config(live_path, windowed=windowed)
+        except Exception as exc:
+            logger.warning("Could not mirror mGBA config to %s: %s", live_path, exc)
+
+    bindings = load_keybindings()
+    problems = verify_mgba_bindings(live_path, bindings)
+    if problems:
+        logger.error("mGBA keyboard profile at %s will NOT be applied: %s",
+                     live_path, "; ".join(problems))
+        return
+    logger.info(
+        "mGBA keyboard profile verified at %s: A=%s B=%s Up=%s Start=%s "
+        "(Z=A, X=B as configured)",
+        live_path, bindings["keyA"], bindings["keyB"],
+        bindings["keyUp"], bindings["keyStart"])
 
 
 def sync_directory(dir_path: str) -> int:
@@ -2005,6 +2132,10 @@ def main():
             "  (or press Ctrl+Alt+T and run 'gba-selftest' for a full report)\n\n")
         sys.stderr.flush()
         sys.exit(3)
+    else:
+        redirection = config_redirection_warning(mgba_bin, mgba_config_path(config_dir))
+        if redirection:
+            logger.warning("%s", redirection)
 
     is_windowed = os.environ.get("GBA_WINDOWED", "0") == "1"
     display_scaling = os.environ.get("SYS_DISPLAY_SCALING") or \
@@ -2155,6 +2286,9 @@ def main():
         logger.warning("Invalid game identity; in-game features disabled")
 
     def make_command(windowed=None, size=None, fps_target=None, savestate=None):
+        # Every (re)start re-writes and re-verifies the profile, so a mapping
+        # changed in the shell before a relaunch is what the next game gets.
+        ensure_mgba_config(config_dir)
         return build_mgba_command(
             mgba_bin, content_path, save_dir,
             is_windowed if windowed is None else windowed,

@@ -824,3 +824,38 @@ ISO installs that carry no `.git` directory at all.
 installer's own. The working clone is disposable and reset on every apply. If the network probe
 fails the modal says so in one line and nothing is cloned. Tests exercise check/apply against
 throwaway `file://` repositories and a stub updater drives every overlay phase headlessly.
+
+## D-056 mGBA keyboard bindings are written to `[gba.input.SDLK]`, and their effect is verified
+
+**Status:** Accepted
+
+**Decision.** The shared profile is written into `[gba.input.SDLK]` of the `config.ini` mGBA
+resolves (`$XDG_CONFIG_HOME/mgba/config.ini`, else `$HOME/.config/mgba/config.ini`), never into a
+section of our own invention. The adapter merges that section into the existing file (leaving
+unrelated mGBA settings alone), re-reads the result with mGBA's lookup rules and logs either
+`mGBA keyboard profile verified ... A=122 B=120` or an error naming the file and the mismatch.
+A Qt build of mGBA and a `portable.ini` beside the binary are both reported, because either makes
+mGBA read a different file or a different binding table.
+
+**Why.** mGBA names the section `<platformName>.input.<binding>` (`_makeSectionName()` in
+`src/core/input.c`): the SDL frontend initialises its input map with `GBAInputInfo`
+(`platformName` = `gba`) and loads `SDL_BINDING_KEY` (`0x53444C4B` = `SDLK`), so the live name is
+`[gba.input.SDLK]` and the entries are `key` + `keyId` (`keyA`, `keyB`, `keySelect`, …). The
+previous releases wrote `[input.SDLK]`. mGBA's `_loadAll()` returns early when the section is
+missing, so those bindings were never applied, no error was printed, and every game ran on mGBA's
+compiled-in defaults - `x` = A, `z` = B - which is precisely the reported "Z/A and X/B swap when a
+game starts". `mCoreConfigGetInput()` returns the file-backed table only, so `-C` overrides cannot
+paper over this, and the SDL port never saves `config.ini`, so the wrong section persisted forever.
+The GB core consumes the same key bits (`_GBCoreSetKeys`), so one section covers Pokémon Yellow as
+well as GBA titles.
+
+**Evidence.** A harness linked against a locally built mGBA 0.10.5 calls the same
+`mCoreConfigLoadPath()` + `mInputMapLoad()` the frontend uses: the old file resolves `Z`→`B`,
+`X`→`A`; the identical bindings under `[gba.input.SDLK]` resolve `Z`→`A`, `X`→`B`; and after the
+fix runs, the file the adapter writes and verifies resolves `Z`→`A`, `X`→`B`.
+
+**Consequences.** `tests/test_mgba_input.py` asserts the emulator-visible mapping (including the
+exact pre-fix file being rejected), the merge that preserves other mGBA preferences, the path
+resolution, and that the spawned child keeps the `XDG_CONFIG_HOME` pointing at the verified file.
+A future mGBA rename of the section would now fail loudly in the session log instead of silently
+reversing the controls.
