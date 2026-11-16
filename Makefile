@@ -49,6 +49,7 @@ screenshots:
 	$(PYTHON) src/gba_launcher.py --tab apps --demo --screenshot ui_preview_apps.png
 	$(PYTHON) src/gba_launcher.py --tab settings --demo --screenshot ui_preview_settings.png
 	$(PYTHON) src/gba_launcher.py --tab browser --demo --screenshot ui_preview_browser.png
+	$(PYTHON) src/gba_launcher.py --tab terminal --demo --screenshot ui_preview_terminal.png
 
 iso:
 	./scripts/build_iso.sh

@@ -155,7 +155,7 @@ class Theme:
         self.colors = Palette(**THEMES[self.name].as_dict())
         self.scale = scale
         self._fonts: Dict[str, pygame.font.Font] = {}
-        self._mono_fonts: Dict[int, pygame.font.Font] = {}
+        self._mono_fonts: Dict[Tuple[int, bool], pygame.font.Font] = {}
 
     # -- units ---------------------------------------------------------
     def px(self, value: float) -> int:
@@ -178,11 +178,13 @@ class Theme:
             self._fonts[key] = self._load(path, size)
         return self._fonts[key]
 
-    def mono(self, size_units: float = 9) -> pygame.font.Font:
+    def mono(self, size_units: float = 9, bold: bool = False) -> pygame.font.Font:
         pixels = self.px(size_units)
-        if pixels not in self._mono_fonts:
-            self._mono_fonts[pixels] = self._load(_find_font("mono"), pixels)
-        return self._mono_fonts[pixels]
+        key = (pixels, bold)
+        if key not in self._mono_fonts:
+            self._mono_fonts[key] = self._load(
+                _find_font("mono_bold" if bold else "mono"), pixels)
+        return self._mono_fonts[key]
 
     @staticmethod
     def _load(path: Optional[str], size: int) -> pygame.font.Font:

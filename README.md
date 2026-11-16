@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Contract](https://img.shields.io/badge/Contract-Draft%202%20(V1)-purple.svg)](docs/CONTRACT.md)
-[![Tests](https://img.shields.io/badge/Tests-673%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/Tests-750%20passing-brightgreen.svg)](tests)
 [![Safe by default](https://img.shields.io/badge/install-safe%20by%20default-blue.svg)](docs/SAFETY.md)
 
 **GBA OS** is an appliance-style Linux operating system experience designed to turn any PC or laptop into a dedicated Game Boy Advance console.
@@ -36,6 +36,11 @@ Power On -> GRUB Menu -> GBA OS -> Game Library -> Play Game -> Return to Librar
 - **Five tabs:** GAMES · APPS · BROWSER · TERMINAL · SETTINGS.
 - **Terminal and browser built in:** a real PTY shell and a deliberately minimal web reader. Useful
   for fixing a machine with no desktop, and both are stdlib-only.
+- **The terminal runs real programs:** the screen is xterm-compatible — alternate screen,
+  truecolor, scroll regions, bracketed paste, and **mouse reporting** — so a full-screen program
+  (an editor, a dashboard, the Antigravity CLI) runs in it and can be driven with the pointer.
+- **Two browsers:** the built-in text reader (always there, no JavaScript) and a full browser
+  (NetSurf or Dillo) that opens a real window in the session, where the mouse is a mouse.
 - **Pendrive and Android MTP import:** plug in a stick, or unlock a phone in File Transfer mode,
   get a prompt, and import its ROMs on request — never silently.
 
@@ -56,7 +61,11 @@ Power On -> GRUB Menu -> GBA OS -> Game Library -> Play Game -> Return to Librar
 
 | Lightweight browser (BROWSER) | Terminal (TERMINAL) |
 | :---: | :---: |
-| ![Browser](ui_preview_browser.png) | Open **Ctrl+Alt+T** — a real `$SHELL` on a PTY |
+| ![Browser](ui_preview_browser.png) | ![Terminal](ui_preview_terminal.png) |
+
+The terminal picture is not a mock-up: it is the terminal running a full-screen
+program — the kind of program the Antigravity CLI (`agy`) is. It took over the
+screen, painted in truecolor, set its window title and asked for mouse reports.
 
 ---
 
@@ -68,7 +77,8 @@ Built strictly against the specifications in [`docs/CONTRACT.md`](docs/CONTRACT.
 PID 1 (init / gba-init)
   └── gba-supervisor      (Headless session manager, outcome classifier, crash-loop guard)
         ├── gba-launcher  (Cartridge-shell desktop; exits on selection to release the display)
-        └── mgba-adapter  (Isolated handler running mGBA with dedicated save routing)
+        ├── mgba-adapter  (Isolated handler running mGBA with dedicated save routing)
+        └── web-adapter   (Isolated handler running NetSurf or Dillo in the session display)
 ```
 
 The shell itself is deliberately small and single-purpose per module:
@@ -78,8 +88,8 @@ The shell itself is deliberately small and single-purpose per module:
 | `src/gba_launcher.py` | window, tabs, cartridge shelf, modals, input routing, launch protocol |
 | `src/theme.py` | palettes, TTF font ramp, design-unit scaling, the cartridge renderer |
 | `src/config.py` | `settings.json` store, SDL/audio/backlight helpers, display-session resolution |
-| `src/gba_terminal.py` | PTY session, ANSI screen emulator, key translation, terminal view |
-| `src/gba_browser.py` | HTTP fetch, HTML extraction, text layout, history, URL bar |
+| `src/gba_terminal.py` | PTY session, xterm-compatible screen emulator, key and mouse translation, terminal view |
+| `src/gba_browser.py` | HTTP fetch, HTML extraction, text layout, history, URL bar, mouse hit-testing |
 | `src/gba_usb.py` | `/proc/mounts` block discovery, Android MTP/FUSE sources, ROM scan, content-ID cache, verified import, background watcher |
 | `src/gba_mtp.py` | small MTP API facade over the shared `gba_usb` implementation |
 | `src/game_data.py` | per-content-id cheats, nine save-state slots, favorites, game deletion |
@@ -88,6 +98,7 @@ The shell itself is deliberately small and single-purpose per module:
 | `src/gba_ingame_ui.py` | pygame/Theme overlay renderer used *inside the mGBA handler* |
 | `src/gba_boot.py` | original cartridge/handheld startup animation and bounded timing policy |
 | `src/gba_status.py` | background WiFi/Bluetooth probes with lock-protected, non-blocking UI snapshots |
+| `src/gba_adapter_web.py` | full-browser handler: picks NetSurf or Dillo, keeps its profile in the handler directory |
 
 ### Process Lifecycle
 1. **Supervisor** starts and executes `gba-launcher`.
@@ -223,6 +234,24 @@ In a game the shipped keyboard profile is straight GBA: `Z` = **A**, `X` = **B**
 
 Browser: `Ctrl+L` types an address, `Tab` / `1`–`9` pick a link, `Enter` opens it, `Alt+Left` /
 `Alt+Right` walk history, `R` reloads, `Up`/`Down`/`PgUp`/`PgDn` scroll.
+
+### 🖱️ The mouse
+
+The mouse is a first-class input in the two tabs that can use it:
+
+- **Browser** — a click on a link opens it, the pointer highlights the link under it, the wheel
+  scrolls, dragging selects text and `Ctrl+C` copies the selection to the clipboard.
+- **Terminal** — a program that asks for mouse reports (any full-screen program does) gets
+  xterm-compatible reports, exactly as a real terminal sends them: `?1000` for clicks, `?1002` for
+  drags, `?1003` for motion, and the SGR encoding (`?1006`) when the program prefers it. A program
+  that does *not* ask gets nothing — then the wheel scrolls the terminal's own history instead,
+  and a click does not turn into stray escape sequences.
+- **Games and the full browser** — the emulated GBA screen is a gamepad screen; the browser app
+  hands the display to NetSurf or Dillo, which is a normal X window with a normal pointer.
+
+The terminal reports the pointer position in *cells*, so a program is told "row 7, column 12",
+not pixels. The X cursor is enabled at boot for the same reason (a browser window without a
+pointer is unusable); `GBA_NO_CURSOR=1` turns it off again for a pure kiosk appliance.
 
 All ten GBA buttons are remappable under **SETTINGS → Controls → Remap buttons**; the same profile
 drives both the shell and mGBA (written into the handler's `config.ini`), so a gamepad behaves
@@ -391,6 +420,15 @@ is duplicated.
 - **Settings:** `DATA/config/settings.json` is the single store (scaling, theme, clock, view mode,
   volume, USB behaviour, launch confirmation). `keybindings.json` and `history.json` live beside it;
   a legacy `display.json` is migrated automatically on first run.
+- **Browsers:** there are two, and they do different jobs. The **BROWSER tab** is the built-in
+  text reader: it fetches a page, lays it out for a small screen and shows links and pictures —
+  no JavaScript, no CSS, no tracking, and it always starts, even with no network. The
+  **Web Browser** app (APPS → *Web Browser*) hands the display to a real browser — NetSurf or
+  Dillo — in the session's X display, where the mouse is a mouse and CSS and small scripts work.
+  **SETTINGS → Browser** chooses which browser (Auto / NetSurf / Dillo) and the start page.
+  Install the browsers with `sudo apt install netsurf-3 dillo`; the installer offers it, and
+  `gba-selftest` reports which one is present. The full browser keeps its profile in
+  `DATA/config/handlers/web-adapter/`, never in your home directory.
 - **Updates:** SETTINGS → System → *Check for updates* asks github.com (anonymous HTTPS, no login)
   whether `origin/main` is ahead of the commit stamped in `/opt/gba-distro/VERSION`, shows the new
   commits, and on confirm shallow-clones them and re-runs the shipped `scripts/install.sh --apply
@@ -402,7 +440,7 @@ is duplicated.
 ## 🧪 Testing & Development
 
 ```bash
-make test       # 673 tests (headless, no display needed)
+make test       # 750 tests (headless, no display needed)
 make lint       # byte-compile Python + syntax-check every shell script
 make selftest   # check *this* machine: interpreter, fonts, pty, display, mGBA, storage, config
 make iso-check  # what is missing to build a bootable ISO here
@@ -415,7 +453,14 @@ handler environment isolation (H1), outcome classification (H10), crash-loop han
 cleanup (S8), save durability and restoration (SV2–SV4), log rotation (ST5), input-profile validation
 (I3), ROM import safety (ST7, ST8), the settings store and theme system, the ANSI terminal emulator, the
 browser's HTML extractor/layout/history, and shell behaviour (tabs, `Alt+Tab`, `Ctrl+Alt+T`, search,
-empty state, confirmation-gated launches). The in-game suites cover the display handoff end to end
+empty state, confirmation-gated launches). The terminal suite (`tests/test_terminal_mouse.py`) covers
+the parts a full-screen program depends on — the alternate screen, truecolor, scroll regions,
+insert/delete, the cursor-position report, the kitty-keyboard fallback, bracketed paste — and the
+mouse: the three reporting modes, the SGR and X10 encodings, and a report travelling through a real
+PTY into a program that asked for it. `tests/test_mouse_input.py` covers the pointer in the shell:
+a click that reaches a program that asked for mouse reports, the wheel scrolling the history when
+nobody asked, a click that follows a link, hover highlighting and text selection. The in-game
+suites cover the display handoff end to end
 (`tests/test_ingame_handoff.py`: mGBA is dead while the overlay renders and a *new* child starts from
 the captured state, at the inherited speed), all nine save-state slots
 (`tests/test_game_data.py`), cheat persistence and application after the overlay closes, the

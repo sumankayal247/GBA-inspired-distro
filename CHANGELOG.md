@@ -4,6 +4,59 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — The terminal could not run a full-screen program, and the mouse only scrolled
+
+Suite: **750 passing, 1 skipped** (`make test`).
+
+### Fixed
+
+- **The terminal emulator was too small for a real program.** It understood a handful of escape
+  sequences, so a full-screen TUI — an editor, a dashboard, the Antigravity CLI (`agy`) — either
+  drew over itself or showed its escape sequences as text. The screen is now xterm-compatible:
+  the **alternate screen** (`?1049`), **truecolor** (`38;2;r;g;b`), background colours, scroll
+  regions (`DECSTBM`), insert/delete of lines and characters, erase-in-line/display, save and
+  restore of the cursor, tab stops, insert mode, autowrap, cursor styles and visibility, and
+  **bracketed paste** (`?2004`).
+- **A program that asked a question got no answer.** The cursor-position report (`CSI 6n`), the
+  device-attributes query (`CSI c`) and the kitty-keyboard query are now answered, because a
+  program that asks and waits is a program that hangs.
+- **A link in the middle of a sentence was not a link.** The text browser flattened a paragraph
+  into one run, so a link inside it lost its address and could only be reached with `Tab`. Every
+  span now carries its own link, and the link that is *last* in a paragraph is no longer dropped
+  from the page.
+- **The pointer did nothing in the browser.** A click now follows the link under it, the link
+  under the pointer is highlighted, dragging selects text and `Ctrl+C` copies it to the
+  clipboard. Clicking the address bar starts editing it.
+
+### Added
+
+- **The mouse works in the terminal.** A program that asks for mouse reports gets xterm-compatible
+  reports — `?1000` for clicks, `?1002` for drags, `?1003` for motion, SGR (`?1006`) or urxvt
+  (`?1015`) encoding when it prefers one, X10 otherwise — in *cell* coordinates, exactly as a
+  real terminal sends them. A program that does **not** ask gets nothing, because a click that
+  turns into stray escape sequences is worse than a click that does nothing; then the wheel
+  scrolls the terminal's own history instead.
+- **A full browser.** The new **Web Browser** app (APPS → *Web Browser*) hands the display to
+  NetSurf or Dillo in the session's X display, where the mouse is a mouse and CSS and small
+  scripts work. **SETTINGS → Browser** picks the browser (Auto / NetSurf / Dillo) and the start
+  page; the installer offers `netsurf-3` and `dillo`, and `gba-selftest` reports which one is
+  there. The browser keeps its profile in `DATA/config/handlers/web-adapter/`, never in the
+  user's home directory, and the shell returns when the browser is closed.
+- **The X cursor is on.** The X server was started with `-nocursor`, so a browser window had no
+  pointer at all. The cursor is now enabled (and the boot log says so);
+  `GBA_NO_CURSOR=1` restores the old kiosk behaviour.
+- **The terminal finds tools that install themselves.** The shell is started as a login shell and
+  `~/.local/bin` is on its `PATH`, so a CLI installed there — the Antigravity CLI installs
+  `agy` exactly there — is found without editing anything.
+- **A page that takes eight seconds to time out no longer freezes the shell.** The text browser
+  fetches in the background and paints when the page is there; a click on a link returns
+  immediately.
+- **`gba-selftest` compares the installed runtime with the checkout.** An appliance can be
+  current in the repository and still boot yesterday's shell, because the copy under
+  `/opt/gba-distro` is what runs. The self-test now names every installed copy that differs from
+  the source tree — the session script, the shell, the supervisor, the terminal and both browsers
+  — and prints the command that fixes it.
+
 ## [Unreleased] — The shelf shows the file name, not the cartridge header, and a game can be renamed
 
 Suite: **673 passing, 1 skipped** (`make test`).

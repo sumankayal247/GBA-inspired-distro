@@ -90,6 +90,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # Misc
     "confirm_launch": True,
     "browser_home": "about:welcome",
+    # Which real browser the "Web Browser" app opens: auto | netsurf | dillo
+    "browser_engine": "auto",
+    # Where the full browser opens when the app starts.
+    "browser_start_page": "https://en.wikipedia.org/wiki/Game_Boy_Advance",
     # In-game action shortcuts (controller buttons, keyboard fallback via I3)
     **{key: list(value) for key, value in DEFAULT_SHORTCUTS.items()},
 }

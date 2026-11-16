@@ -282,12 +282,19 @@ class TestSearchAndHistory(ShellTestCase):
 class TestLibraryIntegration(ShellTestCase):
     def test_apps_and_settings_are_cartridge_entries(self):
         launcher = self.make_launcher()
-        self.assertEqual(len(launcher.apps), 6)
-        # 9 original settings pages + WiFi + Bluetooth = 11.
-        self.assertEqual(len(launcher.settings_entries), 11)
-        for entry in launcher.apps + launcher.settings_entries:
+        self.assertEqual(len(launcher.apps), 7)
+        # 9 original settings pages + WiFi + Bluetooth + Browser = 12.
+        self.assertEqual(len(launcher.settings_entries), 12)
+        for entry in launcher.apps:
+            self.assertIn("format", entry)
+        for entry in launcher.settings_entries:
             self.assertTrue(entry["handler"].startswith("internal_"))
             self.assertIn("format", entry)
+        # The one app that is not internal is the full browser: it is a
+        # separate program that takes the display over.
+        handlers = [entry["handler"] for entry in launcher.apps]
+        self.assertIn("web-adapter", handlers)
+        self.assertEqual(handlers.count("web-adapter"), 1)
 
     def test_every_internal_handler_opens_without_raising(self):
         launcher = self.make_launcher()
@@ -296,6 +303,14 @@ class TestLibraryIntegration(ShellTestCase):
             launcher.activate_current.__self__  # keep bound-method typing honest
             launcher.current_item = lambda entry=entry: entry
             if entry["handler"] in ("internal_reboot", "internal_poweroff"):
+                continue
+            if entry["handler"] == "web-adapter":
+                # It hands the display over to the browser and exits; the
+                # launch request is what it leaves behind. The display is not
+                # really released here - the test suite keeps using pygame.
+                launcher.release_display = lambda: None
+                with self.assertRaises(SystemExit):
+                    launcher.activate_current()
                 continue
             launcher.activate_current()
             if entry["handler"] in ("internal_browser", "internal_terminal"):
