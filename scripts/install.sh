@@ -143,6 +143,7 @@ Run '$0 --apply' to install it for the first time."
     install_automount_dependencies
     install_x11_dependencies
     install_bluetooth_dependencies
+    install_browser_dependencies
     install_files
     install_ownership
     install_wrappers
@@ -364,6 +365,7 @@ install_files() {
     # against this file, which is how a half-applied update gets caught.
     gb_run install -m 0644 "$REPO_DIR/src/gba_session.sh"     "$INSTALL_DIR/src/gba_session.sh"
     gb_run install -m 0755 "$REPO_DIR/src/gba_adapter_mgba.py" "$INSTALL_DIR/handlers/mgba-adapter"
+    gb_run install -m 0755 "$REPO_DIR/src/gba_adapter_web.py" "$INSTALL_DIR/handlers/web-adapter"
 
     local font
     for font in DejaVuSans.ttf DejaVuSans-Bold.ttf; do
@@ -490,8 +492,20 @@ export TERM=linux SYS_CONTRACT=1 GBA_LOG_FILE="$LOG_FILE"
 
 # Preferred path: a tiny X server for the SDL backend. If xinit or Xorg is
 # missing we do not fail the boot - the shell itself works on KMS/DRM.
+#
+# The X cursor: a browser window is unusable without a pointer, so the
+# server keeps the cursor. GBA_NO_CURSOR=1 turns it off again for a pure
+# kiosk appliance.
+X_CURSOR_OPT=""
+if [ "${GBA_NO_CURSOR:-0}" = "1" ]; then
+    X_CURSOR_OPT="-nocursor"
+    echo "[boot] X cursor: disabled (GBA_NO_CURSOR=1)"
+else
+    echo "[boot] X cursor: enabled (a mouse can drive the browser)"
+fi
+echo "[boot] pointing devices:"; ls /dev/input/ 2>/dev/null | head -20 || echo "  (none)"
 if command -v xinit >/dev/null 2>&1 && command -v Xorg >/dev/null 2>&1; then
-    xinit /usr/local/bin/gba-session -- :0 vt1 -nocursor -quiet
+    xinit /usr/local/bin/gba-session -- :0 vt1 $X_CURSOR_OPT -quiet
     EXIT_CODE=$?
 else
     echo "[boot] X11 not available; starting the shell directly on KMS/DRM"
@@ -782,6 +796,35 @@ summary() {
     gb_print_backup_note
 }
 
+# Install a real browser for the "Web Browser" app.
+#
+# The shell's own browser reads pages and shows words; it cannot run a page
+# that needs an engine, and it has no pointer. NetSurf and Dillo are the two
+# light browsers that do: they open a window in the session's X display, so
+# the mouse is a mouse. Neither is required - the built-in browser always
+# works - so a failure here is a warning, not an error.
+install_browser_dependencies() {
+    gb_step "Installing browser dependencies"
+    if gb_is_dry_run; then
+        gb_dim "  (dry-run) would install netsurf-3 dillo without recommends"
+        return 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        gb_warn "Install a browser with your package manager (netsurf-3 or dillo)."
+        return 0
+    fi
+    apt-get install -y --no-install-recommends netsurf-3 dillo || \
+    apt-get install -y --no-install-recommends netsurf-3 || \
+    apt-get install -y --no-install-recommends dillo || true
+    if command -v netsurf >/dev/null 2>&1 || command -v netsurf-3 >/dev/null 2>&1 || \
+       command -v dillo >/dev/null 2>&1; then
+        gb_ok "a full browser is installed (NetSurf or Dillo)"
+    else
+        gb_warn "No full browser installed; the Web Browser app will say so."
+        gb_warn "The built-in text browser in the BROWSER tab still works."
+    fi
+}
+
 main() {
     gb_info "GBA OS installer — repo: $REPO_DIR"
     gb_info "mode: $([ "$APPLY" = "1" ] && echo APPLY || echo 'dry-run (add --apply to install)')"
@@ -814,6 +857,7 @@ main() {
     install_automount_dependencies
     install_x11_dependencies
     install_bluetooth_dependencies
+    install_browser_dependencies
     install_files
     install_ownership
     install_profile

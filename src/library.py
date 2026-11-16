@@ -356,11 +356,20 @@ class Library:
             },
             {
                 "id": "app_browser",
-                "title": "Web Browser",
+                "title": "Text Browser",
                 "type": "app",
                 "format": "NET",
                 "description": "Lightweight text and image browser",
                 "handler": "internal_browser",
+                "args": []
+            },
+            {
+                "id": "app_web_browser",
+                "title": "Web Browser",
+                "type": "app",
+                "format": "WWW",
+                "description": "A full browser (NetSurf or Dillo) in a window, with the mouse",
+                "handler": "web-adapter",
                 "args": []
             },
             {
@@ -429,6 +438,15 @@ class Library:
                 "format": "LIB",
                 "description": "View mode, USB auto-import and rescanning",
                 "handler": "internal_settings_library",
+                "args": []
+            },
+            {
+                "id": "setting_browser",
+                "title": "Browser",
+                "type": "settings",
+                "format": "WWW",
+                "description": "The text browser and the full browser (NetSurf or Dillo)",
+                "handler": "internal_settings_browser",
                 "args": []
             },
             {

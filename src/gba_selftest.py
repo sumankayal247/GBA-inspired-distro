@@ -22,7 +22,7 @@ import os
 import shutil
 import sys
 import tempfile
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
 
@@ -524,6 +524,113 @@ def check_bluetooth() -> Check:
                  "sudo apt install pipewire wireplumber libspa-0.2-bluetooth")
 
 
+def _runtime_copies() -> List[Tuple[str, str, str]]:
+    """The installed runtime copies that have to match the checkout.
+
+    Each entry is (installed path, path inside the source tree, what it is).
+    """
+    install_dir = os.environ.get("GBA_INSTALL_DIR", "/opt/gba-distro")
+    session_runner = os.environ.get("GBA_SESSION_RUNNER", "/usr/local/bin/gba-session")
+    return (
+        (session_runner, "src/gba_session.sh", "session script"),
+        (os.path.join(install_dir, "bin", "gba-launcher"), "src/gba_launcher.py",
+         "shell"),
+        (os.path.join(install_dir, "bin", "gba-supervisor"), "src/gba_supervisor.py",
+         "supervisor"),
+        (os.path.join(install_dir, "src", "gba_terminal.py"), "src/gba_terminal.py",
+         "terminal"),
+        (os.path.join(install_dir, "src", "gba_browser.py"), "src/gba_browser.py",
+         "text browser"),
+        (os.path.join(install_dir, "handlers", "web-adapter"),
+         "src/gba_adapter_web.py", "full browser"),
+    )
+
+
+def _source_checkout() -> str:
+    """The checkout the installed copies should match, if there is one."""
+    candidates = []
+    env = os.environ.get("GBA_SOURCE_DIR", "").strip()
+    if env:
+        candidates.append(env)
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.dirname(here))                 # <checkout>/src
+    candidates.append(os.path.dirname(os.path.dirname(here)))  # <install>/bin
+    for candidate in candidates:
+        if candidate and os.path.isfile(os.path.join(candidate, "src",
+                                                     "gba_launcher.py")):
+            return os.path.abspath(candidate)
+    return ""
+
+
+def _file_digest(path: str) -> str:
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def check_installed_runtime() -> Check:
+    """Are the installed runtime copies the ones from this checkout?
+
+    An appliance can be current in the repository and still run yesterday's
+    shell, because the copy under /opt/gba-distro is what boots. This
+    compares the copies that matter - the session script, the shell, the
+    terminal and the two browsers - with the source tree.
+    """
+    checkout = _source_checkout()
+    if not checkout:
+        return Check("runtime", PASS, "no source checkout to compare against",
+                     "Set GBA_SOURCE_DIR to the checkout to have the installed "
+                     "copies compared with it.")
+    stale = []
+    missing = []
+    compared = 0
+    for installed, relative, what in _runtime_copies():
+        source = os.path.join(checkout, relative)
+        if not os.path.isfile(source):
+            # The checkout does not have this file, so there is nothing to
+            # compare it with.
+            continue
+        if not os.path.isfile(installed):
+            missing.append(what)
+            continue
+        compared += 1
+        if _file_digest(installed) != _file_digest(source):
+            stale.append(f"{what} ({installed})")
+    if stale or missing:
+        details = []
+        if stale:
+            details.append("older than the checkout: " + ", ".join(stale))
+        if missing:
+            details.append("not installed: " + ", ".join(missing))
+        return Check("runtime", WARN, "; ".join(details),
+                     "Re-run the installer so the installed copies match the "
+                     "checkout: sudo ./scripts/install.sh --apply --repair")
+    return Check("runtime", PASS,
+                 f"{compared} installed copies match {checkout}")
+
+
+def check_browser() -> Check:
+    """Is there a full browser for the "Web Browser" app?
+
+    The built-in browser always works - it only reads text. A full browser
+    (NetSurf or Dillo) opens a window in the session's X display, and that
+    window is where the mouse works.
+    """
+    found = [name for name in ("netsurf", "netsurf-3", "dillo")
+             if shutil.which(name)]
+    if found:
+        return Check("browser", PASS,
+                     f"full browser available: {', '.join(found)}",
+                     "The Web Browser app opens it in the session display.")
+    return Check("browser", WARN, "no full browser installed",
+                 "The Web Browser app needs NetSurf or Dillo: "
+                 "sudo apt install netsurf-3 dillo. The built-in text "
+                 "browser in the BROWSER tab works without them.")
+
+
 def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
     try:
         _import(src_hint)
@@ -536,7 +643,8 @@ def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
                            check_native_hotkeys(), check_compositor(),
                            check_presentation(), check_session_script(),
                            check_window_manager(), check_diagnostics(),
-                           check_bluetooth()]
+                           check_bluetooth(), check_browser(),
+                           check_installed_runtime()]
     checks.extend(check_modules())
     checks.extend(check_pygame())
     checks.extend(check_storage(data_dir, games_dir))

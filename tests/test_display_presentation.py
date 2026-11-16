@@ -972,5 +972,98 @@ class SessionScriptTests(unittest.TestCase):
         self.assertIn("export GBA_COMPOSITOR_BACKEND", self.text)
 
 
+class InstalledRuntimeFreshness(unittest.TestCase):
+    """`gba-selftest` must catch an installed copy older than the checkout.
+
+    An appliance can be current in the repository and still boot yesterday's
+    shell: what boots is the copy under /opt/gba-distro. Verifying a change
+    therefore means comparing the installed copies with the source tree.
+    """
+
+    def setUp(self):
+        import gba_selftest
+        self.selftest = gba_selftest
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.install = os.path.join(self.dir, "opt", "gba-distro")
+        self.checkout = os.path.join(self.dir, "checkout")
+        self.session = os.path.join(self.dir, "gba-session")
+        for path in (os.path.join(self.install, "bin"),
+                     os.path.join(self.install, "src"),
+                     os.path.join(self.install, "handlers"),
+                     os.path.join(self.checkout, "src")):
+            os.makedirs(path, exist_ok=True)
+
+    def installed_path(self, relative):
+        """Where the installer puts the copy of a source file."""
+        with mock.patch.dict(os.environ,
+                             {"GBA_INSTALL_DIR": self.install,
+                              "GBA_SESSION_RUNNER": self.session}):
+            for installed, source, _what in self.selftest._runtime_copies():
+                if source == relative:
+                    return installed
+        raise AssertionError(f"{relative} is not a runtime copy")
+
+    def write(self, relative, text, install=True):
+        """Writes a file into the checkout and (optionally) the install."""
+        checkout_path = os.path.join(self.checkout, relative)
+        os.makedirs(os.path.dirname(checkout_path), exist_ok=True)
+        with open(checkout_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        installed = self.installed_path(relative)
+        if not install:
+            return installed
+        os.makedirs(os.path.dirname(installed), exist_ok=True)
+        with open(installed, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return installed
+
+    def check(self):
+        env = {"GBA_SOURCE_DIR": self.checkout, "GBA_INSTALL_DIR": self.install,
+               "GBA_SESSION_RUNNER": self.session}
+        with mock.patch.dict(os.environ, env):
+            return self.selftest.check_installed_runtime()
+
+    def test_matching_copies_pass(self):
+        self.write("src/gba_launcher.py", "# launcher\n")
+        self.write("src/gba_terminal.py", "# terminal\n")
+        result = self.check()
+        self.assertEqual(result.status, "PASS")
+
+    def test_a_stale_copy_warns_with_the_repair_command(self):
+        installed = self.write("src/gba_launcher.py", "# launcher\n")
+        with open(installed, "a", encoding="utf-8") as handle:
+            handle.write("# an old line\n")
+        result = self.check()
+        self.assertEqual(result.status, "WARN")
+        self.assertIn("shell", result.detail)
+        self.assertIn("--apply --repair", result.hint)
+
+    def test_a_missing_copy_is_reported(self):
+        self.write("src/gba_launcher.py", "# launcher\n", install=False)
+        result = self.check()
+        self.assertEqual(result.status, "WARN")
+        self.assertIn("not installed", result.detail)
+
+    def test_the_terminal_and_the_browsers_are_compared_too(self):
+        for relative in ("src/gba_terminal.py", "src/gba_browser.py",
+                         "src/gba_adapter_web.py"):
+            installed = self.write(relative, f"# {relative}\n")
+            with open(installed, "a", encoding="utf-8") as handle:
+                handle.write("# stale\n")
+        result = self.check()
+        self.assertEqual(result.status, "WARN")
+        self.assertIn("terminal", result.detail)
+        self.assertIn("full browser", result.detail)
+
+    def test_without_a_checkout_there_is_nothing_to_compare(self):
+        with mock.patch.dict(os.environ, {"GBA_SOURCE_DIR": "",
+                                          "GBA_INSTALL_DIR": self.install}):
+            with mock.patch.object(self.selftest, "_source_checkout", return_value=""):
+                result = self.selftest.check_installed_runtime()
+        self.assertEqual(result.status, "PASS")
+        self.assertIn("no source checkout", result.detail)
+
+
 if __name__ == "__main__":
     unittest.main()

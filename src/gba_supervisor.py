@@ -64,9 +64,21 @@ ORPHAN_EXECUTABLES = {
     "mgba", "mgba-sdl", "mgba-qt",
     "gba-launcher", "gba_launcher.py", "gba-launcher.py",
     "gba_adapter_mgba.py", "mgba-adapter",
+    "gba_adapter_web.py", "web-adapter",
+    "netsurf", "netsurf-3", "dillo",
 }
 PYTHON_EXECUTABLES = {"python", "python3", "python3.8", "python3.9", "python3.10",
                       "python3.11", "python3.12", "python3.13"}
+
+# The handlers the shell can hand the display to. Each entry says where its
+# program may live and whether it needs a content file to work on: the
+# emulator needs a ROM, the browser needs a URL and nothing else.
+HANDLERS = {
+    "mgba-adapter": (("handlers/mgba-adapter", "src/gba_adapter_mgba.py"),
+                     "gba_adapter_mgba.py", True),
+    "web-adapter": (("handlers/web-adapter", "src/gba_adapter_web.py"),
+                    "gba_adapter_web.py", False),
+}
 
 # Outcomes the launcher can present to the user (Rule S6, H10).
 OUTCOME_CLEAN = "clean"
@@ -163,6 +175,20 @@ class Supervisor:
             if candidate and os.path.exists(candidate):
                 return candidate
         return None
+
+    def _handler_binary(self, handler_name: str) -> Tuple[Optional[str], bool]:
+        """Where the program of a handler lives, and whether it needs content."""
+        entry = HANDLERS.get(handler_name)
+        if entry:
+            relatives, fallback, needs_content = entry
+        else:
+            stem = handler_name.replace("-", "_")
+            relatives = (f"handlers/{handler_name}", f"src/gba_adapter_{stem}.py")
+            fallback = f"gba_adapter_{stem}.py"
+            needs_content = True
+        paths = [os.path.join(self.base_dir, relative) for relative in relatives]
+        paths.append(os.path.join(os.path.dirname(__file__), fallback))
+        return self._script_path(*paths), needs_content
 
     @staticmethod
     def _is_foreground_program(argv) -> bool:
@@ -293,9 +319,17 @@ class Supervisor:
             try:
                 with open(self.launch_request_file, "r", encoding="utf-8") as f:
                     launch_data = json.load(f)
-                if not isinstance(launch_data, dict) or not launch_data.get("content_path"):
+                if not isinstance(launch_data, dict) or not launch_data.get("handler"):
                     logger.error("Malformed launch request; ignoring.")
                     launch_data = None
+                elif not launch_data.get("content_path"):
+                    # A handler that works on nothing but a URL (the browser)
+                    # has no content file - that is not a malformed request.
+                    _bin, needs_content = self._handler_binary(
+                        launch_data.get("handler") or "")
+                    if needs_content:
+                        logger.error("Launch request without content; ignoring.")
+                        launch_data = None
             except Exception as e:
                 logger.error("Failed to read launch request: %s", e)
                 launch_data = None
@@ -326,16 +360,12 @@ class Supervisor:
                 logger.error("Cannot create handler directory %s: %s", path, exc)
                 return OUTCOME_LAUNCH_FAILURE
 
-        handler_bin = self._script_path(
-            os.path.join(self.base_dir, "handlers", "mgba-adapter"),
-            os.path.join(self.base_dir, "src", "gba_adapter_mgba.py"),
-            os.path.join(os.path.dirname(__file__), "gba_adapter_mgba.py"),
-        )
+        handler_bin, needs_content = self._handler_binary(handler_name)
         if not handler_bin:
             logger.error("No handler executable found for %s", handler_name)
             return OUTCOME_LAUNCH_FAILURE
 
-        if not content_path or not os.path.exists(content_path):
+        if needs_content and (not content_path or not os.path.exists(content_path)):
             logger.error("Content not found: %s", content_path)
             return OUTCOME_LAUNCH_FAILURE
 
@@ -352,6 +382,11 @@ class Supervisor:
             "GBA_WINDOWED": "1" if self.is_desktop_mode else "0",
             "GBA_LOG_FILE": get_current_log_file(),
         })
+        if handler_name == "web-adapter":
+            # The browser opens where the shell asked it to, in the browser
+            # the user picked, and it keeps its profile in its own directory.
+            env["GBA_WEB_URL"] = str(req.get("url") or "")
+            env["GBA_WEB_BROWSER"] = str(req.get("browser") or "auto")
 
         cmd = [sys.executable, handler_bin]
         logger.info("Starting handler: %s for entry %s (%s)", handler_name, entry_id, content_path)

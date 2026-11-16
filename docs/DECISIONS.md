@@ -1026,3 +1026,51 @@ deliberately narrow: the file stays in its folder, an existing file is never ove
 containing a path separator is refused rather than silently rewritten — a name is a name, never a
 path. A ROM whose file name is deliberately cryptic now shows that cryptic name; the shell is a
 library of the user's files, not a guesser.
+
+## D-061 The terminal speaks xterm, and the mouse is only reported when the program asks
+**Status:** Accepted
+
+**Context.** The terminal tab was a pseudo-terminal plus a small ANSI emulator: cursor movement,
+erase, 16/256 colours, scrolling. That is enough for `ls` and `nano`, and not enough for a
+full-screen program — an editor, a dashboard, the Antigravity CLI (`agy`). Such a program takes
+over the screen with the *alternate screen*, paints in truecolor, asks where the cursor is, and
+- if it wants a pointer - asks for mouse reports. Every one of those asks was either ignored or
+printed as literal escape sequences, so the program drew over itself and then hung waiting for
+an answer.
+
+`agy` is written in Go on charmbracelet's Bubble Tea v2 with the Ultraviolet renderer, so its
+requirements are known exactly: alternate screen, truecolor, cursor addressing, erase, mouse
+tracking, bracketed paste, and — before it paints — the queries for the background colour
+(`OSC 11`) and the window size (`CSI 14t`/`18t`/`19t`). A terminal that ignores the queries
+makes such a program wait, and a program that waits draws nothing.
+
+The mouse had a second problem: in the terminal tab a click wrote `^L` (clear screen) into the
+program's input, whatever the program was. In the browser tab the pointer only scrolled; a link
+in the middle of a sentence was not a link at all, because the layout flattened a paragraph into
+one run and threw the address away.
+
+**Decision.**
+
+1. The screen is xterm-compatible for the feature set a modern program needs: alternate screen,
+   truecolor and background colours, scroll regions, insert/delete, save/restore of the cursor,
+   tab stops, insert mode, autowrap, cursor styles, bracketed paste, and the queries a program
+   asks (cursor position, device attributes, kitty keyboard). An unknown sequence is dropped,
+   never printed.
+2. The mouse is forwarded to the program **only when the program asked for it** (`?1000`,
+   `?1002`, `?1003`), in cell coordinates, in the encoding it asked for (SGR `?1006`, urxvt
+   `?1015`, or the original X10). This is what a real terminal does, and it matters: unsolicited
+   escape sequences in the input stream corrupt a program that never wanted a pointer. When no
+   program is listening, the wheel scrolls the terminal's own history instead.
+3. There are two browsers, because they do different jobs. The built-in text reader always
+   works, needs no display server, no network stack and no third-party program, and shows words
+   and pictures. A **full browser** (NetSurf or Dillo) is a separate program in the session's X
+   display: it renders CSS, runs small scripts, and has a real pointer. The shell hands the
+   display over the same way it hands it to the emulator, and takes it back when the browser
+   closes.
+
+**Consequences.** The terminal can host a full-screen program, and the shell has a pointer in
+both tabs. The cost is a real dependency: the full browser is optional, and the built-in reader
+stays the fallback, so nothing that worked before stops working. The X server is no longer
+started with `-nocursor`, because a browser window without a pointer is unusable;
+`GBA_NO_CURSOR=1` restores the kiosk behaviour. A link inside a paragraph is now a link with its
+own address, and the last link of a page is no longer dropped.

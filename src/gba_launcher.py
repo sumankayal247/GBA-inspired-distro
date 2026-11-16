@@ -77,10 +77,12 @@ from common import (
 )
 import game_data
 from gba_boot import BootAnimation
-from gba_browser import Browser
+from gba_browser import Browser, document_boxes, document_fonts
 from gba_ingame import button_from_key, button_from_joy_button, buttons_from_hat
 from gba_status import SystemStatusMonitor
-from gba_terminal import TerminalScreen, TerminalSession, TerminalView, key_to_bytes
+from gba_terminal import (MOUSE_LEFT, MOUSE_MIDDLE, MOUSE_RIGHT, MOUSE_WHEEL_DOWN,
+                         MOUSE_WHEEL_UP, TerminalScreen, TerminalSession, TerminalView,
+                         key_to_bytes)
 from gba_usb import (MtpManager, VolumeWatcher, import_roms, list_import_sources,
                      list_mounted_mtp_volumes, list_mounted_volumes,
                      mtp_diagnostics)
@@ -96,6 +98,26 @@ TOAST_INFO = "info"
 TOAST_OK = "ok"
 TOAST_WARN = "warn"
 TOAST_ERROR = "error"
+
+# What a full-screen program looks like in the terminal, for the demo
+# screenshot: it takes over the screen, paints in truecolor and sets a
+# title - exactly what an agent CLI does. It deliberately does *not* ask for
+# mouse reports: the demo screen is a picture, and a picture must not change
+# how the shell treats the pointer.
+DEMO_TERMINAL_SCREEN = (
+    b"\x1b[?1049h\x1b[2J\x1b[H"
+    b"\x1b[38;2;255;150;60m\x1b[1mAntigravity CLI\x1b[0m "
+    b"\x1b[38;2;120;220;255mv0.9\x1b[0m\r\n"
+    b"\x1b]0;Antigravity CLI\x07"
+    b"\x1b[38;2;140;150;170m  ~/projects/orbital\x1b[0m\r\n\r\n"
+    b"\x1b[38;2;255;255;255m> \x1b[0mBuild the launcher screen"
+    b"\x1b[38;2;120;150;180m...\x1b[0m\r\n\r\n"
+    b"\x1b[38;2;120;200;160m  \xe2\x9c\x93\x1b[0m read the settings file\r\n"
+    b"\x1b[38;2;120;200;160m  \xe2\x9c\x93\x1b[0m add the mouse protocol\r\n"
+    b"\x1b[38;2;240;190;90m  \xe2\x86\x92\x1b[0m write the test\r\n\r\n"
+    b"\x1b[38;2;140;150;170m  waiting for the model\x1b[0m\r\n"
+    b"\x1b[38;2;255;255;255m\x1b[5m \x1b[?25h"
+)
 
 DEMO_GAMES = [
     {"id": "44636205c3e1a1b2", "title": "Celeste Classic", "format": "GBA",
@@ -2425,8 +2447,15 @@ class GBALauncher:
         self.terminal_screen = TerminalScreen(80, 24)
         self.terminal_view: Optional[TerminalView] = None
         self._terminal_grid = (0, 0)
+        self._terminal_button_down = False
+        self._terminal_button = MOUSE_LEFT
+        # Where the drag started, in (column, visible row).
+        self._terminal_selection_anchor: Optional[Tuple[int, int]] = None
         self.browser: Optional[Browser] = None
         self._browser_loaded = False
+        self._terminal_demo_loaded = False
+        self._browser_hover = ""
+        self._browser_selection: Optional[Tuple[int, int]] = None
 
         # Input devices
         self.joysticks: List[Any] = []
@@ -2717,6 +2746,7 @@ class GBALauncher:
 
         self._poll_usb()
         self._poll_terminal()
+        self._poll_browser()
         self._poll_key_repeat()
 
         if self.overlay is not None:
@@ -2952,6 +2982,20 @@ class GBALauncher:
         data = self.terminal_session.drain()
         if data:
             self.terminal_screen.feed(data)
+            # The text moved: a selection made a moment ago now points at
+            # something else.
+            if self.terminal_view is not None:
+                self.terminal_view.selection = None
+                self._terminal_selection_anchor = None
+        # The terminal owes the program answers (cursor position report,
+        # device attributes). A program that asks and gets nothing waits.
+        while self.terminal_screen.responses:
+            self.terminal_session.write(self.terminal_screen.responses.pop(0))
+        # A program that put something on the clipboard (OSC 52) means it.
+        if self.terminal_screen.clipboard:
+            text = self.terminal_screen.clipboard
+            self.terminal_screen.clipboard = ""
+            self._copy_to_clipboard(text)
 
     # -------------------------------------------------------------- input
     def navigate(self, delta: int) -> None:
@@ -3296,17 +3340,199 @@ class GBALauncher:
         if self.terminal_view is None:
             self.terminal_view = TerminalView(self.terminal_screen, self.theme, 8,
                                               "starting shell…")
+        if self.demo and self.screenshot_path and not self._terminal_demo_loaded:
+            # The canned screen exists for the screenshot in the README. In a
+            # demo *run* the terminal shows the real shell.
+            self._terminal_demo_loaded = True
+            self._demo_terminal()
+
+    def _demo_terminal(self) -> None:
+        """Shows what a full-screen program looks like in the terminal.
+
+        The screenshot in the README is the terminal running a program that
+        takes over the screen - the kind of program the Antigravity CLI is.
+        """
+        self.terminal_screen.feed(DEMO_TERMINAL_SCREEN)
+        self.terminal_screen.cursor_row = min(14, self.terminal_screen.rows - 1)
+        self.terminal_screen.cursor_col = 2
 
     def _terminal_event(self, event) -> None:
         self.ensure_terminal()
         if event.type == pygame.KEYDOWN:
-            self.terminal_session.write(key_to_bytes(event))
-        elif event.type == pygame.MOUSEBUTTONDOWN:
-            if event.button == 4:
+            mod = getattr(event, "mod", 0)
+            shift = bool(mod & pygame.KMOD_SHIFT)
+            ctrl = bool(mod & pygame.KMOD_CTRL)
+            # Ctrl+C belongs to the program (it interrupts it), so copying
+            # and pasting use Ctrl+Shift, the way a real terminal does.
+            if ctrl and shift and event.key == pygame.K_c:
+                self._terminal_copy_selection()
                 return
-            self.terminal_session.write(b"\x0c")
+            if ctrl and shift and event.key == pygame.K_v:
+                self._terminal_paste()
+                return
+            self.terminal_session.write(key_to_bytes(event))
+            if self.terminal_view is not None:
+                self.terminal_view.selection = None
+                self._terminal_selection_anchor = None
+        elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
+                            pygame.MOUSEMOTION, pygame.MOUSEWHEEL):
+            self._terminal_mouse_event(event)
         elif event.type == pygame.JOYBUTTONDOWN and event.button == 1:
             self.goto_tab(TAB_GAMES)
+
+    # -- terminal mouse ------------------------------------------------
+    def _terminal_body_rect(self) -> pygame.Rect:
+        """The rectangle the character grid is drawn in."""
+        theme = self.theme
+        content = self.content_rect()
+        header = pygame.Rect(content.x, content.y, content.width, theme.px(16))
+        return pygame.Rect(content.x, header.bottom + theme.px(3), content.width,
+                           content.bottom - header.bottom - theme.px(3))
+
+    def _terminal_mouse_event(self, event) -> None:
+        """Forwards the mouse to the program, or scrolls the view.
+
+        A program that asked for mouse reports (``CSI ?1000h`` and friends)
+        gets xterm-compatible reports, so a full-screen TUI can be driven
+        with the pointer. A program that did not ask gets nothing - the
+        wheel then scrolls the scrollback instead, which is what a terminal
+        without mouse reporting is expected to do, and a drag selects the text
+        under the pointer.
+        """
+        screen = self.terminal_screen
+        session = self.terminal_session
+        if session is None:
+            return
+        view = self.terminal_view
+        if view is None:
+            return
+        tracking = screen.mouse_tracking()
+
+        if event.type == pygame.MOUSEWHEEL:
+            # In pygame a positive y means "wheel up", which in a terminal
+            # means "go back into the history".
+            up = event.y > 0
+            if tracking:
+                col, row = self._terminal_cell(event.pos)
+                if col is None:
+                    return
+                button = MOUSE_WHEEL_UP if up else MOUSE_WHEEL_DOWN
+                session.write(screen.encode_mouse(button, col + 1, row + 1, "press"))
+                session.write(screen.encode_mouse(button, col + 1, row + 1, "release"))
+            else:
+                self._terminal_scroll(view, 3 if up else -3)
+            return
+
+        if event.type == pygame.MOUSEMOTION:
+            if tracking:
+                if not screen.mouse_motion(self._terminal_button_down):
+                    return
+                col, row = self._terminal_cell(event.pos)
+                if col is None:
+                    return
+                session.write(screen.encode_mouse(self._terminal_button, col + 1, row + 1,
+                                                  "move"))
+                return
+            if self._terminal_button_down:
+                self._terminal_select_to(event.pos)
+            return
+
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            self._terminal_button_down = True
+            self._terminal_button = {1: MOUSE_LEFT, 2: MOUSE_MIDDLE,
+                                     3: MOUSE_RIGHT}.get(event.button, MOUSE_LEFT)
+        else:  # MOUSEBUTTONUP
+            self._terminal_button_down = False
+
+        if not tracking:
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                self._terminal_select_to(event.pos, start=True)
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self._terminal_button_down = False
+            return
+        col, row = self._terminal_cell(event.pos)
+        if col is None:
+            return
+        action = "press" if event.type == pygame.MOUSEBUTTONDOWN else "release"
+        session.write(screen.encode_mouse(self._terminal_button, col + 1, row + 1, action))
+
+    def _terminal_select_to(self, pos, start: bool = False) -> None:
+        """Selects the text under the pointer.
+
+        Only the shell does this. A program that asked for the mouse owns the
+        pointer, and the shell keeps its hands off it.
+        """
+        view = self.terminal_view
+        if view is None:
+            return
+        cell = self._terminal_cell(pos)
+        if cell is None:
+            if start:
+                view.selection = None
+            return
+        col, row = cell
+        visible_row = view.row_offset() + row
+        if start:
+            self._terminal_selection_anchor = (col, visible_row)
+            view.selection = (col, visible_row, col, visible_row)
+            return
+        anchor = self._terminal_selection_anchor
+        if anchor is None:
+            return
+        first_col, first_row = anchor
+        view.selection = (min(first_col, col), min(first_row, visible_row),
+                          max(first_col, col), max(first_row, visible_row))
+
+    def _terminal_copy_selection(self) -> None:
+        """Copies the selected text to the system clipboard."""
+        view = self.terminal_view
+        if view is None:
+            return
+        text = view.selected_text()
+        if not text:
+            self.toast("Nothing selected", TOAST_INFO)
+            return
+        copied = self._copy_to_clipboard(text)
+        self.toast(f"Copied {len(text)} characters" if copied
+                   else "Clipboard is not available", TOAST_OK if copied else TOAST_WARN)
+
+    def _terminal_paste(self) -> None:
+        """Pastes the clipboard into the program."""
+        session = self.terminal_session
+        if session is None:
+            return
+        text = self._read_clipboard()
+        if not text:
+            self.toast("The clipboard is empty", TOAST_INFO)
+            return
+        if self.terminal_screen.bracketed_paste:
+            session.write(b"\x1b[200~" + text.encode("utf-8") + b"\x1b[201~")
+        else:
+            session.write(text.encode("utf-8"))
+
+    @staticmethod
+    def _read_clipboard() -> str:
+        """Reads text from the system clipboard, if this platform has one."""
+        try:
+            if not pygame.scrap.get_init():
+                pygame.scrap.init()
+            data = pygame.scrap.get(pygame.SCRAP_TEXT)
+            if isinstance(data, bytes):
+                return data.decode("utf-8", "replace")
+            return str(data or "")
+        except Exception:
+            return ""
+
+    def _terminal_cell(self, pos) -> Optional[Tuple[int, int]]:
+        view = self.terminal_view
+        if view is None:
+            return None
+        return view.cell_at(self._terminal_body_rect(), int(pos[0]), int(pos[1]))
+
+    def _terminal_scroll(self, view, lines: int) -> None:
+        """Scrolls the terminal's own history (the wheel, without tracking)."""
+        history = len(self.terminal_screen.scrollback)
+        view.scroll_offset = max(0, min(history, view.scroll_offset + lines))
 
     # ------------------------------------------------------------- browser
     def ensure_browser(self) -> None:
@@ -3318,14 +3544,32 @@ class GBALauncher:
             self._browser_loaded = True
             self.browser.load("about:welcome")
 
+    def _poll_browser(self) -> None:
+        """Applies a page that was fetched in the background."""
+        if self.browser is None:
+            return
+        self.browser.poll()
+
     def _browser_event(self, event) -> None:
         self.ensure_browser()
         browser = self.browser
+        if event.type == pygame.MOUSEWHEEL:
+            # In pygame a positive y means "wheel up".
+            browser.scroll_by(-3 if event.y > 0 else 3)
+            return
         if event.type == pygame.MOUSEBUTTONDOWN:
             if event.button == 4:
                 browser.scroll_by(-3)
             elif event.button == 5:
                 browser.scroll_by(3)
+            elif event.button == 1:
+                self._browser_click(event.pos)
+            return
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._browser_selection = None
+            return
+        if event.type == pygame.MOUSEMOTION:
+            self._browser_motion(event.pos)
             return
         if event.type == pygame.JOYHATMOTION:
             browser.scroll_by(-event.value[1] * 3)
@@ -3340,7 +3584,7 @@ class GBALauncher:
 
         if browser.editing_url:
             if key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                browser.commit_url_entry()
+                browser.commit_url_entry(background=True)
             elif key == pygame.K_ESCAPE:
                 browser.editing_url = False
             elif key == pygame.K_BACKSPACE:
@@ -3353,10 +3597,12 @@ class GBALauncher:
 
         if ctrl and key == pygame.K_l:
             browser.begin_url_entry()
+        elif ctrl and key == pygame.K_c:
+            self._browser_copy_selection()
         elif alt and key == pygame.K_LEFT:
-            browser.back()
+            browser.back(background=True)
         elif alt and key == pygame.K_RIGHT:
-            browser.forward()
+            browser.forward(background=True)
         elif alt and key == pygame.K_TAB:
             self.switch_tab(-1 if mod & pygame.KMOD_SHIFT else 1)
         elif key == pygame.K_UP:
@@ -3372,12 +3618,12 @@ class GBALauncher:
         elif key == pygame.K_END:
             browser.scroll = browser.max_scroll()
         elif key == pygame.K_r:
-            browser.reload()
+            browser.reload(background=True)
         elif key == pygame.K_h:
             browser.load(self.settings.get("browser_home", "about:welcome"))
         elif key in (pygame.K_RETURN, pygame.K_KP_ENTER):
             if 0 <= browser.selected_link < len(browser.document.links if browser.document else []):
-                browser.follow(browser.document.links[browser.selected_link])
+                self._browser_follow(browser.document.links[browser.selected_link])
         elif key == pygame.K_TAB:
             total = len(browser.document.links) if browser.document else 0
             if total:
@@ -3387,7 +3633,7 @@ class GBALauncher:
         elif pygame.K_1 <= key <= pygame.K_9:
             index = key - pygame.K_1
             if browser.document and index < len(browser.document.links):
-                browser.follow(browser.document.links[index])
+                self._browser_follow(browser.document.links[index])
         elif key == pygame.K_ESCAPE:
             self.goto_tab(TAB_GAMES)
 
@@ -3404,6 +3650,86 @@ class GBALauncher:
                 browser.scroll = max(0, index - 2)
                 return
 
+    # -- browser mouse -------------------------------------------------
+    def _browser_bar_rect(self) -> pygame.Rect:
+        theme = self.theme
+        content = self.content_rect()
+        return pygame.Rect(content.x, content.y, content.width, theme.px(17))
+
+    def _browser_body_rect(self) -> pygame.Rect:
+        theme = self.theme
+        content = self.content_rect()
+        bar = self._browser_bar_rect()
+        return pygame.Rect(content.x, bar.bottom + theme.px(3), content.width,
+                           content.bottom - bar.bottom - theme.px(3))
+
+    def _browser_click(self, pos) -> None:
+        """A click on the page: follow a link, or start a text selection."""
+        browser = self.browser
+        if browser is None:
+            return
+        if self._browser_bar_rect().collidepoint(pos):
+            browser.begin_url_entry()
+            return
+        hit = browser.hit_test(int(pos[0]), int(pos[1]), self._browser_body_rect(),
+                               self.theme)
+        if not hit:
+            self._browser_selection = None
+            return
+        index, href = hit
+        if href:
+            self._browser_follow(href)
+            self._browser_selection = None
+            return
+        self._browser_selection = (index, index)
+
+    def _browser_follow(self, href: str) -> None:
+        """Opens a link, unless a page is still on its way."""
+        browser = self.browser
+        if browser is None:
+            return
+        if browser.loading:
+            self.toast("Still loading the previous page", TOAST_INFO)
+            return
+        browser.follow(href, background=True)
+
+    def _browser_motion(self, pos) -> None:
+        """Track the pointer: highlight the link under it, extend a selection."""
+        browser = self.browser
+        if browser is None:
+            return
+        hit = browser.hit_test(int(pos[0]), int(pos[1]), self._browser_body_rect(),
+                               self.theme)
+        href = hit[1] if hit else ""
+        if href != self._browser_hover:
+            self._browser_hover = href
+        if self._browser_selection and hit:
+            start = self._browser_selection[0]
+            self._browser_selection = (start, hit[0])
+
+    def _browser_copy_selection(self) -> None:
+        browser = self.browser
+        if browser is None:
+            return
+        text = browser.selection_text(*(self._browser_selection or (None, None)))
+        if not text:
+            self.toast("Nothing selected", TOAST_INFO)
+            return
+        copied = self._copy_to_clipboard(text)
+        self.toast(f"Copied {len(text)} characters" if copied
+                   else "Clipboard is not available", TOAST_OK if copied else TOAST_WARN)
+
+    @staticmethod
+    def _copy_to_clipboard(text: str) -> bool:
+        """Puts text on the system clipboard, if this platform has one."""
+        try:
+            if not pygame.scrap.get_init():
+                pygame.scrap.init()
+            pygame.scrap.put_text(text)
+            return True
+        except Exception:
+            return False
+
     # ------------------------------------------------------------- actions
     def activate_current(self) -> None:
         item = self.current_item()
@@ -3414,6 +3740,10 @@ class GBALauncher:
                     TABS[self.current_tab], item.get("title"), handler)
         if item.get("type") == "game":
             self.request_launch(item)
+            return
+
+        if item.get("handler") == "web-adapter":
+            self.request_app_launch(item)
             return
 
         actions = {
@@ -3429,6 +3759,7 @@ class GBALauncher:
             "internal_settings_bluetooth": lambda: self.open_settings_page("bluetooth"),
             "internal_settings_controls": lambda: self.open_settings_page("controls"),
             "internal_settings_library": lambda: self.open_settings_page("library"),
+            "internal_settings_browser": lambda: self.open_settings_page("browser"),
             "internal_settings_games": lambda: self.open_settings_page("games"),
             "internal_settings_storage": lambda: self.open_settings_page("storage"),
             "internal_settings_system": lambda: self.open_settings_page("system"),
@@ -3463,6 +3794,40 @@ class GBALauncher:
             "handler": item.get("handler", "mgba-adapter"),
             "title": item.get("title", ""),
         }
+        self._write_launch_request(payload)
+
+        record_play_session(item["id"])
+        logger.info("Launching %s (%s)", item.get("title"), item.get("id"))
+
+        # Hand the display over cleanly: a half-torn-down KMS/DRM context is
+        # one of the classic causes of the emulator showing a black screen.
+        self.release_display()
+        sys.exit(EXIT_CODE_LAUNCH_REQUEST)
+
+    def request_app_launch(self, item: Dict[str, Any]) -> None:
+        """Hands the display to an app that runs beside the shell.
+
+        The browser is a separate program with its own window and its own
+        mouse, so the launcher gives up the display exactly as it does for a
+        game and comes back when the browser is closed.
+        """
+        payload = {
+            "entry_id": item.get("id", "app_web_browser"),
+            "content_path": "",
+            "handler": item.get("handler", "web-adapter"),
+            "title": item.get("title", ""),
+            "url": self.settings.get("browser_start_page", ""),
+            "browser": self.settings.get("browser_engine", "auto"),
+        }
+        if not payload["url"] or payload["url"].startswith("about:"):
+            payload["url"] = ""
+        self._write_launch_request(payload)
+        logger.info("Launching %s", item.get("title"))
+        self.release_display()
+        sys.exit(EXIT_CODE_LAUNCH_REQUEST)
+
+    def _write_launch_request(self, payload: Dict[str, Any]) -> None:
+        req_path = os.path.join(get_run_dir(), "launch_request.json")
         try:
             tmp = req_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -3473,15 +3838,6 @@ class GBALauncher:
         except Exception as exc:
             logger.error("Could not write launch request: %s", exc)
             self.toast("Launch failed: run directory not writable", TOAST_ERROR)
-            return
-
-        record_play_session(item["id"])
-        logger.info("Launching %s (%s)", item.get("title"), item.get("id"))
-
-        # Hand the display over cleanly: a half-torn-down KMS/DRM context is
-        # one of the classic causes of the emulator showing a black screen.
-        self.release_display()
-        sys.exit(EXIT_CODE_LAUNCH_REQUEST)
 
     def release_display(self) -> None:
         try:
@@ -3560,6 +3916,7 @@ class GBALauncher:
             "bluetooth": self._rows_bluetooth,
             "controls": self._rows_controls,
             "library": self._rows_library,
+            "browser": self._rows_browser,
             "games": self._rows_games,
             "storage": self._rows_storage,
             "system": self._rows_system,
@@ -3567,7 +3924,8 @@ class GBALauncher:
         titles = {
             "display": "DISPLAY", "audio": "AUDIO", "wifi": "WIFI",
             "bluetooth": "BLUETOOTH", "controls": "CONTROLS",
-            "library": "LIBRARY", "games": "GAME MANAGEMENT",
+            "library": "LIBRARY", "browser": "BROWSER",
+            "games": "GAME MANAGEMENT",
             "storage": "STORAGE & SAVES", "system": "SYSTEM",
         }
         builder = builders.get(section)
@@ -3750,6 +4108,34 @@ class GBALauncher:
              "action": lambda shell: shell.push_overlay(UsbManagerOverlay(shell))},
             {"type": "info", "label": "Games folder", "value": get_games_dir(),
              "hint": "Copy .gba/.gbc/.gb here, or import from USB/MTP."},
+        ]
+
+    def _rows_browser(self) -> List[dict]:
+        s = self.settings
+        start_pages = [
+            ("https://en.wikipedia.org/wiki/Game_Boy_Advance", "Wikipedia"),
+            ("https://news.ycombinator.com", "Hacker News"),
+            ("https://github.com/sumankayal247/GBA-inspired-distro", "Project page"),
+        ]
+        return [
+            {"type": "info", "label": "Text browser",
+             "value": "BROWSER tab",
+             "hint": "The built-in reader: no JavaScript, no CSS, but it always starts."},
+            {"type": "choice", "label": "Full browser",
+             "hint": "Which browser the Web Browser app opens. 'Auto' picks the first one "
+                     "that is installed (netsurf-3 or dillo).",
+             "key": "browser_engine", "values": ["auto", "netsurf", "dillo"],
+             "get": lambda: s["browser_engine"],
+             "set": lambda v: self.set_setting("browser_engine", v),
+             "label_for": lambda v: {"auto": "Auto", "netsurf": "NetSurf",
+                                     "dillo": "Dillo"}[v]},
+            {"type": "choice", "label": "Start page",
+             "hint": "Where the full browser opens.",
+             "key": "browser_start_page",
+             "values": [url for url, _ in start_pages],
+             "get": lambda: s["browser_start_page"],
+             "set": lambda v: self.set_setting("browser_start_page", v),
+             "label_for": lambda v: dict(start_pages).get(v, "Custom")},
         ]
 
     def _deletable_games(self) -> List[Dict[str, Any]]:
@@ -4294,9 +4680,12 @@ class GBALauncher:
         if tab == TAB_TERMINAL:
             return [("Ctrl+Alt+T", "back to games", c.highlight),
                     ("Alt+Tab", "switch tab", c.info),
+                    ("mouse", "select · full-screen programs", c.text_dim),
+                    ("Ctrl+Shift+C", "copy", c.text_dim),
                     ("Ctrl+C", "interrupt", c.text_dim)]
         if tab == TAB_BROWSER:
             return [("Ctrl+L", "address", c.info),
+                    ("click", "links", c.primary),
                     ("Tab / 1-9", "links", c.text_muted),
                     ("Alt+←/→", "history", c.text_muted),
                     ("R", "reload", c.text_dim)]
@@ -4531,6 +4920,11 @@ class GBALauncher:
         pygame.draw.rect(self.surface, c.panel_alt, header, border_radius=theme.px(4))
         title = "TERMINAL" if self.terminal_session and self.terminal_session.alive \
             else "TERMINAL (unavailable)"
+        # A program that sets a window title (OSC 0/2) says what it is; that
+        # is how "Antigravity CLI" identifies itself in the header.
+        app_title = (self.terminal_screen.title or "").strip()
+        if app_title:
+            title = f"{title} · {app_title}"
         theme.label(self.surface, title, (content.x / theme.scale + 6, content.y / theme.scale + 3),
                     c.info)
         theme.label(self.surface, "Ctrl+Alt+T returns to the shelf · Alt+Tab switches tabs",
@@ -4545,6 +4939,9 @@ class GBALauncher:
                                                     "starting shell…")
         cols, rows, _, _ = 0, 0, 0, 0
         cw, ch, cols, rows = view.metrics(body)
+        # A program that asks how big the text area is (CSI 14t) gets the real
+        # size of a character cell.
+        self.terminal_screen.cell_size = (cw, ch)
         if (cols, rows) != self._terminal_grid:
             self._terminal_grid = (cols, rows)
             if self.terminal_session:
@@ -4563,7 +4960,7 @@ class GBALauncher:
         browser.theme = theme
         browser.set_width(content.width)
 
-        bar = pygame.Rect(content.x, content.y, content.width, theme.px(17))
+        bar = self._browser_bar_rect()
         pygame.draw.rect(self.surface, c.panel_alt, bar, border_radius=theme.px(4))
         pygame.draw.rect(self.surface, c.border_soft, bar, width=1, border_radius=theme.px(4))
         url_text = browser.address_buffer if browser.editing_url else (browser.url or "about:welcome")
@@ -4579,8 +4976,7 @@ class GBALauncher:
                              (theme.px(cursor_x), bar.y + theme.px(3)),
                              (theme.px(cursor_x), bar.bottom - theme.px(3)), 1)
 
-        body = pygame.Rect(content.x, bar.bottom + theme.px(3), content.width,
-                           content.bottom - bar.bottom - theme.px(3))
+        body = self._browser_body_rect()
         pygame.draw.rect(self.surface, c.screen, body, border_radius=theme.px(4))
         pygame.draw.rect(self.surface, c.border_soft, body, width=1, border_radius=theme.px(4))
         self.draw_browser_document(browser, body)
@@ -4603,48 +4999,54 @@ class GBALauncher:
                         c.text_dim)
             return
 
-        fonts = {
-            "h1": theme.font("title"), "h2": theme.font("header"), "h3": theme.font("body_bold"),
-            "p": theme.font("body"), "li": theme.font("body"), "quote": theme.font("body"),
-            "pre": theme.mono(8), "link": theme.font("body"), "meta": theme.font("micro"),
-        }
+        fonts = document_fonts(theme)
         colors = {
             "h1": c.highlight, "h2": c.accent, "h3": c.accent, "p": c.text,
             "li": c.text, "quote": c.text_muted, "pre": c.success,
             "link": c.info, "meta": c.text_dim,
         }
-        x0 = rect.x + theme.px(4)
-        y = rect.y + theme.px(3)
         bottom = rect.bottom - theme.px(10)
         selected_href = None
         if browser.document.links and 0 <= browser.selected_link < len(browser.document.links):
             selected_href = browser.document.links[browser.selected_link]
 
-        start = browser.scroll
-        for index in range(start, len(browser.document.lines)):
-            if y > bottom:
+        selection = self._browser_selection
+        selected_range = None
+        if selection and selection[0] is not None and selection[1] is not None:
+            selected_range = (min(selection), max(selection))
+
+        for index, line, box in document_boxes(browser.document, theme, rect, browser.scroll):
+            if box.y > bottom:
                 break
-            line = browser.document.lines[index]
-            image = browser.document.images.get(index) if hasattr(browser.document, "images") else None
             font = fonts.get(line.style, fonts["p"])
+            image = browser.document.images.get(index) if hasattr(browser.document, "images") else None
 
             if line.text and line.text.strip():
-                is_selected_link = line.href and line.href == selected_href
-                if is_selected_link:
-                    highlight = pygame.Rect(x0, y - theme.px(1),
-                                            rect.width - theme.px(8),
-                                            font.get_linesize() + theme.px(1))
+                is_selected_link = line.link and line.link == selected_href
+                is_hovered = bool(line.link) and line.link == self._browser_hover
+                if is_selected_link or is_hovered:
+                    highlight = pygame.Rect(box.x, box.y - theme.px(1),
+                                            box.width, font.get_linesize() + theme.px(1))
                     pygame.draw.rect(self.surface, theme.mix(c.card_sel, c.info, 0.25), highlight,
                                      border_radius=theme.px(2))
-                color = colors.get(line.style, c.text_muted)
-                indent = theme.px(6) * line.indent
-                surf = font.render(line.text, True, color)
-                self.surface.blit(surf, (x0 + indent, y))
-                y += font.get_linesize() + theme.px(0.5)
+                if selected_range and selected_range[0] <= index <= selected_range[1]:
+                    pygame.draw.rect(self.surface, theme.mix(c.card_sel, c.primary, 0.45),
+                                     pygame.Rect(box.x, box.y, box.width, box.height),
+                                     border_radius=theme.px(2))
+                # Each span carries its own style, so a link in the middle of a
+                # paragraph is drawn (and clicked) as a link.
+                x = box.x + theme.px(6) * line.indent
+                for text, style, _href in line.spans:
+                    span_font = fonts.get(style, font)
+                    color = colors.get(style, c.text_muted)
+                    surf = span_font.render(text, True, color)
+                    self.surface.blit(surf, (x, box.y))
+                    x += surf.get_width()
 
             if image is not None:
+                caption = font.get_linesize() + theme.px(0.5)
                 self.draw_browser_image(browser, image, pygame.Rect(
-                    x0, y, rect.width - theme.px(8), theme.px(64)))
+                    box.x, box.y + caption, box.width, theme.px(64)))
 
     def draw_browser_image(self, browser, block, rect: pygame.Rect) -> None:
         theme = self.theme

@@ -53,9 +53,13 @@ Every MUST/MUST NOT clause carries exactly one verification tag directly after i
 
 ### 1.5 Non-goals
 
-This contract does not cover a browser, a general file manager, Bluetooth, networking, update
+This contract does not cover a general file manager, Bluetooth, networking, update
 application, metadata and artwork, multiple emulated systems, or a third-party application
 ecosystem. Several are planned for later phases. None are Phase 1 deliverables.
+
+The terminal tab and the browser app are covered in section 7b: both run a program that was
+written by somebody else, and both are held to the rules of that program, not to the rules of
+the shell.
 
 ---
 
@@ -360,6 +364,56 @@ Parameters (provisional): N = 3, M = 30.
 
 ---
 
+## 7b. Terminal & Browser Contract
+
+The terminal tab and the browser app are the two places where the shell runs a program that
+somebody else wrote. They are held to the rules of that program, not to the rules of the shell.
+
+### Terminal
+
+- **TERM1** [TEST: T-TERM-1] The terminal MUST run a shell on a pseudo-terminal and MUST speak
+  enough of the xterm protocol for a full-screen program to work: the alternate screen (`?1049`),
+  truecolor (`38;2;r;g;b`), background colours, scroll regions, insert and delete, erase,
+  cursor save and restore, tab stops, insert mode, autowrap, cursor style and visibility, and
+  bracketed paste (`?2004`). An unknown sequence MUST be dropped, never printed.
+- **TERM2** [TEST: T-TERM-1] A program that asks MUST be answered: the cursor-position report
+  (`CSI 6n`), the device-status report, the kitty-keyboard query, the background-colour query
+  (`OSC 10`/`OSC 11`) and the window-size reports (`CSI 14t`, `18t`, `19t`). A program that asks
+  and waits is a program that hangs.
+- **TERM3** [TEST: T-TERM-2] The terminal MUST forward mouse events to the program **only** when
+  the program asked for them (`?1000`, `?1002`, `?1003`), in cell coordinates, in the encoding the
+  program asked for (SGR `?1006`, urxvt `?1015`, otherwise X10). A program that did not ask MUST
+  receive nothing, and the wheel MUST then scroll the terminal's own history.
+- **TERM4** [REVIEW] The terminal MUST NOT turn a mouse event into a stray control character in
+  the program's input stream. Unsolicited escape sequences corrupt a program that never wanted a
+  pointer.
+- **TERM5** [TEST: T-TERM-3] The shell MUST be started as a login shell and `~/.local/bin` MUST
+  be on its `PATH`, so a tool that installs itself there - the Antigravity CLI installs `agy`
+  exactly there - is found without the user editing anything.
+- **TERM6** [REVIEW] A program that sets a window title (`OSC 0` / `OSC 2`) MUST be able to name
+  itself in the terminal header.
+- **TERM7** [TEST: T-TERM-2b] While no program is listening for mouse reports, the terminal MUST
+  let the user select text with the pointer, copy it (`Ctrl+Shift+C`) and paste the clipboard into
+  the program (`Ctrl+Shift+V`, bracketed when the program asked for bracketed paste). `Ctrl+C`
+  MUST still reach the program, because it interrupts it.
+
+### Browser
+
+- **WEB1** [TEST: T-WEB-1] The system MUST offer a *real* browser: the "Web Browser" app MUST
+  start NetSurf or Dillo in the session's X display as a supervised handler (`web-adapter`), and
+  the shell MUST come back when the browser is closed. The built-in text reader MUST stay
+  available and MUST work when neither browser is installed.
+- **WEB2** [TEST: T-WEB-1] The browser's profile MUST live in the handler's own configuration
+  directory (`DATA/config/handlers/web-adapter`), never in the user's home directory.
+- **WEB3** [REVIEW] The settings MUST offer the engine choice (Auto / NetSurf / Dillo) and the
+  start page, and `gba-selftest` MUST report which browser is installed.
+- **WEB4** [TEST: T-WEB-1] A missing browser MUST NOT be fatal: the app MUST name the package to
+  install (`sudo apt install netsurf-3 dillo`), and the built-in reader MUST keep working.
+- **WEB5** [REVIEW] The X server MUST NOT be started with `-nocursor` by default, because a
+  browser window without a pointer is unusable. `GBA_NO_CURSOR=1` restores the kiosk behaviour.
+
+---
+
 ## 8. Display & Audio Contract
 
 - **D1** [REVIEW] [AMENDED 2026-11-02, see D-029] The launcher MUST use the whole display: it
@@ -596,6 +650,16 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 |---|---|---|---|
 | T-INPUT-4 | Fresh install: press `Z` then `X` in a game; then import a legacy profile and a customised one. | `Z` acts as `A`, `X` as `B`; the untouched legacy profile is migrated; a customised profile keeps every custom binding. The session log contains `mGBA keyboard profile verified ... A=122 B=120`, and `[gba.input.SDLK]` in the config mGBA reads carries those values. | I6 |
 
+### Terminal and browser
+
+| ID | Procedure | Pass criteria | Verifies |
+|---|---|---|---|
+| T-TERM-1 | Run a full-screen program in the terminal tab - a stand-in for the Antigravity CLI: alternate screen, truecolor, window title, mouse reporting, cursor-position query. | The program paints its own screen, the title appears in the terminal header, the question is answered, and the answer reaches the program. | TERM1, TERM2 |
+| T-TERM-2 | Click, drag and turn the wheel in the terminal tab, once with a program that asked for mouse reports and once without. | With a listener: an xterm-compatible report arrives in the program's input in cell coordinates. Without: nothing is written to the program and the wheel scrolls the terminal's own history. | TERM3, TERM4 |
+| T-TERM-3 | Install a command-line tool into `~/.local/bin`, open the terminal tab, run it. | The command is found and runs; the shell is a login shell. | TERM5 |
+| T-TERM-2b | Drag over the text in the terminal tab, copy it with `Ctrl+Shift+C`, paste it back with `Ctrl+Shift+V`; press `Ctrl+C` in a running command. | The selected text is copied, the paste reaches the program (bracketed when the program asked for it), and `Ctrl+C` interrupts the program instead of copying. | TERM7 |
+| T-WEB-1 | Start the "Web Browser" app with NetSurf or Dillo installed, then with neither installed. | With: a browser window opens on the requested page in the session display, its profile is under `DATA/config/handlers/web-adapter`, and closing the window returns to the shell. Without: the app names the package to install and the built-in text reader still works. | WEB1, WEB2, WEB3, WEB4 |
+
 ### Saves
 
 | ID | Procedure | Pass criteria | Verifies |
@@ -658,6 +722,6 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 
 ### Explicitly not Phase 1
 
-Browser, Bluetooth, file manager, metadata/artwork, networking, update mechanism, A/B slots,
+Bluetooth, file manager, metadata/artwork, networking, update mechanism, A/B slots,
 multiple emulated systems, application ecosystem, settings beyond the minimum, themes, cloud
-features.
+features. The browser and the terminal are covered by section 7b.
