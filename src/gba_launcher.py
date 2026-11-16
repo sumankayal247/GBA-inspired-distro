@@ -3455,6 +3455,10 @@ class GBALauncher:
     def _browser_event(self, event) -> None:
         self.ensure_browser()
         browser = self.browser
+        if event.type == pygame.MOUSEWHEEL:
+            # In pygame a positive y means "wheel up".
+            browser.scroll_by(-3 if event.y > 0 else 3)
+            return
         if event.type == pygame.MOUSEBUTTONDOWN:
             if event.button == 4:
                 browser.scroll_by(-3)

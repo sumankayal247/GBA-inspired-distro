@@ -239,6 +239,20 @@ class TestBrowserMouse(MouseTestCase):
         self.launcher._browser_motion(point)
         self.assertEqual(self.launcher._browser_hover, "https://example.com/one")
 
+    def test_the_wheel_scrolls_the_page(self):
+        body = self.launcher._browser_body_rect()
+        for index in range(60):
+            self.launcher.browser.document.lines.append(
+                gba_browser.Line([(f"line {index}", "p")], "p"))
+        self.launcher.browser.scroll = 0
+        self.launcher._browser_event(
+            pygame.event.Event(pygame.MOUSEWHEEL, x=0, y=-1, pos=(body.x + 4, body.y + 4)))
+        self.assertGreater(self.launcher.browser.scroll, 0)
+        scrolled = self.launcher.browser.scroll
+        self.launcher._browser_event(
+            pygame.event.Event(pygame.MOUSEWHEEL, x=0, y=1, pos=(body.x + 4, body.y + 4)))
+        self.assertLess(self.launcher.browser.scroll, scrolled)
+
     def test_copying_a_selection_reports_what_was_copied(self):
         body = self.launcher._browser_body_rect()
         boxes = gba_launcher.document_boxes(self.launcher.browser.document,

@@ -6,7 +6,7 @@ contract version where applicable.
 
 ## [Unreleased] — The terminal could not run a full-screen program, and the mouse only scrolled
 
-Suite: **754 passing, 1 skipped** (`make test`).
+Suite: **755 passing, 1 skipped** (`make test`).
 
 ### Fixed
 
