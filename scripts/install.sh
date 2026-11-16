@@ -142,6 +142,7 @@ Run '$0 --apply' to install it for the first time."
 
     install_automount_dependencies
     install_x11_dependencies
+    install_bluetooth_dependencies
     install_files
     install_ownership
     install_wrappers
@@ -243,6 +244,47 @@ then retry. Automatic dependency installation currently supports Debian/Ubuntu."
         gb_ok "matchbox-window-manager installed"
     else
         gb_warn "matchbox-window-manager installation failed; SDL2 windows may not render"
+    fi
+}
+
+# Install the Bluetooth + sound stack.
+#
+# These two belong together: the A2DP sink profile a headset is connected
+# through is created by the sound server, not by BlueZ. Without a sound
+# server every connect attempt fails with
+#   org.bluez.Error.Failed br-connection-profile-unavailable
+# which is the single most common reason a Bluetooth headset "does not
+# connect" on a machine without a desktop.
+install_bluetooth_dependencies() {
+    gb_step "Installing Bluetooth and sound dependencies"
+    if gb_is_dry_run; then
+        gb_dim "  (dry-run) would install bluez bluez-tools pipewire wireplumber libspa-0.2-bluetooth without recommends"
+        return 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        gb_warn "Install bluez, bluez-tools, pipewire and wireplumber with your package manager."
+        gb_warn "Without a sound server (pipewire/wireplumber) Bluetooth headsets cannot be connected."
+        return 0
+    fi
+    apt-get install -y --no-install-recommends \
+        bluez bluez-tools pipewire wireplumber libspa-0.2-bluetooth || \
+    apt-get install -y --no-install-recommends bluez bluez-tools || true
+    if command -v bluetoothctl >/dev/null 2>&1; then
+        gb_ok "bluez tools installed"
+    else
+        gb_warn "bluetoothctl is missing; the Bluetooth panel cannot talk to BlueZ"
+    fi
+    if command -v pipewire >/dev/null 2>&1 && command -v wireplumber >/dev/null 2>&1; then
+        gb_ok "pipewire + wireplumber installed (Bluetooth audio profiles work)"
+    else
+        gb_warn "No sound server installed: Bluetooth headsets will refuse to connect"
+        gb_warn "    sudo apt install pipewire wireplumber libspa-0.2-bluetooth"
+    fi
+    # BlueZ is a system service on systemd machines; the appliance session
+    # only needs the adapter powered, not a service it owns.
+    if [ -d /run/systemd/system ]; then
+        systemctl enable bluetooth.service >/dev/null 2>&1 || true
+        systemctl start bluetooth.service >/dev/null 2>&1 || true
     fi
 }
 
@@ -771,6 +813,7 @@ main() {
 
     install_automount_dependencies
     install_x11_dependencies
+    install_bluetooth_dependencies
     install_files
     install_ownership
     install_profile

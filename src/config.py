@@ -10,8 +10,11 @@ sysfs/debugfs interfaces.
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
+import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from common import get_data_dir
@@ -814,6 +817,354 @@ def toggle_wifi(enabled: bool) -> bool:
 
 
 # --- Bluetooth --------------------------------------------------------------
+#
+# Bluetooth is the only hardware path in the shell that talks to a daemon
+# instead of a device file, and that daemon answers asynchronously:
+# `bluetoothctl connect` prints "Attempting to connect to <MAC>" and only
+# later prints "Connection successful" or a BlueZ error. The old code ran
+# one-shot commands, believed the exit code and pasted the raw D-Bus error
+# into the toast, so a headset that was merely busy looked like a crash:
+#
+#     Attempting to connect to 01:02:03:04:D2:A1 | Failed to connect:
+#     org.bluez.Error.Failed br-connection-profile-unavailable
+#
+# br-connection-profile-unavailable means BlueZ had no profile it could
+# connect for that device. In practice that is one of two things:
+#
+#   * no audio service is running, so there is no A2DP sink endpoint and the
+#     headset has nothing to attach to (the GBA OS session ships without a
+#     sound server by default), or
+#   * the headset is still linked to the phone it was last used with and
+#     refuses a second link.
+#
+# The helpers below therefore pair and trust before connecting, treat the
+# device list - not the exit code - as the truth about a connection,
+# translate BlueZ error codes into one actionable sentence, and report
+# whether an audio service and an A2DP sink profile exist at all.
+
+BT_CONNECT_TIMEOUT = 30.0
+BT_PAIR_TIMEOUT = 30.0
+BT_VERIFY_TIMEOUT = 12.0
+BT_POLL_INTERVAL = 0.5
+
+# BlueZ error text -> one actionable sentence. Matched case-insensitively as a
+# substring, longest key first, so "device not available" wins over
+# "not available".
+BT_ERROR_HINTS: Dict[str, str] = {
+    "br-connection-profile-unavailable":
+        "No usable BT profile: headset busy, or no audio service",
+    "br-connection-already-connected": "Already connected",
+    "br-connection-failed": "Connection failed",
+    "authenticationfailed": "Pairing failed: the PIN was rejected",
+    "authenticationrejected": "Pairing was rejected by the headset",
+    "authentication canceled": "Pairing was cancelled",
+    "org.bluez.error.inprogress": "Another connection is already running",
+    "org.bluez.error.notready": "Adapter not ready: toggle Bluetooth off/on",
+    "org.bluez.error.nosuchdevice": "The device is gone: rescan",
+    "device not available": "Out of range: rescan and keep the headset close",
+    "not available": "Out of range: rescan and keep the headset close",
+    "no such device": "The device is gone: rescan",
+    "not connected": "The headset refused the connection",
+}
+
+# BlueZ object names -> the profile names people know them by.
+BLUEZ_PROFILE_NAMES: Dict[str, str] = {
+    "a2dpsink": "a2dp-sink",
+    "a2dpsource": "a2dp-source",
+    "hspag": "hsp-ag",
+    "hsphs": "hsp-hs",
+    "outputcontrol": "output-control",
+    "inputcontrol": "input-control",
+}
+
+
+def _btctl(args: List[str], timeout: float = 5.0) -> str:
+    """Run bluetoothctl once and return everything it printed (stdout+stderr).
+
+    BlueZ prints its errors on stderr, so both streams are merged: an error
+    that is only visible on stderr would otherwise look like silence.
+    """
+    btcli = shutil.which("bluetoothctl")
+    if not btcli:
+        return ""
+    try:
+        proc = subprocess.run(
+            [btcli] + list(args),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=timeout, check=False
+        )
+        return proc.stdout.decode("utf-8", "ignore")
+    except subprocess.TimeoutExpired as exc:
+        out = exc.output or b""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "ignore")
+        return out + "\n(command timed out)"
+    except Exception:
+        return ""
+
+
+def _btctl_session(commands: List[str], timeout: float,
+                   terminators: Optional[List[str]] = None) -> str:
+    """Run several bluetoothctl commands in ONE session.
+
+    bluetoothctl registers its pairing agent for the lifetime of the
+    process, so "agent on" in one invocation and "pair" in another cannot
+    work: the second process has no agent and the PIN exchange never
+    happens. Everything therefore happens in a single session here, and the
+    output is read until a terminal line appears - the verdict is
+    asynchronous - or the timeout expires.
+    """
+    btcli = shutil.which("bluetoothctl")
+    if not btcli:
+        return ""
+    try:
+        proc = subprocess.Popen(
+            [btcli], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1
+        )
+    except Exception:
+        return ""
+
+    collected: List[str] = []
+    finished = threading.Event()
+
+    def reader() -> None:
+        try:
+            for line in proc.stdout:
+                collected.append(line)
+                if terminators and any(t.lower() in line.lower() for t in terminators):
+                    break
+        except Exception:
+            pass
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=reader, daemon=True, name="gba-bluetoothctl")
+    thread.start()
+    try:
+        for command in commands:
+            proc.stdin.write(command + "\n")
+            proc.stdin.flush()
+        finished.wait(timeout)
+    except Exception:
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+    return "".join(collected)
+
+
+def _bt_connected_macs() -> List[str]:
+    """MACs BlueZ currently reports as connected."""
+    macs: List[str] = []
+    for line in _btctl(["devices", "Connected"], timeout=5.0).splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].lower() == "device":
+            macs.append(parts[1].upper())
+    return macs
+
+
+def _bt_device_info(mac: str) -> Dict[str, Any]:
+    """Parse "bluetoothctl info <mac>" into paired/trusted/connected/name."""
+    info: Dict[str, Any] = {"paired": False, "trusted": False,
+                            "connected": False, "name": ""}
+    for line in _btctl(["info", mac], timeout=5.0).splitlines():
+        key, _, value = line.partition(":")
+        key = key.strip().lower()
+        if key == "paired":
+            info["paired"] = value.strip().lower() == "yes"
+        elif key == "trusted":
+            info["trusted"] = value.strip().lower() == "yes"
+        elif key == "connected":
+            info["connected"] = value.strip().lower() == "yes"
+        elif key == "name" and not info["name"]:
+            info["name"] = value.strip()
+    return info
+
+
+def _bt_wait_connected(mac: str, want_connected: bool, timeout: float) -> bool:
+    """Wait until the device is (or is no longer) connected.
+
+    The device list is the only trustworthy answer: bluetoothctl's exit code
+    is zero for a failed connection just as often as for a successful one.
+    """
+    mac = mac.upper()
+    deadline = time.monotonic() + timeout
+    while True:
+        if (mac in _bt_connected_macs()) == want_connected:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(BT_POLL_INTERVAL)
+
+
+def bluetooth_error_message(raw: str) -> str:
+    """Translate raw bluetoothctl/BlueZ output into one actionable sentence.
+
+    "org.bluez.Error.Failed br-connection-profile-unavailable" tells a user
+    nothing; "Headset busy: disconnect it from your phone" tells them what to
+    do next.
+    """
+    text = (raw or "").strip()
+    low = text.lower()
+    if not text:
+        return "No answer from BlueZ - is bluetoothd running?"
+    for needle in sorted(BT_ERROR_HINTS, key=len, reverse=True):
+        if needle.lower() in low:
+            return BT_ERROR_HINTS[needle]
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line or line.lower().startswith("attempting to connect"):
+            continue
+        if line.lower().startswith("failed to connect:"):
+            line = line.split(":", 1)[1].strip()
+        return line[:72]
+    return "Connection failed"
+
+
+def _process_running(*names: str) -> bool:
+    """True if any of the given process names is running.
+
+    Reads /proc directly: the shell has to work on a machine without
+    procps, and pgrep is not part of the appliance's dependency list.
+    """
+    wanted = {name.lower() for name in names}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/comm" % entry, "r", encoding="utf-8") as handle:
+                comm = handle.read().strip().lower()
+        except OSError:
+            continue
+        if comm in wanted:
+            return True
+    return False
+
+
+def get_audio_service() -> str:
+    """Name of the running sound server ("pipewire", "pulseaudio" or "")."""
+    if _process_running("pipewire"):
+        return "pipewire"
+    if _process_running("pulseaudio"):
+        return "pulseaudio"
+    return ""
+
+
+def _bluez_object_paths() -> List[str]:
+    """Object paths BlueZ currently exports (e.g. /org/bluez/hci0/A2DPSink)."""
+    dbus_send = shutil.which("dbus-send")
+    if dbus_send:
+        try:
+            proc = subprocess.run(
+                [dbus_send, "--system", "--print-reply", "--dest=org.bluez",
+                 "/org/bluez", "org.freedesktop.DBus.ObjectManager.GetManagedObjects"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=5.0, check=False
+            )
+            out = proc.stdout.decode("utf-8", "ignore")
+            return re.findall(r'string "(/org/bluez/[^"]+)"', out)
+        except Exception:
+            return []
+    busctl = shutil.which("busctl")
+    if busctl:
+        try:
+            proc = subprocess.run(
+                [busctl, "--system", "--no-pager", "tree", "org.bluez"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=5.0, check=False
+            )
+            out = proc.stdout.decode("utf-8", "ignore")
+            return [line.strip() for line in out.splitlines()
+                    if line.strip().startswith("/org/bluez")]
+        except Exception:
+            return []
+    return []
+
+
+def get_bluetooth_profiles() -> List[str]:
+    """Profiles BlueZ currently exposes (e.g. ["a2dp-sink", "hsp-ag"]).
+
+    A Bluetooth headset can only be connected when the profile it speaks is
+    registered locally. Without an audio service there is no a2dp-sink, and
+    every connect attempt fails with br-connection-profile-unavailable.
+    """
+    profiles: List[str] = []
+    for path in _bluez_object_paths():
+        segment = path.rstrip("/").rsplit("/", 1)[-1]
+        if not segment or segment.startswith("hci"):
+            continue
+        name = BLUEZ_PROFILE_NAMES.get(segment.lower(), segment.lower())
+        if name not in profiles:
+            profiles.append(name)
+    return profiles
+
+
+def get_bluetooth_diagnostics() -> Dict[str, Any]:
+    """Everything needed to explain a failed connection, in one dict.
+
+      - available:   bluetoothctl is installed
+      - adapter:     adapter name
+      - powered:     the radio is on
+      - profiles:    profiles BlueZ exposes right now
+      - audio_profile: an a2dp-sink exists (Bluetooth sound can work)
+      - audio_service: name of the running sound server
+      - hint:        one line the UI can show the user
+    """
+    info: Dict[str, Any] = {
+        "available": bool(shutil.which("bluetoothctl")),
+        "adapter": "",
+        "powered": False,
+        "profiles": [],
+        "audio_profile": False,
+        "audio_service": "",
+        "hint": "",
+    }
+    if not info["available"]:
+        info["hint"] = "bluetoothctl is missing - install the bluez package"
+        return info
+
+    for line in _btctl(["show"], timeout=5.0).splitlines():
+        key, _, value = line.partition(":")
+        key = key.strip().lower()
+        if key == "name" and not info["adapter"]:
+            info["adapter"] = value.strip()
+        elif key == "powered":
+            info["powered"] = value.strip().lower() == "yes"
+
+    info["profiles"] = get_bluetooth_profiles()
+    info["audio_profile"] = "a2dp-sink" in info["profiles"]
+    info["audio_service"] = get_audio_service()
+
+    if not info["powered"]:
+        info["hint"] = "Bluetooth is off"
+    elif not info["audio_profile"]:
+        if info["audio_service"]:
+            info["hint"] = ("No A2DP sink profile - %s cannot drive Bluetooth sound"
+                            % info["audio_service"])
+        else:
+            info["hint"] = ("No A2DP sink profile - start PipeWire/WirePlumber "
+                            "for Bluetooth sound")
+    return info
+
 
 def get_bluetooth_status() -> Optional[Dict[str, Any]]:
     """Detect Bluetooth adapter and connection status.
@@ -821,13 +1172,15 @@ def get_bluetooth_status() -> Optional[Dict[str, Any]]:
     Returns None if no BT hardware found, otherwise:
       - powered: bool
       - connected: bool
+      - device_mac: str (connected device MAC, empty if none)
       - device_name: str (connected device name, empty if none)
     """
     btcli = shutil.which("bluetoothctl")
     if not btcli:
         return None
 
-    result: Dict[str, Any] = {"powered": False, "connected": False, "device_name": ""}
+    result: Dict[str, Any] = {"powered": False, "connected": False,
+                               "device_mac": "", "device_name": ""}
 
     try:
         # Check adapter power
@@ -839,8 +1192,6 @@ def get_bluetooth_status() -> Optional[Dict[str, Any]]:
         for line in out.splitlines():
             if "Powered:" in line:
                 result["powered"] = "yes" in line.lower()
-            if "Name:" in line and "Alias:" not in line:
-                pass  # adapter name, not needed
 
         if not result["powered"]:
             return result
@@ -853,44 +1204,58 @@ def get_bluetooth_status() -> Optional[Dict[str, Any]]:
         ).stdout.decode("utf-8", "ignore").strip()
         if out:
             result["connected"] = True
-            # Try to get device name
-            lines = out.splitlines()
-            if lines:
-                mac = lines[0].split()[-1] if lines[0].split() else ""
-                if mac:
-                    info_out = subprocess.run(
-                        [btcli, "info", mac],
-                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                        timeout=3.0, check=False
-                    ).stdout.decode("utf-8", "ignore")
-                    for line in info_out.splitlines():
-                        if "Name:" in line:
-                            result["device_name"] = line.split(":", 1)[1].strip()
-                            break
+            # The device line is "Device <MAC> <name>": the MAC is the second
+            # field. It used to be read from the last field, which is the
+            # *name* - so the connected device was never identified and the
+            # UI could neither show it nor disconnect it.
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].lower() == "device":
+                    mac = parts[1]
+                    result["device_mac"] = mac
+                    name = " ".join(parts[2:]) if len(parts) > 2 else ""
+                    if not name:
+                        info = _bt_device_info(mac)
+                        name = info.get("name", "")
+                    result["device_name"] = name
+                    break
     except Exception:
         pass
 
     return result
 
 
-def get_bluetooth_devices() -> List[Dict[str, str]]:
-    """List known/paired Bluetooth devices."""
+def get_bluetooth_devices() -> List[Dict[str, Any]]:
+    """List known Bluetooth devices with their pairing state."""
     btcli = shutil.which("bluetoothctl")
     if not btcli:
         return []
+    devices: List[Dict[str, Any]] = []
     try:
         out = subprocess.run(
             [btcli, "devices"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             timeout=3.0, check=False
         ).stdout.decode("utf-8", "ignore").strip()
-        devices = []
+
+        paired: set = set()
+        pout = subprocess.run(
+            [btcli, "devices", "Paired"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=3.0, check=False
+        ).stdout.decode("utf-8", "ignore")
+        for line in pout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].lower() == "device":
+                paired.add(parts[1].upper())
+
         for line in out.splitlines():
             parts = line.split(None, 2)
-            if len(parts) >= 3 and parts[0] == "Device":
+            if len(parts) >= 2 and parts[0] == "Device":
                 mac = parts[1]
-                name = parts[2]
-                devices.append({"mac": mac, "name": name})
+                name = parts[2].strip() if len(parts) > 2 else ""
+                devices.append({"mac": mac, "name": name or "Unknown device",
+                                "paired": mac.upper() in paired})
         return devices
     except Exception:
         return []
@@ -913,79 +1278,112 @@ def toggle_bluetooth(enabled: bool) -> bool:
         return False
 
 
+def pair_bluetooth(mac: str) -> Tuple[bool, str]:
+    """Pair and trust a device.
+
+    A headset that was never paired cannot be connected at all, and the
+    pairing agent has to live in the same bluetoothctl process as the
+    "pair" command - otherwise the PIN exchange never happens.
+    """
+    if not shutil.which("bluetoothctl"):
+        return False, "bluetoothctl is not installed (package: bluez)"
+    mac = (mac or "").strip().upper()
+    if not mac:
+        return False, "No device selected"
+
+    out = _btctl_session(
+        ["agent on", "default-agent", "scan on", "pair " + mac],
+        timeout=BT_PAIR_TIMEOUT,
+        terminators=["pairing successful", "successfully paired", "already exists",
+                     "failed to pair", "authentication failed", "authentication rejected"]
+    )
+    low = out.lower()
+    if "pairing successful" in low or "successfully paired" in low or "already exists" in low:
+        _btctl(["trust", mac], timeout=5.0)
+        return True, "Paired"
+    return False, bluetooth_error_message(out or "Pairing failed")
+
+
 def connect_bluetooth(mac: str) -> Tuple[bool, str]:
-    """Connect to a paired Bluetooth device. Returns (success, message)."""
-    btcli = shutil.which("bluetoothctl")
-    if not btcli:
-        return False, "bluetoothctl not available"
-    try:
-        # Trust and connect
-        subprocess.run(
-            [btcli, "trust", mac],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=3.0, check=False
-        )
-        proc = subprocess.run(
-            [btcli, "connect", mac],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=15.0, check=False
-        )
-        out = proc.stdout.decode("utf-8", "ignore").strip()
-        if "Connected" in out or proc.returncode == 0:
-            return True, "Connected"
-        return False, out or "Connection failed"
-    except Exception as exc:
-        return False, str(exc)
+    """Connect to a Bluetooth device. Returns (success, message).
+
+    The device is paired and trusted first, the verdict is read from the
+    asynchronous output, and the connection is confirmed against the device
+    list. The message is one actionable sentence - never a raw D-Bus error.
+    """
+    if not shutil.which("bluetoothctl"):
+        return False, "bluetoothctl is not installed (package: bluez)"
+    mac = (mac or "").strip().upper()
+    if not mac:
+        return False, "No device selected"
+
+    info = _bt_device_info(mac)
+    if not info.get("paired"):
+        paired, message = pair_bluetooth(mac)
+        if not paired:
+            return False, message
+    if not info.get("trusted"):
+        _btctl(["trust", mac], timeout=5.0)
+
+    out = _btctl_session(
+        ["connect " + mac],
+        timeout=BT_CONNECT_TIMEOUT,
+        terminators=["connection successful", "failed to connect",
+                     "already connected", "not available"]
+    )
+    low = out.lower()
+    if "already connected" in low:
+        return True, "Already connected"
+    if ("failed to connect" in low or "not available" in low
+            or "authentication" in low or "not ready" in low):
+        return False, bluetooth_error_message(out)
+    if _bt_wait_connected(mac, True, BT_VERIFY_TIMEOUT):
+        return True, "Connected"
+    # No error, no connection: the headset accepted the request but never
+    # brought the profile up (usually a second device already holds it).
+    low = out.lower()
+    if "connection successful" in low or "already connected" in low:
+        return False, "The headset did not connect (profile busy)"
+    return False, bluetooth_error_message(out or "The headset did not connect")
 
 
 def disconnect_bluetooth(mac: str) -> Tuple[bool, str]:
     """Disconnect a Bluetooth device."""
-    btcli = shutil.which("bluetoothctl")
-    if not btcli:
-        return False, "bluetoothctl not available"
-    try:
-        proc = subprocess.run(
-            [btcli, "disconnect", mac],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=10.0, check=False
-        )
-        out = proc.stdout.decode("utf-8", "ignore").strip()
-        if "Disconnected" in out or proc.returncode == 0:
-            return True, "Disconnected"
-        return False, out or "Disconnect failed"
-    except Exception as exc:
-        return False, str(exc)
+    if not shutil.which("bluetoothctl"):
+        return False, "bluetoothctl is not installed (package: bluez)"
+    mac = (mac or "").strip().upper()
+    if not mac:
+        return False, "No device selected"
+
+    out = _btctl_session(
+        ["disconnect " + mac],
+        timeout=10.0,
+        terminators=["disconnected", "failed to disconnect", "not connected"]
+    )
+    if _bt_wait_connected(mac, False, 6.0):
+        return True, "Disconnected"
+    return False, bluetooth_error_message(out or "Still connected")
 
 
-def scan_bluetooth_devices() -> List[Dict[str, str]]:
-    """Scan for nearby Bluetooth devices (quick 3-second scan)."""
+def scan_bluetooth_devices() -> List[Dict[str, Any]]:
+    """Scan for nearby Bluetooth devices (quick 5-second scan)."""
     btcli = shutil.which("bluetoothctl")
     if not btcli:
         return []
     try:
-        # Start scan, wait 3 seconds, stop scan
+        # Start scan, wait, stop scan
         subprocess.run(
             [btcli, "scan", "on"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=1.0, check=False
         )
-        time.sleep(3)
+        time.sleep(5)
         subprocess.run(
             [btcli, "scan", "off"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=1.0, check=False
         )
         # Get devices found
-        out = subprocess.run(
-            [btcli, "devices"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=3.0, check=False
-        ).stdout.decode("utf-8", "ignore").strip()
-        devices = []
-        for line in out.splitlines():
-            parts = line.split(None, 2)
-            if len(parts) >= 3 and parts[0] == "Device":
-                devices.append({"mac": parts[1], "name": parts[2]})
-        return devices
+        return get_bluetooth_devices()
     except Exception:
         return []

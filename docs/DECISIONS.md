@@ -999,3 +999,30 @@ when there is none), `GBA_COMPOSITOR_REASON` carries the session's verdict into 
 `GBA_COMPOSITOR_DISABLED=1`/`GBA_COMPOSITOR_BACKEND=none` is the only way to ask for no compositing.
 A stale script that still exports `none` on failure is retried rather than obeyed, which matters
 because installed scripts lag behind adapters (D-058).
+
+## D-060 The title of a game is its file name, not the cartridge header
+**Status:** Accepted
+
+**Context.** The library took the title of a game from the cartridge header, which is a property of
+the *base game*. A Pokémon ROM hack is a patch of a base ROM, and it keeps the header it inherited:
+hundreds of hacks built on the same base ship the same twelve bytes of title (`POKEMON EMER` is a
+popular base). The shelf therefore showed the same name on every cartridge, and the games could not
+be told apart — the user sees "Pokemon Emerald" four times and has to guess which is the
+randomizer, which is the hard mode and which is the plain dump. The file name, on the other hand,
+is what the user named the file, and it is where the decorations live: `(USA)`, `(Rev 1)`, `[b]` are
+exactly what distinguishes two dumps of the same game. The header is still worth reading — it is
+evidence that the file is what it claims to be — so it stays in the boot log.
+
+**Decision.** The title of a game entry is the name of its file without the extension, taken
+verbatim (decorations included). The cartridge header is diagnostic only. Because a title is now a
+property of a *name*, the user can change it: the library offers a rename that renames the file, and
+the new file name becomes the new title. The rename touches nothing else — the entry id is derived
+from the content (L2), so saves, cheats, save states and the favourite flag stay with the game.
+
+**Consequences.** The library cache records where its title came from, so a cache written by an
+earlier release is refreshed in place from the file name instead of re-hashing the ROM (the content
+id, and every artefact keyed by it, must not change because a label changed). The rename is
+deliberately narrow: the file stays in its folder, an existing file is never overwritten, and a name
+containing a path separator is refused rather than silently rewritten — a name is a name, never a
+path. A ROM whose file name is deliberately cryptic now shows that cryptic name; the shell is a
+library of the user's files, not a guesser.

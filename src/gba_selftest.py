@@ -490,6 +490,40 @@ def check_diagnostics() -> Check:
     return Check("diagnostics", PASS, "; ".join(detail))
 
 
+def check_bluetooth() -> Check:
+    """Can a Bluetooth headset be connected on this machine?
+
+    Two things are needed and both are easy to miss: bluetoothctl (the BlueZ
+    client) and a sound server. The A2DP sink profile a headset is connected
+    through belongs to the sound server, not to BlueZ - without it every
+    connect attempt fails with
+    "org.bluez.Error.Failed br-connection-profile-unavailable".
+    """
+    if not shutil.which("bluetoothctl"):
+        return Check("bluetooth", WARN, "bluetoothctl not found",
+                     "Install BlueZ: sudo apt install bluez bluez-tools")
+
+    try:
+        import config
+    except Exception as exc:  # pragma: no cover - broken install
+        return Check("bluetooth", WARN, f"config unavailable: {exc}")
+
+    diagnostics = config.get_bluetooth_diagnostics()
+    adapter = diagnostics.get("adapter") or "no adapter"
+    powered = "powered" if diagnostics.get("powered") else "off"
+    profiles = ", ".join(diagnostics.get("profiles") or []) or "none"
+    service = diagnostics.get("audio_service") or "none"
+    detail = (f"adapter {adapter} ({powered}); profiles: {profiles}; "
+              f"sound server: {service}")
+
+    if diagnostics.get("audio_profile"):
+        return Check("bluetooth", PASS, detail)
+    return Check("bluetooth", WARN, detail,
+                 "Without an A2DP sink profile a Bluetooth headset cannot be "
+                 "connected at all. Install and start a sound server: "
+                 "sudo apt install pipewire wireplumber libspa-0.2-bluetooth")
+
+
 def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
     try:
         _import(src_hint)
@@ -501,7 +535,8 @@ def run_all(src_hint: str, data_dir: str, games_dir: str) -> List[Check]:
                            check_display(), check_mgba(), check_mtp(),
                            check_native_hotkeys(), check_compositor(),
                            check_presentation(), check_session_script(),
-                           check_window_manager(), check_diagnostics()]
+                           check_window_manager(), check_diagnostics(),
+                           check_bluetooth()]
     checks.extend(check_modules())
     checks.extend(check_pygame())
     checks.extend(check_storage(data_dir, games_dir))

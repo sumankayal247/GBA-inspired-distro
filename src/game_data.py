@@ -732,8 +732,107 @@ class Favorites:
 
 
 # ---------------------------------------------------------------------------
-# Game Management (delete selected / delete all)
+# Game Management (rename / delete selected / delete all)
 # ---------------------------------------------------------------------------
+
+# Characters that must never appear in a game name: a name is a file name in
+# the games folder, never a path.
+_NAME_FORBIDDEN = ("/", "\\", "\x00")
+
+
+def sanitize_game_name(raw: Any) -> str:
+    """Turns typed text into a safe file base name.
+
+    Control characters are dropped, runs of whitespace collapse, and a
+    leading dot (a hidden file) or a trailing dot is removed. The result is
+    a *file name* in the games folder - never a path. Path separators are
+    not silently rewritten: a name that contains one is refused by
+    `rename_game`, so the user learns that instead of getting a file called
+    something they did not type.
+    """
+    if not isinstance(raw, str):
+        return ""
+    name = "".join(ch for ch in raw if ch.isprintable())
+    name = " ".join(name.split())
+    name = name.strip(" .")          # no leading dot (hidden file), no trailing dot
+    if name in ("", ".", ".."):
+        return ""
+    return name[:120]
+
+
+def rename_game(entry: Dict[str, Any], new_name: Any,
+                games_dir: Optional[str] = None,
+                library=None) -> Dict[str, Any]:
+    """Renames the ROM file of one game.
+
+    The content id is derived from the file content (Rule L2), so every save,
+    cheat, save state and the favourite flag of that game survive the rename
+    untouched - only the name on the cartridge changes. The file stays in the
+    folder it was in; an existing file is never overwritten.
+    """
+    result: Dict[str, Any] = {"id": "", "ok": False, "path": "", "title": "",
+                               "errors": []}
+    if not isinstance(entry, dict):
+        result["errors"].append("invalid entry")
+        return result
+    result["id"] = entry.get("id", "")
+    source = entry.get("content_path") or ""
+    if not isinstance(source, str) or not source:
+        result["errors"].append("this game has no file on disk")
+        return result
+    if not os.path.isfile(source):
+        result["errors"].append("the ROM file is gone")
+        return result
+
+    root = os.path.abspath(games_dir or common.get_games_dir())
+    folder = os.path.dirname(os.path.abspath(source))
+    try:
+        inside = os.path.commonpath((folder, root)) == root
+    except ValueError:
+        inside = False
+    if not inside:
+        result["errors"].append("ROM outside the games folder")
+        return result
+
+    extension = os.path.splitext(source)[1]
+    if extension.lower() not in (".gba", ".gb", ".gbc"):
+        result["errors"].append("not a ROM file")
+        return result
+
+    raw = new_name if isinstance(new_name, str) else ""
+    if any(bad in raw for bad in _NAME_FORBIDDEN):
+        result["errors"].append("the name cannot contain / or \\")
+        return result
+    name = sanitize_game_name(raw)
+    if not name:
+        result["errors"].append("the name is empty")
+        return result
+
+    target = os.path.join(folder, name + extension)
+    if os.path.abspath(target) == os.path.abspath(source):
+        result["ok"] = True                    # already named that
+        result["path"] = source
+        result["title"] = common.filename_title(source)
+        return result
+    if os.path.exists(target):
+        result["errors"].append("a game with that name already exists")
+        return result
+    try:
+        os.rename(source, target)
+    except OSError as exc:
+        result["errors"].append(f"rename failed: {exc}")
+        return result
+
+    result["ok"] = True
+    result["path"] = target
+    result["title"] = common.filename_title(target)
+    if library is not None:
+        try:
+            library.rekey_entry(source, target)
+        except Exception:
+            pass
+    return result
+
 
 def delete_game(entry: Dict[str, Any], games_dir: Optional[str] = None,
                 data_dir: Optional[str] = None, library=None,

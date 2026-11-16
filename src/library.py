@@ -12,12 +12,18 @@ from common import (
     get_games_dir,
     get_data_dir,
     compute_content_id,
-    extract_gba_title,
+    filename_title,
 )
 
 logger = logging.getLogger("gba.library")
 
 ALLOWED_EXTENSIONS = {".gba", ".gbc", ".gb"}
+
+# The shelf shows the file name, not the cartridge header (see
+# common.filename_title). Caches written before that change carry the old
+# header title, so every cached record states where its title came from and
+# an outdated one is refreshed in place - without re-hashing the ROM.
+TITLE_SOURCE = "filename"
 
 # Directories that never contain user content and are expensive to walk.
 SKIP_DIRS = {"lost+found", ".Trash-1000", "$RECYCLE.BIN", "System Volume Information"}
@@ -111,9 +117,23 @@ class Library:
                         and cached_entry.get("mtime") == mtime
                     ):
                         entry = cached_entry["entry"]
+                        if cached_entry.get("title_source") != TITLE_SOURCE:
+                            # A cache written before the shelf showed file
+                            # names: only the title changed, so it is
+                            # refreshed here instead of re-hashing the ROM.
+                            entry = dict(entry)
+                            entry["title"] = filename_title(full_path)
+                            with self._cache_lock:
+                                self._cache[cache_key] = {
+                                    "size": size,
+                                    "mtime": mtime,
+                                    "entry": entry,
+                                    "title_source": TITLE_SOURCE,
+                                }
+                            cache_updated = True
                     else:
                         entry_id = compute_content_id(full_path)
-                        title = extract_gba_title(full_path)
+                        title = filename_title(full_path)
                         entry = self._make_entry(full_path, file, ext, size,
                                                  entry_id, title)
                         newly_hashed += 1
@@ -121,7 +141,8 @@ class Library:
                             self._cache[cache_key] = {
                                 "size": size,
                                 "mtime": mtime,
-                                "entry": entry
+                                "entry": entry,
+                                "title_source": TITLE_SOURCE,
                             }
                             if newly_hashed % CACHE_SAVE_INTERVAL == 0:
                                 self._save_cache()
@@ -206,12 +227,13 @@ class Library:
                 continue
             entry = self._make_entry(path, os.path.basename(path), ext,
                                      stat.st_size, content_id,
-                                     extract_gba_title(path))
+                                     filename_title(path))
             with self._cache_lock:
                 self._cache[path] = {
                     "size": stat.st_size,
                     "mtime": stat.st_mtime,
                     "entry": entry,
+                    "title_source": TITLE_SOURCE,
                 }
             added += 1
         if added:
@@ -219,6 +241,38 @@ class Library:
                 self._save_cache()
             logger.info("Registered %d imported file(s) in the library cache", added)
         return added
+
+    def rekey_entry(self, old_path: str, new_path: str) -> bool:
+        """Moves one cached entry to a new path after a rename.
+
+        The content id does not change - it is derived from the content, not
+        from the name - so the saves, cheats, save states and the favourite
+        flag of the game all survive the rename. Re-keying the cache keeps
+        the next scan a cache hit instead of a full re-hash.
+        """
+        with self._cache_lock:
+            record = self._cache.pop(old_path, None)
+            if not record:
+                return False
+            entry = dict(record.get("entry") or {})
+            entry["filename"] = os.path.basename(new_path)
+            entry["content_path"] = new_path
+            entry["title"] = filename_title(new_path)
+            updated = {
+                "size": record.get("size"),
+                "mtime": record.get("mtime"),
+                "entry": entry,
+                "title_source": TITLE_SOURCE,
+            }
+            try:
+                stat = os.stat(new_path)
+                updated["size"] = stat.st_size
+                updated["mtime"] = stat.st_mtime
+            except OSError:
+                pass
+            self._cache[new_path] = updated
+            self._save_cache()
+        return True
 
     def forget_path(self, path: str) -> bool:
         """Drops one deleted ROM from the disposable scan cache.
