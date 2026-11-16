@@ -260,6 +260,69 @@ if [ -n "${DISPLAY:-}" ]; then
     sleep 0.5
 fi
 
+# --- audio ------------------------------------------------------------------
+# A Bluetooth headset cannot be connected at all without a sound server: the
+# A2DP sink profile is created by PipeWire (or PulseAudio), and while it is
+# missing BlueZ answers every connect attempt with
+#
+#   org.bluez.Error.Failed br-connection-profile-unavailable
+#
+# GBA OS ran without any sound server at all, so every headset failed for
+# exactly that reason. The session starts one now, reuses an existing one,
+# and names what is missing when it cannot - the shell reports the same
+# thing in SETTINGS > BLUETOOTH, where the user actually looks.
+start_audio_service() {
+    local runtime i
+    runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if [ -d "$runtime" ]; then
+        export XDG_RUNTIME_DIR="$runtime"
+    fi
+
+    if command -v pgrep >/dev/null 2>&1; then
+        if pgrep -x pipewire >/dev/null 2>&1 || \
+           pgrep -x wireplumber >/dev/null 2>&1 || \
+           pgrep -x pulseaudio >/dev/null 2>&1; then
+            echo "[audio] a sound server is already running (reusing it)" >&2
+            return 0
+        fi
+    fi
+
+    if command -v pipewire >/dev/null 2>&1; then
+        pipewire >/dev/null 2>&1 &
+        audio_pids="$audio_pids $!"
+        for i in $(seq 1 40); do
+            [ -e "${XDG_RUNTIME_DIR:-$runtime}/pipewire-0" ] && break
+            sleep 0.1
+        done
+        if command -v wireplumber >/dev/null 2>&1; then
+            wireplumber >/dev/null 2>&1 &
+            audio_pids="$audio_pids $!"
+            sleep 0.5
+            echo "[audio] pipewire + wireplumber started (Bluetooth A2DP sink available)" >&2
+        else
+            echo "[audio] WARNING: wireplumber is missing; PipeWire alone creates no Bluetooth profile" >&2
+            echo "[audio]   Install: sudo apt install wireplumber" >&2
+        fi
+        return 0
+    fi
+
+    if command -v pulseaudio >/dev/null 2>&1; then
+        pulseaudio --daemonize=yes --exit-idle-time=-1 >/dev/null 2>&1 || true
+        echo "[audio] pulseaudio started" >&2
+        return 0
+    fi
+
+    echo "[audio] WARNING: no sound server found (pipewire/pulseaudio)." >&2
+    echo "[audio]   Install: sudo apt install pipewire wireplumber libspa-0.2-bluetooth" >&2
+    echo "[audio]   Without one, Bluetooth headsets cannot be connected at all." >&2
+    return 1
+}
+
+# Only the servers this session starts are stopped again on exit; one that
+# was already running belongs to the user.
+audio_pids=""
+start_audio_service
+
 # --- verbose subsystem diagnostics -------------------------------------------
 # "The game opened to a black screen" cannot be diagnosed from the shell alone:
 # SDL2, Mesa and mGBA all fail quietly by default. These exports make every
@@ -348,6 +411,11 @@ cleanup() {
         kill "$automounter" 2>/dev/null || true
         wait "$automounter" 2>/dev/null || true
     fi
+    # The sound server belongs to this session: a leftover PipeWire would
+    # keep the Bluetooth profile of a session that is already gone.
+    for pid in $audio_pids; do
+        kill "$pid" 2>/dev/null || true
+    done
 }
 trap cleanup EXIT
 trap 'exit 143' TERM

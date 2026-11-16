@@ -4,6 +4,58 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — Bluetooth headsets: the raw BlueZ error was shown instead of a fix, and the appliance had no sound server to connect them with
+
+Suite: **654 passing, 1 skipped** (`make test`).
+
+### Fixed
+
+- **A failed Bluetooth connection showed the D-Bus error, not the reason.** Selecting a headset
+  printed the raw `bluetoothctl` output in the toast:
+
+  ```text
+  Attempting to connect to 01:02:03:04:D2:A1 | Failed to connect:
+  org.bluez.Error.Failed br-connection-profile-unavailable
+  ```
+
+  Every BlueZ error code is now translated into one actionable sentence (`config.py`:
+  `bluetooth_error_message`), the "Attempting to connect" line is never used as a message, and
+  the panel explains the two real causes of `br-connection-profile-unavailable` in the line under
+  the device list: the headset is still linked to another device, or no sound server is running.
+- **The appliance had no sound server at all — which is *why* every headset failed.** The A2DP
+  sink profile a headset is connected through belongs to the sound server (PipeWire or
+  PulseAudio), not to BlueZ; with no profile registered, BlueZ refuses every headset with
+  `br-connection-profile-unavailable`. `gba-session` now starts `pipewire` + `wireplumber` when
+  they are installed, reuses an existing server, and names what is missing when it cannot
+  (`[audio] WARNING: no sound server found ...`). The installer installs
+  `bluez bluez-tools pipewire wireplumber libspa-0.2-bluetooth` alongside the other session
+  dependencies.
+- **The panel now says whether Bluetooth audio is even possible.** `Audio profile: a2dp-sink /
+  missing` appears in SETTINGS → BLUETOOTH, the Bluetooth panel shows the same fact as a hint,
+  and `gba-selftest` reports the adapter, the profiles BlueZ exposes and the sound server it
+  found. The reason a connection failed stays in the panel after the toast is gone, instead of
+  scrolling past in five seconds.
+- **A headset that was never paired could never be connected.** The old code only trusted the
+  device and connected it; an unpaired device cannot be connected at all. Pairing now happens
+  first — and in the *same* `bluetoothctl` process, because the pairing agent is registered for
+  the lifetime of the process and `agent on` in one invocation never reaches the `pair` in the
+  next one.
+- **A connection was declared successful when nothing had connected.** The old code believed
+  `bluetoothctl`'s exit code, which is zero for a failed connection just as often as for a
+  successful one. The device list is now the only thing that decides: the connect is verified
+  against `devices Connected` and a silent failure is reported as a failure.
+- **The connected device was never identified.** The MAC was read from the last field of
+  `Device <MAC> <name>`, which is the *name*, so the connected device was never recognised, the
+  panel never marked it `[connected]`, and pressing `A` on it tried to connect a second time
+  instead of disconnecting.
+- **Scanning never found anything.** `scan_bluetooth_devices` called `time.sleep(3)` but `time`
+  was never imported, so every scan raised `NameError`, was swallowed by the blanket
+  `except Exception`, and the panel always reported "No devices found".
+- **The panel froze the whole shell for the length of a bluetoothctl call.** A scan listens for
+  five seconds and a connect can take half a minute; both ran on the UI thread. They now run on
+  a worker thread, the panel shows what it is waiting for, and the result arrives as a toast.
+  Overlays gained an `update()` hook for exactly this.
+
 ## [Unreleased] — Black screen on modern GPUs: the compositor never ran and every frame was forced through llvmpipe
 
 Suite: **630 passing, 1 skipped** (`make test`).

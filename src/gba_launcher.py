@@ -216,6 +216,15 @@ class Overlay:
         elif event.type == pygame.JOYBUTTONDOWN and event.button == 1:
             self.close(shell)
 
+    def update(self, shell) -> None:
+        """Called once per frame with the top overlay.
+
+        Overlays that run work in the background (a Bluetooth connect can
+        take half a minute) use this to collect the result and report it
+        without ever blocking the frame.
+        """
+        pass
+
     # -- drawing -------------------------------------------------------
     def draw(self, shell) -> None:
         theme = shell.theme
@@ -1909,34 +1918,89 @@ class WifiOverlay(Overlay):
 
 
 class BluetoothOverlay(Overlay):
-    """Bluetooth device manager."""
+    """Bluetooth device manager.
+
+    Every bluetoothctl call can take seconds - a scan listens for five, a
+    connect waits for the headset to answer - so all of them run on a worker
+    thread. The overlay keeps drawing while the work is in flight and the
+    result arrives as a toast, instead of freezing the whole shell for half
+    a minute.
+    """
 
     def __init__(self, shell):
         super().__init__()
         self.title = "BLUETOOTH"
         self.width = 360.0
-        self.height = 260.0
+        self.height = 280.0
         self.index = 0
         self.devices = []
         self.scanning = False
         self.status = settings_store.get_bluetooth_status()
+        self.diagnostics = settings_store.get_bluetooth_diagnostics()
+        self.busy = ""
+        self._job = ""
+        self._worker = None
+        self._result = None
+        self.last_error = ""
         self._load_devices()
 
     def _load_devices(self):
         self.devices = settings_store.get_bluetooth_devices()
 
+    # -- background work -------------------------------------------------
+    def _start_job(self, shell, kind: str, label: str, func) -> None:
+        """Run a slow bluetoothctl job off the UI thread."""
+        if self._worker is not None and self._worker.is_alive():
+            shell.toast("Still working - please wait", TOAST_WARN)
+            return
+        self._job = kind
+        self.busy = label
+        self._result = None
+
+        def worker():
+            try:
+                value = func()
+            except Exception as exc:      # a job must never kill the shell
+                value = exc
+            self._result = value
+
+        self._worker = threading.Thread(target=worker, daemon=True,
+                                        name="gba-bluetooth")
+        self._worker.start()
+
+    def update(self, shell) -> None:
+        """Collect a finished job and turn it into a toast."""
+        if self._result is None:
+            return
+        result, self._result = self._result, None
+        kind, self._job = self._job, ""
+        self.busy = ""
+        self.scanning = False
+
+        if isinstance(result, Exception):
+            shell.toast(f"Bluetooth error: {result}", TOAST_ERROR, 5.0)
+            return
+        if kind == "scan":
+            self._load_devices()
+            total = len(self.devices)
+            shell.toast(f"{total} device(s) found" if total else "No devices found",
+                        TOAST_OK if total else TOAST_WARN)
+        elif kind in ("connect", "disconnect"):
+            ok, msg = result
+            # The reason stays in the panel: a toast disappears after a few
+            # seconds, and the user needs to read what went wrong.
+            self.last_error = "" if ok else msg
+            shell.toast(msg, TOAST_OK if ok else TOAST_ERROR, 5.0)
+        self.status = settings_store.get_bluetooth_status()
+        self.diagnostics = settings_store.get_bluetooth_diagnostics()
+        shell.status_monitor.request_refresh()
+
+    # -- actions ---------------------------------------------------------
     def _refresh(self, shell):
         self.scanning = True
         shell.toast("Scanning for devices...", TOAST_INFO)
-        # Quick scan
-        found = settings_store.scan_bluetooth_devices()
-        self._load_devices()
-        self.scanning = False
-        total = len(self.devices)
-        if total:
-            shell.toast(f"{total} device(s) found", TOAST_OK)
-        else:
-            shell.toast("No devices found", TOAST_WARN)
+        self._start_job(shell, "scan", "Scanning for devices",
+                        settings_store.scan_bluetooth_devices)
 
     def _toggle_power(self, shell):
         if self.status is None:
@@ -1948,18 +2012,25 @@ class BluetoothOverlay(Overlay):
         shell.status_monitor.request_refresh()
         shell.toast("Bluetooth " + ("on" if not powered else "off"), TOAST_OK)
 
+    def _is_connected(self, device) -> bool:
+        status = self.status or {}
+        if not status.get("connected"):
+            return False
+        mac = status.get("device_mac") or ""
+        if mac:
+            return mac.upper() == device["mac"].upper()
+        return status.get("device_name", "") == device["name"]
+
     def _connect_device(self, shell, device):
         mac = device["mac"]
         name = device["name"]
-        # Check if already connected
-        if self.status and self.status.get("connected") and self.status.get("device_name") == name:
-            ok, msg = settings_store.disconnect_bluetooth(mac)
-            shell.toast(f"Disconnected from {name}" if ok else msg, TOAST_OK if ok else TOAST_ERROR)
+        # A connected device is disconnected instead, so one key does both.
+        if self._is_connected(device):
+            self._start_job(shell, "disconnect", f"Disconnecting {name}",
+                            lambda: settings_store.disconnect_bluetooth(mac))
         else:
-            ok, msg = settings_store.connect_bluetooth(mac)
-            shell.toast(f"Connected to {name}" if ok else msg, TOAST_OK if ok else TOAST_ERROR)
-        self.status = settings_store.get_bluetooth_status()
-        shell.status_monitor.request_refresh()
+            self._start_job(shell, "connect", f"Connecting to {name}",
+                            lambda: settings_store.connect_bluetooth(mac))
 
     def handle(self, event, shell) -> None:
         if event.type == pygame.QUIT:
@@ -2009,12 +2080,16 @@ class BluetoothOverlay(Overlay):
                       c.success if powered else c.text_muted))
         items.append(("Scan for devices" + ("..." if self.scanning else ""), c.info))
         for dev in self.devices:
-            is_connected = (self.status and self.status.get("connected")
-                            and self.status.get("device_name") == dev["name"])
-            label = dev["name"]
-            if is_connected:
-                label += " [connected]"
-            items.append((label, c.success if is_connected else c.text))
+            if self._is_connected(dev):
+                label = dev["name"] + " [connected]"
+                color = c.success
+            elif dev.get("paired"):
+                label = dev["name"] + " [paired]"
+                color = c.text
+            else:
+                label = dev["name"] + " [not paired]"
+                color = c.text_muted
+            items.append((label, color))
 
         row_h = 22.0
         visible = max(1, int((rect.height / theme.scale) // row_h))
@@ -2032,9 +2107,24 @@ class BluetoothOverlay(Overlay):
             theme.label(shell.surface, text, (x0 + 8, y + 4),
                         color if sel else c.text_muted, key="body")
 
-        if not self.devices and not self.scanning:
-            theme.label(shell.surface, "No paired devices. Press Scan to find devices.",
-                        (x0 + 8, y0 + 50), c.text_dim, key="micro")
+        # The one line that explains a failure: a headset that cannot be
+        # connected is usually missing an audio service, and the user has to
+        # be told that instead of a BlueZ error code.
+        hint = self.busy
+        hint_color = c.info
+        if not hint:
+            hint = self.last_error
+            hint_color = c.danger
+        if not hint:
+            hint = (self.diagnostics or {}).get("hint", "")
+            hint_color = c.text_dim
+        if hint:
+            theme.label(shell.surface,
+                        truncate(theme.font("micro"), hint, theme.px(width)),
+                        (x0 + 8, y0 + visible * row_h + 2), hint_color, key="micro")
+        elif not self.devices and not self.scanning:
+            theme.label(shell.surface, "No devices yet. Press Scan to find devices.",
+                        (x0 + 8, y0 + visible * row_h + 2), c.text_dim, key="micro")
 
 
 class VolumeOverlay(Overlay):
@@ -2502,6 +2592,9 @@ class GBALauncher:
         self._poll_usb()
         self._poll_terminal()
         self._poll_key_repeat()
+
+        if self.overlay is not None:
+            self.overlay.update(self)
 
         if self.toast_text and time.monotonic() > self.toast_until:
             self.toast_text = ""
@@ -3448,6 +3541,10 @@ class GBALauncher:
                 {"type": "info", "label": "Status", "value": "no adapter",
                  "hint": "No Bluetooth hardware detected on this machine."},
             ]
+        # The audio profile is what decides whether a headset can be
+        # connected at all: without an A2DP sink BlueZ refuses every
+        # headset with br-connection-profile-unavailable.
+        diagnostics = settings_store.get_bluetooth_diagnostics()
         rows = [
             {"type": "info", "label": "Adapter",
              "value": "On" if bt.get("powered") else "Off",
@@ -3455,6 +3552,10 @@ class GBALauncher:
             {"type": "info", "label": "Connected",
              "value": bt.get("device_name", "None") if bt.get("connected") else "None",
              "hint": "Currently connected Bluetooth device."},
+            {"type": "info", "label": "Audio profile",
+             "value": "a2dp-sink" if diagnostics.get("audio_profile") else "missing",
+             "hint": diagnostics.get("hint") or
+                     "Bluetooth sound needs an A2DP sink profile (PipeWire/WirePlumber)."},
             {"type": "action", "label": "Manage devices",
              "hint": "Scan, pair and connect Bluetooth devices.",
              "action": lambda shell: shell.push_overlay(BluetoothOverlay(shell))},

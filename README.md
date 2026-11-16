@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Contract](https://img.shields.io/badge/Contract-Draft%202%20(V1)-purple.svg)](docs/CONTRACT.md)
-[![Tests](https://img.shields.io/badge/Tests-526%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/Tests-654%20passing-brightgreen.svg)](tests)
 [![Safe by default](https://img.shields.io/badge/install-safe%20by%20default-blue.svg)](docs/SAFETY.md)
 
 **GBA OS** is an appliance-style Linux operating system experience designed to turn any PC or laptop into a dedicated Game Boy Advance console.
@@ -367,6 +367,17 @@ is duplicated.
   report `0`-byte file sizes are scanned and imported normally. `gba-selftest --mtp` prints every
   link of the chain (sysfs interface, `jmtpfs`/`mtp-detect`, GVfs, FUSE mount root, devices,
   volumes, last error) with one actionable hint.
+- **Bluetooth:** SETTINGS → Bluetooth → *Manage devices* scans, pairs and connects headsets and
+  controllers. BlueZ is talked to through a single `bluetoothctl` session (the pairing agent only
+  exists inside that process, so `agent on` and `pair` have to share one), and a connection is
+  confirmed against the device list rather than the command's exit code — BlueZ answers
+  asynchronously, and "Attempting to connect" is not a verdict. Bluetooth **audio** additionally
+  needs a sound server: the A2DP sink profile a headset is connected through belongs to PipeWire
+  (or PulseAudio), not to BlueZ, and without it BlueZ refuses every headset with
+  `br-connection-profile-unavailable`. The session starts `pipewire` + `wireplumber` when they are
+  installed, the panel shows *Audio profile: a2dp-sink / missing*, and `gba-selftest` names what is
+  missing. A headset that is still linked to its phone cannot be connected from here — disconnect
+  it there first.
 - **Settings:** `DATA/config/settings.json` is the single store (scaling, theme, clock, view mode,
   volume, USB behaviour, launch confirmation). `keybindings.json` and `history.json` live beside it;
   a legacy `display.json` is migrated automatically on first run.
@@ -381,7 +392,7 @@ is duplicated.
 ## 🧪 Testing & Development
 
 ```bash
-make test       # 412 tests (headless, no display needed)
+make test       # 654 tests (headless, no display needed)
 make lint       # byte-compile Python + syntax-check every shell script
 make selftest   # check *this* machine: interpreter, fonts, pty, display, mGBA, storage, config
 make iso-check  # what is missing to build a bootable ISO here
