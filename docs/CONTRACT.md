@@ -392,6 +392,10 @@ somebody else wrote. They are held to the rules of that program, not to the rule
   exactly there - is found without the user editing anything.
 - **TERM6** [REVIEW] A program that sets a window title (`OSC 0` / `OSC 2`) MUST be able to name
   itself in the terminal header.
+- **TERM7** [TEST: T-TERM-2b] While no program is listening for mouse reports, the terminal MUST
+  let the user select text with the pointer, copy it (`Ctrl+Shift+C`) and paste the clipboard into
+  the program (`Ctrl+Shift+V`, bracketed when the program asked for bracketed paste). `Ctrl+C`
+  MUST still reach the program, because it interrupts it.
 
 ### Browser
 
@@ -653,6 +657,7 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 | T-TERM-1 | Run a full-screen program in the terminal tab - a stand-in for the Antigravity CLI: alternate screen, truecolor, window title, mouse reporting, cursor-position query. | The program paints its own screen, the title appears in the terminal header, the question is answered, and the answer reaches the program. | TERM1, TERM2 |
 | T-TERM-2 | Click, drag and turn the wheel in the terminal tab, once with a program that asked for mouse reports and once without. | With a listener: an xterm-compatible report arrives in the program's input in cell coordinates. Without: nothing is written to the program and the wheel scrolls the terminal's own history. | TERM3, TERM4 |
 | T-TERM-3 | Install a command-line tool into `~/.local/bin`, open the terminal tab, run it. | The command is found and runs; the shell is a login shell. | TERM5 |
+| T-TERM-2b | Drag over the text in the terminal tab, copy it with `Ctrl+Shift+C`, paste it back with `Ctrl+Shift+V`; press `Ctrl+C` in a running command. | The selected text is copied, the paste reaches the program (bracketed when the program asked for it), and `Ctrl+C` interrupts the program instead of copying. | TERM7 |
 | T-WEB-1 | Start the "Web Browser" app with NetSurf or Dillo installed, then with neither installed. | With: a browser window opens on the requested page in the session display, its profile is under `DATA/config/handlers/web-adapter`, and closing the window returns to the shell. Without: the app names the package to install and the built-in text reader still works. | WEB1, WEB2, WEB3, WEB4 |
 
 ### Saves

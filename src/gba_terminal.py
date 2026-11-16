@@ -1059,6 +1059,9 @@ class TerminalView:
         self.theme = theme
         self.size_units = size_units
         self.scroll_offset = 0
+        # The text the user selected with the mouse, as a rectangle of cells:
+        # (first column, first row, last column, last row).
+        self.selection: Optional[Tuple[int, int, int, int]] = None
         # Shown only while the shell has not printed anything yet, so opening
         # the tab never looks like a broken black rectangle.
         self.placeholder = placeholder
@@ -1098,6 +1101,51 @@ class TerminalView:
         combined.extend(self.screen.lines())
         return combined
 
+    def row_offset(self) -> int:
+        """The index of the first visible row in the combined list.
+
+        The selection is counted in visible rows, so it stays where the user
+        put it while the history is scrolled back.
+        """
+        history = len(self.screen.scrollback)
+        offset = max(0, min(history, self.scroll_offset))
+        return history - offset
+
+    def _selection_columns(self, row_index: int) -> Optional[Tuple[int, int]]:
+        """The columns of the selection on one visible row."""
+        selection = self.selection
+        if selection is None:
+            return None
+        first_col, first_row, last_col, last_row = selection
+        if row_index < first_row or row_index > last_row:
+            return None
+        if first_row == last_row:
+            return first_col, last_col
+        if row_index == first_row:
+            return first_col, 10 ** 6
+        if row_index == last_row:
+            return 0, last_col
+        return 0, 10 ** 6
+
+    def selected_text(self) -> str:
+        """The text the user selected, as it is on the screen."""
+        selection = self.selection
+        if selection is None:
+            return ""
+        first_col, first_row, last_col, last_row = selection
+        rows = self.visible_rows()
+        if first_row < 0 or last_row >= len(rows) or first_row > last_row:
+            return ""
+        pieces = []
+        for index in range(first_row, last_row + 1):
+            row = rows[index]
+            start = first_col if index == first_row else 0
+            end = last_col if index == last_row else len(row) - 1
+            start = max(0, min(start, len(row) - 1))
+            end = max(start, min(end, len(row) - 1))
+            pieces.append("".join(cell.char for cell in row[start:end + 1]).rstrip())
+        return "\n".join(pieces).strip("\n")
+
     def draw(self, surface, rect: pygame.Rect, focused: bool = True,
              cursor_on: bool = True) -> None:
         theme = self.theme
@@ -1123,6 +1171,7 @@ class TerminalView:
             y = origin_y + row_index * ch
             if y + ch > rect.bottom:
                 break
+            selection = self._selection_columns(row_index)
             run_text = ""
             run_color: Optional[Color] = None
             run_bg: Optional[Color] = None
@@ -1146,7 +1195,7 @@ class TerminalView:
                 run_x += width
                 run_text = ""
 
-            for cell in row:
+            for column, cell in enumerate(row):
                 color = cell.fg if cell.fg is not None else DEFAULT_COLOR
                 background = cell.bg
                 bold = bool(cell.attrs & ATTR_BOLD)
@@ -1154,6 +1203,8 @@ class TerminalView:
                 if cell.attrs & ATTR_REVERSE:
                     color = background if background is not None else c.screen
                     background = cell.fg if cell.fg is not None else c.text
+                if selection is not None and selection[0] <= column <= selection[1]:
+                    background = theme.mix(background or c.screen, c.highlight, 0.45)
                 if run_color is None:
                     run_color, run_bg, run_bold, run_underline = \
                         color, background, bold, underline

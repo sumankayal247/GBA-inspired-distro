@@ -161,6 +161,65 @@ class TestTerminalMouse(MouseTestCase):
         self.assertIn(b"32", self.written[0])
 
 
+class TestTerminalSelection(MouseTestCase):
+    """Without a program listening, the pointer selects the text."""
+
+    def setUp(self):
+        super().setUp()
+        self.launcher = self.make_launcher()
+        self.launcher.goto_tab(gba_launcher.TAB_TERMINAL)
+        self.launcher.ensure_terminal()
+        self.written = []
+        self.launcher.terminal_session.write = self.written.append
+        self.launcher.terminal_screen.feed(b"hello world\r\nsecond line\r\n")
+
+    def cell_point(self, col=1, row=1):
+        body = self.launcher._terminal_body_rect()
+        view = self.launcher.terminal_view
+        cw, ch, _cols, _rows = view.metrics(body)
+        origin_x, origin_y = view.origin(body)
+        return (origin_x + cw * col + 1, origin_y + ch * row + 1)
+
+    def test_a_drag_selects_the_text_under_the_pointer(self):
+        self.launcher._terminal_mouse_event(
+            pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=self.cell_point(0, 0)))
+        self.launcher._terminal_mouse_event(
+            pygame.event.Event(pygame.MOUSEMOTION, pos=self.cell_point(5, 0),
+                               rel=(1, 0), buttons=(1, 0, 0)))
+        view = self.launcher.terminal_view
+        self.assertIsNotNone(view.selection)
+        self.assertIn("hello", view.selected_text())
+
+    def test_the_selection_is_not_given_to_the_program(self):
+        self.launcher._terminal_mouse_event(
+            pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=self.cell_point(0, 0)))
+        self.launcher._terminal_mouse_event(
+            pygame.event.Event(pygame.MOUSEMOTION, pos=self.cell_point(5, 0),
+                               rel=(1, 0), buttons=(1, 0, 0)))
+        self.assertEqual(self.written, [])
+
+    def test_a_program_that_asked_for_the_mouse_keeps_it(self):
+        self.launcher.terminal_screen.feed(b"\x1b[?1000h\x1b[?1006h")
+        self.launcher._terminal_mouse_event(
+            pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=self.cell_point(0, 0)))
+        self.launcher._terminal_mouse_event(
+            pygame.event.Event(pygame.MOUSEMOTION, pos=self.cell_point(5, 0),
+                               rel=(1, 0), buttons=(1, 0, 0)))
+        self.assertTrue(self.written)
+        self.assertIsNone(self.launcher.terminal_view.selection)
+
+    def test_copy_puts_the_selection_on_the_clipboard(self):
+        copied = {}
+        self.launcher._copy_to_clipboard = lambda text: copied.setdefault("text", text) or True
+        self.launcher._terminal_mouse_event(
+            pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=self.cell_point(0, 0)))
+        self.launcher._terminal_mouse_event(
+            pygame.event.Event(pygame.MOUSEMOTION, pos=self.cell_point(5, 0),
+                               rel=(1, 0), buttons=(1, 0, 0)))
+        self.launcher._terminal_copy_selection()
+        self.assertIn("hello", copied.get("text", ""))
+
+
 class TestBrowserMouse(MouseTestCase):
     def setUp(self):
         super().setUp()

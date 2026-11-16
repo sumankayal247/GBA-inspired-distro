@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Contract](https://img.shields.io/badge/Contract-Draft%202%20(V1)-purple.svg)](docs/CONTRACT.md)
-[![Tests](https://img.shields.io/badge/Tests-755%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/Tests-759%20passing-brightgreen.svg)](tests)
 [![Safe by default](https://img.shields.io/badge/install-safe%20by%20default-blue.svg)](docs/SAFETY.md)
 
 **GBA OS** is an appliance-style Linux operating system experience designed to turn any PC or laptop into a dedicated Game Boy Advance console.
@@ -245,7 +245,10 @@ The mouse is a first-class input in the two tabs that can use it:
   xterm-compatible reports, exactly as a real terminal sends them: `?1000` for clicks, `?1002` for
   drags, `?1003` for motion, and the SGR encoding (`?1006`) when the program prefers it. A program
   that does *not* ask gets nothing — then the wheel scrolls the terminal's own history instead,
-  and a click does not turn into stray escape sequences.
+  a drag selects the text under the pointer, and a click does not turn into stray escape
+  sequences. `Ctrl+Shift+C` copies the selection, `Ctrl+Shift+V` pastes the clipboard into the
+  program (bracketed, when the program asked for bracketed paste). `Ctrl+C` still belongs to the
+  program: it interrupts it.
 - **Games and the full browser** — the emulated GBA screen is a gamepad screen; the browser app
   hands the display to NetSurf or Dillo, which is a normal X window with a normal pointer.
 
@@ -440,7 +443,7 @@ is duplicated.
 ## 🧪 Testing & Development
 
 ```bash
-make test       # 755 tests (headless, no display needed)
+make test       # 759 tests (headless, no display needed)
 make lint       # byte-compile Python + syntax-check every shell script
 make selftest   # check *this* machine: interpreter, fonts, pty, display, mGBA, storage, config
 make iso-check  # what is missing to build a bootable ISO here

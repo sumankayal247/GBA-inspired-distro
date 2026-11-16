@@ -2449,6 +2449,8 @@ class GBALauncher:
         self._terminal_grid = (0, 0)
         self._terminal_button_down = False
         self._terminal_button = MOUSE_LEFT
+        # Where the drag started, in (column, visible row).
+        self._terminal_selection_anchor: Optional[Tuple[int, int]] = None
         self.browser: Optional[Browser] = None
         self._browser_loaded = False
         self._terminal_demo_loaded = False
@@ -2980,6 +2982,11 @@ class GBALauncher:
         data = self.terminal_session.drain()
         if data:
             self.terminal_screen.feed(data)
+            # The text moved: a selection made a moment ago now points at
+            # something else.
+            if self.terminal_view is not None:
+                self.terminal_view.selection = None
+                self._terminal_selection_anchor = None
         # The terminal owes the program answers (cursor position report,
         # device attributes). A program that asks and gets nothing waits.
         while self.terminal_screen.responses:
@@ -3352,7 +3359,21 @@ class GBALauncher:
     def _terminal_event(self, event) -> None:
         self.ensure_terminal()
         if event.type == pygame.KEYDOWN:
+            mod = getattr(event, "mod", 0)
+            shift = bool(mod & pygame.KMOD_SHIFT)
+            ctrl = bool(mod & pygame.KMOD_CTRL)
+            # Ctrl+C belongs to the program (it interrupts it), so copying
+            # and pasting use Ctrl+Shift, the way a real terminal does.
+            if ctrl and shift and event.key == pygame.K_c:
+                self._terminal_copy_selection()
+                return
+            if ctrl and shift and event.key == pygame.K_v:
+                self._terminal_paste()
+                return
             self.terminal_session.write(key_to_bytes(event))
+            if self.terminal_view is not None:
+                self.terminal_view.selection = None
+                self._terminal_selection_anchor = None
         elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
                             pygame.MOUSEMOTION, pygame.MOUSEWHEEL):
             self._terminal_mouse_event(event)
@@ -3375,7 +3396,8 @@ class GBALauncher:
         gets xterm-compatible reports, so a full-screen TUI can be driven
         with the pointer. A program that did not ask gets nothing - the
         wheel then scrolls the scrollback instead, which is what a terminal
-        without mouse reporting is expected to do.
+        without mouse reporting is expected to do, and a drag selects the text
+        under the pointer.
         """
         screen = self.terminal_screen
         session = self.terminal_session
@@ -3384,12 +3406,13 @@ class GBALauncher:
         view = self.terminal_view
         if view is None:
             return
+        tracking = screen.mouse_tracking()
 
         if event.type == pygame.MOUSEWHEEL:
             # In pygame a positive y means "wheel up", which in a terminal
             # means "go back into the history".
             up = event.y > 0
-            if screen.mouse_tracking():
+            if tracking:
                 col, row = self._terminal_cell(event.pos)
                 if col is None:
                     return
@@ -3401,13 +3424,17 @@ class GBALauncher:
             return
 
         if event.type == pygame.MOUSEMOTION:
-            if not screen.mouse_motion(self._terminal_button_down):
+            if tracking:
+                if not screen.mouse_motion(self._terminal_button_down):
+                    return
+                col, row = self._terminal_cell(event.pos)
+                if col is None:
+                    return
+                session.write(screen.encode_mouse(self._terminal_button, col + 1, row + 1,
+                                                  "move"))
                 return
-            col, row = self._terminal_cell(event.pos)
-            if col is None:
-                return
-            session.write(screen.encode_mouse(self._terminal_button, col + 1, row + 1,
-                                              "move"))
+            if self._terminal_button_down:
+                self._terminal_select_to(event.pos)
             return
 
         if event.type == pygame.MOUSEBUTTONDOWN:
@@ -3417,13 +3444,84 @@ class GBALauncher:
         else:  # MOUSEBUTTONUP
             self._terminal_button_down = False
 
-        if not screen.mouse_tracking():
+        if not tracking:
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                self._terminal_select_to(event.pos, start=True)
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self._terminal_button_down = False
             return
         col, row = self._terminal_cell(event.pos)
         if col is None:
             return
         action = "press" if event.type == pygame.MOUSEBUTTONDOWN else "release"
         session.write(screen.encode_mouse(self._terminal_button, col + 1, row + 1, action))
+
+    def _terminal_select_to(self, pos, start: bool = False) -> None:
+        """Selects the text under the pointer.
+
+        Only the shell does this. A program that asked for the mouse owns the
+        pointer, and the shell keeps its hands off it.
+        """
+        view = self.terminal_view
+        if view is None:
+            return
+        cell = self._terminal_cell(pos)
+        if cell is None:
+            if start:
+                view.selection = None
+            return
+        col, row = cell
+        visible_row = view.row_offset() + row
+        if start:
+            self._terminal_selection_anchor = (col, visible_row)
+            view.selection = (col, visible_row, col, visible_row)
+            return
+        anchor = self._terminal_selection_anchor
+        if anchor is None:
+            return
+        first_col, first_row = anchor
+        view.selection = (min(first_col, col), min(first_row, visible_row),
+                          max(first_col, col), max(first_row, visible_row))
+
+    def _terminal_copy_selection(self) -> None:
+        """Copies the selected text to the system clipboard."""
+        view = self.terminal_view
+        if view is None:
+            return
+        text = view.selected_text()
+        if not text:
+            self.toast("Nothing selected", TOAST_INFO)
+            return
+        copied = self._copy_to_clipboard(text)
+        self.toast(f"Copied {len(text)} characters" if copied
+                   else "Clipboard is not available", TOAST_OK if copied else TOAST_WARN)
+
+    def _terminal_paste(self) -> None:
+        """Pastes the clipboard into the program."""
+        session = self.terminal_session
+        if session is None:
+            return
+        text = self._read_clipboard()
+        if not text:
+            self.toast("The clipboard is empty", TOAST_INFO)
+            return
+        if self.terminal_screen.bracketed_paste:
+            session.write(b"\x1b[200~" + text.encode("utf-8") + b"\x1b[201~")
+        else:
+            session.write(text.encode("utf-8"))
+
+    @staticmethod
+    def _read_clipboard() -> str:
+        """Reads text from the system clipboard, if this platform has one."""
+        try:
+            if not pygame.scrap.get_init():
+                pygame.scrap.init()
+            data = pygame.scrap.get(pygame.SCRAP_TEXT)
+            if isinstance(data, bytes):
+                return data.decode("utf-8", "replace")
+            return str(data or "")
+        except Exception:
+            return ""
 
     def _terminal_cell(self, pos) -> Optional[Tuple[int, int]]:
         view = self.terminal_view
@@ -4582,7 +4680,8 @@ class GBALauncher:
         if tab == TAB_TERMINAL:
             return [("Ctrl+Alt+T", "back to games", c.highlight),
                     ("Alt+Tab", "switch tab", c.info),
-                    ("mouse", "for full-screen programs", c.text_dim),
+                    ("mouse", "select · full-screen programs", c.text_dim),
+                    ("Ctrl+Shift+C", "copy", c.text_dim),
                     ("Ctrl+C", "interrupt", c.text_dim)]
         if tab == TAB_BROWSER:
             return [("Ctrl+L", "address", c.info),

@@ -6,7 +6,7 @@ contract version where applicable.
 
 ## [Unreleased] — The terminal could not run a full-screen program, and the mouse only scrolled
 
-Suite: **755 passing, 1 skipped** (`make test`).
+Suite: **759 passing, 1 skipped** (`make test`).
 
 ### Fixed
 
@@ -29,6 +29,12 @@ Suite: **755 passing, 1 skipped** (`make test`).
 - **The pointer did nothing in the browser.** A click now follows the link under it, the link
   under the pointer is highlighted, dragging selects text and `Ctrl+C` copies it to the
   clipboard. Clicking the address bar starts editing it.
+- **The mouse wheel did nothing in the browser.** The tab handled the wheel as the old button
+  4/5 events, which SDL2 does not send any more; it now reads the modern wheel event.
+- **The terminal had no text selection.** Dragging over the terminal now selects the text under
+  the pointer, `Ctrl+Shift+C` copies it and `Ctrl+Shift+V` pastes the clipboard into the program
+  — bracketed, when the program asked for bracketed paste. `Ctrl+C` still reaches the program,
+  because it interrupts it.
 
 ### Added
 
