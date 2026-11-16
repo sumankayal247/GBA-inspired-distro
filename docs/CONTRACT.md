@@ -377,8 +377,9 @@ somebody else wrote. They are held to the rules of that program, not to the rule
   cursor save and restore, tab stops, insert mode, autowrap, cursor style and visibility, and
   bracketed paste (`?2004`). An unknown sequence MUST be dropped, never printed.
 - **TERM2** [TEST: T-TERM-1] A program that asks MUST be answered: the cursor-position report
-  (`CSI 6n`), the device-status report and the kitty-keyboard query. A program that asks and
-  waits is a program that hangs.
+  (`CSI 6n`), the device-status report, the kitty-keyboard query, the background-colour query
+  (`OSC 10`/`OSC 11`) and the window-size reports (`CSI 14t`, `18t`, `19t`). A program that asks
+  and waits is a program that hangs.
 - **TERM3** [TEST: T-TERM-2] The terminal MUST forward mouse events to the program **only** when
   the program asked for them (`?1000`, `?1002`, `?1003`), in cell coordinates, in the encoding the
   program asked for (SGR `?1006`, urxvt `?1015`, otherwise X10). A program that did not ask MUST

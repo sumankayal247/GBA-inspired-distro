@@ -1038,6 +1038,12 @@ over the screen with the *alternate screen*, paints in truecolor, asks where the
 printed as literal escape sequences, so the program drew over itself and then hung waiting for
 an answer.
 
+`agy` is written in Go on charmbracelet's Bubble Tea v2 with the Ultraviolet renderer, so its
+requirements are known exactly: alternate screen, truecolor, cursor addressing, erase, mouse
+tracking, bracketed paste, and — before it paints — the queries for the background colour
+(`OSC 11`) and the window size (`CSI 14t`/`18t`/`19t`). A terminal that ignores the queries
+makes such a program wait, and a program that waits draws nothing.
+
 The mouse had a second problem: in the terminal tab a click wrote `^L` (clear screen) into the
 program's input, whatever the program was. In the browser tab the pointer only scrolled; a link
 in the middle of a sentence was not a link at all, because the layout flattened a paragraph into

@@ -55,6 +55,11 @@ DEFAULT_FG = 7
 DEFAULT_BG = 0
 DEFAULT_COLOR: Color = ANSI_COLORS[DEFAULT_FG]
 DEFAULT_BACKGROUND: Color = ANSI_COLORS[DEFAULT_BG]
+# The colours of the glass the terminal is drawn on. A program that asks
+# "what colour is your background?" (OSC 11) gets these, so it can pick a
+# palette that fits.
+GLASS_FOREGROUND: Color = (246, 244, 255)
+GLASS_BACKGROUND: Color = (12, 10, 24)
 
 # Cell attributes (a bit set, so a cell stays cheap to copy).
 ATTR_BOLD = 1 << 0
@@ -304,6 +309,10 @@ class TerminalScreen:
         self._decoder = b""
         self.reset()
         self.scrollback: List[List[Cell]] = []
+        # The size of one character cell in pixels. The shell keeps it up to
+        # date; a program that asks how big the text area is (CSI 14t) gets
+        # an answer in real pixels.
+        self.cell_size = (8, 16)
         # Replies the terminal owes the program (cursor position report, device
         # attributes). The session drains them and writes them back.
         self.responses: List[bytes] = []
@@ -477,6 +486,19 @@ class TerminalScreen:
             # OSC 52: the program puts text on the clipboard. The shell owns
             # the real clipboard, so the text is kept here and handed over.
             self._read_clipboard(payload.split(";", 2)[-1])
+            return
+        if payload in ("10;", "11;") or payload.startswith(("10;?", "11;?")):
+            # OSC 10/11: "what colour is your background?" A modern TUI asks
+            # this to pick a readable palette - and waits for the answer.
+            self._report_color(payload.startswith("10"))
+            return
+
+    def _report_color(self, foreground: bool) -> None:
+        """Answers the OSC 10/11 colour query."""
+        red, green, blue = GLASS_FOREGROUND if foreground else GLASS_BACKGROUND
+        color = f"rgb:{red:04x}/{green:04x}/{blue:04x}"
+        number = 10 if foreground else 11
+        self.responses.append(f"\x1b]{number};{color}\x1b\\".encode("ascii"))
 
     def _read_clipboard(self, blob: str) -> None:
         import base64
@@ -767,7 +789,28 @@ class TerminalScreen:
         elif final == "p" and private:
             pass
         elif final == "t" and not private:
-            pass
+            self._report_size(arg0(0, 0))
+
+    def _report_size(self, request: int) -> None:
+        """Answers the window-size reports (`CSI 14t`, `18t`, `19t`).
+
+        A program that asks how big the window is wants the answer; a
+        program that waits for it never draws anything.
+        """
+        if request == 14:
+            # The size of the text area, in pixels.
+            cell_width, cell_height = self.cell_size
+            width = self.cols * max(1, cell_width)
+            height = self.rows * max(1, cell_height)
+            self.responses.append(f"\x1b[4;{height};{width}t".encode("ascii"))
+        elif request == 18:
+            # The size of the window, in characters.
+            self.responses.append(
+                f"\x1b[8;{self.rows};{self.cols}t".encode("ascii"))
+        elif request == 19:
+            # The size of the screen, in characters.
+            self.responses.append(
+                f"\x1b[9;{self.rows};{self.cols}t".encode("ascii"))
 
     def _goto(self, row: int, col: int) -> None:
         if self.origin_mode:

@@ -155,6 +155,30 @@ class TestScreenFeatures(unittest.TestCase):
         self.screen.feed(b"\x1b[1;2H\x1b[2X")
         self.assertTrue(self.screen.text().startswith("a  def"))
 
+    def test_the_background_colour_query_is_answered(self):
+        # A modern TUI asks what colour the background is before it picks a
+        # palette, and waits for the answer.
+        self.screen.feed(b"\x1b]11;?\x1b\\")
+        self.assertTrue(self.screen.responses)
+        answer = self.screen.responses[0].decode("ascii")
+        self.assertTrue(answer.startswith("\x1b]11;rgb:"))
+        self.assertTrue(answer.endswith("\x1b\\"))
+
+    def test_the_foreground_colour_query_is_answered(self):
+        self.screen.feed(b"\x1b]10;?\x07")
+        self.assertTrue(self.screen.responses[0].decode("ascii").startswith("\x1b]10;"))
+
+    def test_the_window_size_is_reported_in_characters(self):
+        self.screen.feed(b"\x1b[18t")
+        self.assertEqual(self.screen.responses[0], b"\x1b[8;6;20t")
+        self.screen.feed(b"\x1b[19t")
+        self.assertEqual(self.screen.responses[1], b"\x1b[9;6;20t")
+
+    def test_the_text_area_is_reported_in_pixels(self):
+        self.screen.cell_size = (10, 20)
+        self.screen.feed(b"\x1b[14t")
+        self.assertEqual(self.screen.responses[0], b"\x1b[4;120;200t")
+
     def test_erase_to_the_end_of_the_screen_clears_the_rows_below(self):
         self.screen.feed(b"one\r\ntwo\r\nthree")
         self.screen.feed(b"\x1b[2;2H\x1b[J")
@@ -304,7 +328,8 @@ class TestMouseOverTheWire(unittest.TestCase):
             while time.time() < deadline:
                 session.drain()
                 if os.path.exists(marker):
-                    received = open(marker, encoding="utf-8").read()
+                    with open(marker, encoding="utf-8") as handle:
+                        received = handle.read()
                     if received:
                         break
                 time.sleep(0.05)

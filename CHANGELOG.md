@@ -6,7 +6,7 @@ contract version where applicable.
 
 ## [Unreleased] — The terminal could not run a full-screen program, and the mouse only scrolled
 
-Suite: **750 passing, 1 skipped** (`make test`).
+Suite: **754 passing, 1 skipped** (`make test`).
 
 ### Fixed
 
@@ -19,7 +19,9 @@ Suite: **750 passing, 1 skipped** (`make test`).
   **bracketed paste** (`?2004`).
 - **A program that asked a question got no answer.** The cursor-position report (`CSI 6n`), the
   device-attributes query (`CSI c`) and the kitty-keyboard query are now answered, because a
-  program that asks and waits is a program that hangs.
+  program that asks and waits is a program that hangs. The two questions a modern TUI asks
+  before it paints — *what colour is your background?* (`OSC 10`/`OSC 11`) and *how big is the
+  window?* (`CSI 14t`, `18t`, `19t`) — are answered too.
 - **A link in the middle of a sentence was not a link.** The text browser flattened a paragraph
   into one run, so a link inside it lost its address and could only be reached with `Tab`. Every
   span now carries its own link, and the link that is *last* in a paragraph is no longer dropped

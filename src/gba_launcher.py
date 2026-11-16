@@ -4836,6 +4836,9 @@ class GBALauncher:
                                                     "starting shell…")
         cols, rows, _, _ = 0, 0, 0, 0
         cw, ch, cols, rows = view.metrics(body)
+        # A program that asks how big the text area is (CSI 14t) gets the real
+        # size of a character cell.
+        self.terminal_screen.cell_size = (cw, ch)
         if (cols, rows) != self._terminal_grid:
             self._terminal_grid = (cols, rows)
             if self.terminal_session:
