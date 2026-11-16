@@ -1102,14 +1102,13 @@ class TerminalView:
         return combined
 
     def row_offset(self) -> int:
-        """The index of the first visible row in the combined list.
+        """The index of the screen's first row in the visible list.
 
         The selection is counted in visible rows, so it stays where the user
         put it while the history is scrolled back.
         """
         history = len(self.screen.scrollback)
-        offset = max(0, min(history, self.scroll_offset))
-        return history - offset
+        return max(0, min(history, self.scroll_offset))
 
     def _selection_columns(self, row_index: int) -> Optional[Tuple[int, int]]:
         """The columns of the selection on one visible row."""

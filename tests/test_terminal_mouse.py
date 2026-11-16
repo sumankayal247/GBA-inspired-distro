@@ -284,6 +284,15 @@ class TestTerminalView(unittest.TestCase):
         rows = self.view.visible_rows()
         self.assertTrue(any("line16" in "".join(c.char for c in row) for row in rows))
 
+    def test_the_selection_follows_the_rows_that_are_visible(self):
+        for index in range(20):
+            self.screen.feed(f"line{index}\r\n".encode())
+        # The screen's own first row sits below the scrolled-back history.
+        self.view.scroll_offset = 3
+        self.assertEqual(self.view.row_offset(), 3)
+        self.view.selection = (0, 3, 4, 3)
+        self.assertIn("line", self.view.selected_text())
+
     def test_drawing_does_not_raise(self):
         surface = pygame.Surface((800, 400))
         self.screen.feed(b"\x1b[31mred\x1b[0m \x1b[48;2;10;20;30m bg")
