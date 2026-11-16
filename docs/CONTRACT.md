@@ -163,7 +163,10 @@ GAMES   (optional)   user-visible content, readable from other operating systems
 ## 4. Library Entry Contract
 
 - **L1** [REVIEW] An entry MUST have: `id`, `title`, `type` (`game`, `app` or `settings`),
-  `handler`, and handler arguments. Game entries additionally refer to a content path.
+  `handler`, and handler arguments. Game entries additionally refer to a content path. The `title`
+  of a game entry MUST be the name of its file (without the extension), not the cartridge header:
+  a header is a property of the *base game*, so hundreds of ROM hacks built on the same base
+  would otherwise all carry the same name and become impossible to tell apart.
 - **L2** [TEST: T-LIBRARY-1] The `id` of a game entry MUST be derived from the content (a
   cryptographic hash of the content file), not from its name or location, so renaming a file does
   not orphan its saves.
@@ -177,14 +180,17 @@ GAMES   (optional)   user-visible content, readable from other operating systems
 - **L7** [TEST: T-MANIFEST-1] Application manifests MUST declare `contract = <integer>`. A
   component MUST reject or ignore a manifest whose contract it does not support, and MUST NOT
   crash.
-- **L8** [TEST: T-MANIFEST-1] A manifest MUST declare what an application needs. Absent
-  declarations default to the most restrictive value:
+- **L8** [TEST: T-MANIFEST-1] A manifest MUST declare what an application needs. Absent  declarations default to the most restrictive value:
 
   | Need | Default |
   |---|---|
   | `network` | `false` |
   | `input` | gamepad only |
   | `display` | direct (no compositor) |
+- **L9** [TEST: T-LIBRARY-6] The user MUST be able to rename a game. A rename MUST change the
+  name of the ROM file, MUST NOT change the entry `id` (L2), MUST NOT overwrite an existing file,
+  MUST NOT move the file out of the games folder, and MUST leave the saves, cheats, save states and
+  the favourite flag of that game in place.
 
 ---
 
@@ -552,6 +558,8 @@ facts that select an implementation. Their results are recorded in `DECISIONS.md
 | ID | Procedure | Pass criteria | Verifies |
 |---|---|---|---|
 | T-LIBRARY-1 | Add game A without any manual step; record its entry ID; rename the file; rescan. | Entry appears automatically; ID and save directory unchanged after the rename. | L2, L3 |
+| T-LIBRARY-2 | Put three ROMs with the *same* cartridge header title into GAMES under three different file names. | The three entries carry three different titles - the file names. | L1 |
+| T-LIBRARY-6 | Rename a game from the shelf; then rename it to the name of another game, and to a name containing `/`. | The file is renamed and the shelf shows the new name; the entry ID, the saves, the cheats and the favourite flag are unchanged; the second rename is refused with a reason and no file is overwritten; the third is refused and no file is written outside the games folder. | L2, L9 |
 | T-LIBRARY-3 | Plug in a stick with 10 ROMs, decline the prompt, re-plug, accept; import twice. | Nothing copied before confirmation; 10 files appear inside GAMES; the second import copies nothing; no partial files remain. | ST7 |
 | T-LIBRARY-4 | Unlock an Android phone in File Transfer/MTP mode containing the same 10 ROMs plus two new ones; accept the prompt, then re-import. | The phone appears as one or more MTP storages, not a removable disk; only two new files are offered/copied; normal USB detection still works; no partial files remain. | ST8, ST8a |
 | T-LIBRARY-5 | Plug in a locked phone; wait for the mount attempt; unlock it while the import screen is open; press `R`. Then repeat on a phone whose storage reports 0-byte sizes. | The first attempt reports "unlock the phone" instead of failing silently; the unlock produces the prompt in the same session; the 0-byte storage is still scanned and imported; `gba-selftest --mtp` names the failing stage. | ST8a |

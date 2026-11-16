@@ -4,6 +4,35 @@ All notable changes to GBA OS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions align with the
 contract version where applicable.
 
+## [Unreleased] — The shelf shows the file name, not the cartridge header, and a game can be renamed
+
+Suite: **673 passing, 1 skipped** (`make test`).
+
+### Changed
+
+- **The title on the cartridge is now the name of the file.** The library read its titles from the
+  cartridge header, and a header is a property of the *base game*: hundreds of ROM hacks are built
+  on the same base and ship the same header title (`POKEMON EMER` is a popular one), so the shelf
+  showed the same name over and over and the games could not be told apart. The file name is what
+  the user named them with and what tells them apart. Decorations are kept — `(USA)`, `(Rev 1)`,
+  `[b]` are exactly what distinguishes two dumps of the same game — and the header title is still
+  read for the boot log (`[load] ROM: ... title=...`).
+- **A library cached before this change is fixed in place.** The old cache stored the header title
+  and would have kept showing it forever; the cached record now states where its title came from,
+  and an outdated record is refreshed from the file name — without re-hashing the ROM, so the
+  content id (and with it every save, cheat and favourite) is untouched.
+
+### Added
+
+- **A game can be renamed.** `Ctrl+R` on the selected cartridge, or **SETTINGS → Game Management →
+  Rename a Game** and then `R` on the game in the list, opens a rename dialog. The rename renames
+  the *file*, and the new name becomes the title on the shelf. Because the content id is derived
+  from the content (Rule L2), the game's saves, cheats, save states and favourite flag all survive
+  the rename untouched. The rules are deliberately narrow: the file stays in the folder it was in,
+  an existing file is never overwritten, a name containing `/` or `\` is refused instead of being
+  silently rewritten, and the name is never a path. The dialog behaves like a selected text field:
+  the current name is pre-filled, the first character typed replaces it.
+
 ## [Unreleased] — Bluetooth headsets: the raw BlueZ error was shown instead of a fix, and the appliance had no sound server to connect them with
 
 Suite: **654 passing, 1 skipped** (`make test`).

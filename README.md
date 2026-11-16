@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Contract](https://img.shields.io/badge/Contract-Draft%202%20(V1)-purple.svg)](docs/CONTRACT.md)
-[![Tests](https://img.shields.io/badge/Tests-654%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/Tests-673%20passing-brightgreen.svg)](tests)
 [![Safe by default](https://img.shields.io/badge/install-safe%20by%20default-blue.svg)](docs/SAFETY.md)
 
 **GBA OS** is an appliance-style Linux operating system experience designed to turn any PC or laptop into a dedicated Game Boy Advance console.
@@ -216,6 +216,7 @@ The installer:
 In a game the shipped keyboard profile is straight GBA: `Z` = **A**, `X` = **B**, arrows = D-pad,
 `A` / `S` = **L** / **R**, `Enter` = **START**, `Backspace` = **SELECT**.
 | **Search library** | — | just start typing (`Backspace` edits, `Esc` clears) |
+| **Rename a game** | — | `Ctrl+R` (or `R` in SETTINGS → Game Management) |
 | **Toggle cartridge/list view** | — | `Ctrl+V` |
 | **Help / screenshot** | — | `F1` / `F12` (saved to `DATA/screenshots/`) |
 | **Emergency Recovery** | — | boot failure, or **SETTINGS → System → Reboot** after a crash |
@@ -345,9 +346,18 @@ is duplicated.
 ## 📂 Managing ROMs, Saves & Settings
 
 - **Games Directory:** `/games/` (sub-folders are allowed)
-  Place any `.gba`, `.gbc` or `.gb` file here. Titles are read from the cartridge header, falling
-  back to a cleaned-up filename (`Pokemon Emerald (USA).gba` → `Pokemon Emerald`).
+  Place any `.gba`, `.gbc` or `.gb` file here. **The title on the cartridge is the file name**
+  (`Pokemon Emerald (USA).gba` → *Pokemon Emerald (USA)*), deliberately *not* the cartridge header:
+  hundreds of ROM hacks ship the same header title (`POKEMON EMER` is a popular base), so a shelf
+  built from headers shows the same name over and over. Decorations such as `(USA)` or `[b]` are
+  kept, because they are what tells two dumps of the same game apart.
   The library rescans automatically; use **SETTINGS → Library → Rescan library** after copying files over.
+- **Renaming a game:** press **Ctrl+R** on the selected cartridge, or **SETTINGS → Game Management →
+  Rename a Game** (then `R` on the game in the list). The dialog renames the *file*, and the new
+  name becomes the title. Saves, cheats, save states and the favourite flag stay with the game —
+  they are keyed by content hash, not by name. An existing file is never overwritten, a name that
+  contains `/` is refused, and the file stays in the folder it was in. Renaming needs the keyboard
+  (like the search field).
 - **Saves Directory:** `/data/saves/<entry-id>/`
   Save batteries (`.sav`) and savestates live here, keyed by content hash, so renaming a ROM never
   orphans its save. **Apps → Save Manager** shows sizes and can delete a save after confirmation.
@@ -392,7 +402,7 @@ is duplicated.
 ## 🧪 Testing & Development
 
 ```bash
-make test       # 654 tests (headless, no display needed)
+make test       # 673 tests (headless, no display needed)
 make lint       # byte-compile Python + syntax-check every shell script
 make selftest   # check *this* machine: interpreter, fonts, pty, display, mGBA, storage, config
 make iso-check  # what is missing to build a bootable ISO here
@@ -400,6 +410,7 @@ make help       # list every target
 ```
 
 The suite covers the numbered contract rules directly — library identity and caching (L2, L3, L4, L6),
+the file-name title and the rename action (L1, L9),
 handler environment isolation (H1), outcome classification (H10), crash-loop handling (S6, S7), orphan
 cleanup (S8), save durability and restoration (SV2–SV4), log rotation (ST5), input-profile validation
 (I3), ROM import safety (ST7, ST8), the settings store and theme system, the ANSI terminal emulator, the

@@ -19,8 +19,8 @@ import gba_launcher  # noqa: E402
 import library  # noqa: E402
 from game_data import CheatStore, Favorites, SaveStateStore  # noqa: E402
 from gba_launcher import (  # noqa: E402
-    GBALauncher, GameManagementOverlay, ShortcutOverlay, StrongConfirmOverlay,
-    ConfirmOverlay,
+    GBALauncher, GameManagementOverlay, RenameOverlay, ShortcutOverlay,
+    StrongConfirmOverlay, ConfirmOverlay,
 )
 
 GAME_A = "44636205c3e1a1b2"
@@ -230,6 +230,81 @@ class TestGameManagement(ManagementTestCase):
         launcher.confirm_delete_all()
         self.assertEqual(launcher.overlays, [])
         self.assertIn("No imported games", launcher.toast_text)
+
+
+class TestRenameUI(ManagementTestCase):
+    """The rename dialog: Ctrl+R on the shelf, R in the game list."""
+
+    def test_ctrl_r_opens_the_rename_dialog_for_the_selected_game(self):
+        launcher = self.make_launcher()
+        entries = self.entries(launcher)
+        launcher.current_tab = gba_launcher.TAB_GAMES
+        launcher.selected[0] = 1
+        launcher._handle_key(pygame.event.Event(
+            pygame.KEYDOWN, key=pygame.K_r, mod=pygame.KMOD_CTRL))
+        overlay = launcher.overlays[-1]
+        self.assertIsInstance(overlay, RenameOverlay)
+        self.assertEqual(overlay.entry["id"], entries[1]["id"])
+        # The field starts with the current file name.
+        self.assertEqual(overlay.text, "bravo")
+
+    def test_typing_and_confirming_renames_the_file(self):
+        launcher = self.make_launcher()
+        entries = self.entries(launcher)
+        launcher.current_tab = gba_launcher.TAB_GAMES
+        launcher.selected[0] = 0
+        launcher._handle_key(pygame.event.Event(
+            pygame.KEYDOWN, key=pygame.K_r, mod=pygame.KMOD_CTRL))
+        overlay = launcher.overlays[-1]
+        for char in "Bravo":
+            overlay.handle(pygame.event.Event(
+                pygame.KEYDOWN, key=ord(char.lower()), unicode=char), launcher)
+        self.assertEqual(overlay.text, "Bravo")
+        overlay.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN),
+                       launcher)
+        self.assertFalse(os.path.exists(entries[0]["content_path"]))
+        self.assertTrue(os.path.isfile(os.path.join(self.games_dir, "Bravo.gba")))
+        self.assertIn("Renamed", launcher.toast_text)
+
+    def test_a_refused_rename_keeps_the_file_and_explains_why(self):
+        launcher = self.make_launcher()
+        entries = self.entries(launcher)
+        launcher.current_tab = gba_launcher.TAB_GAMES
+        launcher.selected[0] = 0
+        launcher._handle_key(pygame.event.Event(
+            pygame.KEYDOWN, key=pygame.K_r, mod=pygame.KMOD_CTRL))
+        overlay = launcher.overlays[-1]
+        # "bravo.gba" already exists - the rename must not overwrite it.
+        for char in "bravo":
+            overlay.handle(pygame.event.Event(
+                pygame.KEYDOWN, key=ord(char), unicode=char), launcher)
+        overlay.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN),
+                       launcher)
+        self.assertTrue(os.path.exists(entries[0]["content_path"]))
+        self.assertTrue(os.path.exists(entries[1]["content_path"]))
+        self.assertIn("already exists", overlay.error)
+
+    def test_the_game_list_offers_the_rename_action(self):
+        launcher = self.make_launcher()
+        entries = self.entries(launcher)
+        manage = GameManagementOverlay(launcher)
+        manage.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_r), launcher)
+        overlay = launcher.overlays[-1]
+        self.assertIsInstance(overlay, RenameOverlay)
+        self.assertEqual(overlay.entry["id"], entries[0]["id"])
+
+    def test_escape_leaves_the_name_alone(self):
+        launcher = self.make_launcher()
+        entries = self.entries(launcher)
+        launcher.current_tab = gba_launcher.TAB_GAMES
+        launcher.selected[0] = 0
+        launcher._handle_key(pygame.event.Event(
+            pygame.KEYDOWN, key=pygame.K_r, mod=pygame.KMOD_CTRL))
+        overlay = launcher.overlays[-1]
+        overlay.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE),
+                       launcher)
+        self.assertTrue(os.path.exists(entries[0]["content_path"]))
+        self.assertNotIn(overlay, launcher.overlays)
 
 
 class TestShortcutUI(ManagementTestCase):

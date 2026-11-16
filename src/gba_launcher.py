@@ -1236,13 +1236,115 @@ class StrongConfirmOverlay(Overlay):
                 self.on_confirm()
 
 
+class RenameOverlay(Overlay):
+    """Renames the ROM file of one game - the label on its cartridge.
+
+    The cartridge header is not used for the library name: hundreds of ROM
+    hacks ship the same header title, so the file name is what tells them
+    apart. Renaming therefore renames the file. Saves, cheats and the
+    favourite flag stay with the game: they are keyed by content, not by
+    name.
+    """
+
+    MAX_LENGTH = 120
+
+    def __init__(self, shell, entry):
+        super().__init__()
+        self.title = "RENAME GAME"
+        self.subtitle = "Enter confirm · Esc cancel · keyboard"
+        self.accent = "info"
+        self.width = 360.0
+        self.height = 110.0
+        self.entry = entry or {}
+        self.original = os.path.splitext(self.entry.get("filename") or "")[0]
+        self.text = self.original
+        # The current name is pre-filled and behaves like a selected text:
+        # the first character typed replaces it, a backspace edits it.
+        self.replace_on_type = True
+        self.error = ""
+
+    # -- input ---------------------------------------------------------
+    def handle(self, event, shell) -> None:
+        if event.type == pygame.QUIT:
+            if not shell.appliance_mode:
+                self.close(shell)
+            return
+        if event.type != pygame.KEYDOWN:
+            return
+        key = resolve_event_keycode(event)
+        if key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self._confirm(shell)
+        elif key == pygame.K_ESCAPE:
+            self.close(shell)
+        elif key == pygame.K_BACKSPACE:
+            self.text = self.text[:-1]
+            self.replace_on_type = False
+            self.error = ""
+        else:
+            char = getattr(event, "unicode", "")
+            if not char:
+                try:
+                    name = pygame.key.name(key)
+                except Exception:
+                    name = ""
+                char = name if len(name) == 1 else ""
+            if char and char.isprintable():
+                if self.replace_on_type:
+                    self.text = ""
+                    self.replace_on_type = False
+                if len(self.text) < self.MAX_LENGTH:
+                    self.text += char
+                    self.error = ""
+
+    # -- action --------------------------------------------------------
+    def _confirm(self, shell) -> None:
+        result = game_data.rename_game(self.entry, self.text,
+                                       library=shell.library)
+        if not result.get("ok"):
+            self.error = (result.get("errors") or ["rename failed"])[0]
+            return
+        logger.info("Renamed %s -> %s", self.entry.get("content_path"),
+                    result.get("path"))
+        shell.close_overlays()
+        shell.rescan_library(quiet=True)
+        shell.toast(f"Renamed to {result.get('title')}", TOAST_OK)
+
+    # -- drawing -------------------------------------------------------
+    def draw_body(self, shell) -> None:
+        theme = shell.theme
+        c = theme.colors
+        rect = self.content_rect(shell)
+        x0, y0 = rect.x / theme.scale, rect.y / theme.scale
+        width = rect.width / theme.scale
+
+        theme.label(shell.surface, "NEW NAME", (x0 + 4, y0), c.text_dim, key="micro")
+        field = theme.rect(x0, y0 + 12, width, 20)
+        pygame.draw.rect(shell.surface, c.card_sel, field, border_radius=theme.px(3))
+        pygame.draw.rect(shell.surface, c.primary, field, width=1, border_radius=theme.px(3))
+        shown = truncate(theme.font("body"), self.text, theme.px(width - 14))
+        theme.label(shell.surface, shown, (x0 + 7, y0 + 16), c.text, key="body")
+        # The caret sits right behind the last character.
+        caret_x = x0 + 7 + theme.font("body").size(shown)[0] / theme.scale
+        caret = theme.rect(caret_x, y0 + 15, 1.5, 14)
+        pygame.draw.rect(shell.surface, c.primary, caret)
+
+        y = y0 + 36
+        if self.error:
+            theme.label(shell.surface,
+                        truncate(theme.font("micro"), self.error, theme.px(width)),
+                        (x0 + 4, y), c.danger, key="micro")
+            y += 12
+        theme.label(shell.surface, "The file is renamed; saves and cheats stay.",
+                    (x0 + 4, y), c.text_dim, key="micro")
+
+
 class GameManagementOverlay(Overlay):
-    """Multi-select list for permanently deleting imported games."""
+    """Multi-select list for renaming and permanently deleting imported games."""
 
     def __init__(self, shell):
         super().__init__()
-        self.title = "DELETE SELECTED GAMES"
-        self.subtitle = "A toggle · Start/D delete · B back"
+        self.title = "MANAGE GAMES"
+        self.subtitle = "A select · R rename · D delete · B back"
         self.accent = "danger"
         self.width = 380.0
         self.height = 260.0
@@ -1271,6 +1373,8 @@ class GameManagementOverlay(Overlay):
             elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER,
                                pygame.K_z, pygame.K_SPACE) and self.items:
                 self._toggle(self.index)
+            elif event.key == pygame.K_r:
+                self._rename(shell)
             elif event.key in (pygame.K_d, pygame.K_DELETE):
                 self._confirm(shell)
         elif event.type == pygame.JOYBUTTONDOWN:
@@ -1292,6 +1396,14 @@ class GameManagementOverlay(Overlay):
         else:
             self.selected.add(index)
         self.index = index
+
+    def _rename(self, shell) -> None:
+        """Opens the rename dialog for the highlighted game."""
+        if not self.items:
+            shell.toast("No imported ROMs to rename", TOAST_WARN)
+            return
+        entry = self.items[self.index]
+        shell.push_overlay(RenameOverlay(shell, entry))
 
     def _confirm(self, shell) -> None:
         if not self.selected:
@@ -1344,7 +1456,7 @@ class GameManagementOverlay(Overlay):
                         (x0 + 26, y + 4), c.text if index == self.index
                         else c.text_muted)
         theme.label(shell.surface,
-                    f"{len(self.selected)} selected · Start/D delete (asks first)",
+                    f"{len(self.selected)} selected · R rename · Start/D delete (asks first)",
                     (x0 + 4, y0 + visible * 20 + 4), c.highlight, key="micro")
 
 
@@ -2484,6 +2596,20 @@ class GBALauncher:
                    item.get("title", ""), TOAST_OK if is_favorite else TOAST_INFO)
         return is_favorite
 
+    def rename_current_game(self) -> bool:
+        """Opens the rename dialog for the selected game (Ctrl+R).
+
+        The library shows the file name, not the cartridge header: hundreds
+        of ROM hacks ship the same header title, so the file name is what
+        tells them apart - and renaming it is how the user fixes that.
+        """
+        item = self.current_item()
+        if not item or item.get("type") != "game" or not item.get("content_path"):
+            self.toast("Select a game to rename", TOAST_WARN)
+            return False
+        self.push_overlay(RenameOverlay(self, item))
+        return True
+
     def visible_games(self) -> List[Dict[str, Any]]:
         games = self.favorites.order(self.games)
         if not self.filter_text:
@@ -3022,6 +3148,10 @@ class GBALauncher:
         if key == pygame.K_f and (mod & pygame.KMOD_CTRL) and \
                 self.current_tab == TAB_GAMES:
             self.toggle_favorite()
+            return
+        if key == pygame.K_r and (mod & pygame.KMOD_CTRL) and \
+                self.current_tab == TAB_GAMES:
+            self.rename_current_game()
             return
         if key == pygame.K_TAB:
             self.switch_tab(-1 if mod & pygame.KMOD_SHIFT else 1)
@@ -3636,6 +3766,11 @@ class GBALauncher:
             {"type": "info", "label": "Favorites",
              "value": str(len(self.favorites.ids())),
              "hint": "Ctrl+F or controller X toggles a favorite in GAMES."},
+            {"type": "action", "label": "Rename a Game",
+             "hint": "Rename the ROM file of a game. The library shows the file "
+                     "name, so ROM hacks that share a cartridge title can be "
+                     "told apart. Saves and cheats stay with the game.",
+             "action": lambda shell: shell.push_overlay(GameManagementOverlay(shell))},
             {"type": "action", "label": "Delete Selected Games",
              "hint": "Choose multiple ROMs; each deletion asks for confirmation.",
              "action": lambda shell: shell.push_overlay(GameManagementOverlay(shell))},
@@ -4178,6 +4313,7 @@ class GBALauncher:
                     ("(B)", "back", c.text_muted),
                     ("(D-Pad)", "navigate", c.text_muted),
                     ("Ctrl+F / X", "favorite", c.highlight),
+                    ("Ctrl+R", "rename", c.highlight),
                     ("[Tab]", "tab", c.info),
                     ("type", "search", c.text_dim)]
         return [("(A)", "select", c.primary),

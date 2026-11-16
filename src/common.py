@@ -222,6 +222,23 @@ def _title_from_filename(file_path: str) -> str:
     return " ".join(base.split()) or os.path.basename(file_path)
 
 
+def filename_title(file_path: str) -> str:
+    """The name of the file, used as the title on the cartridge shelf.
+
+    The cartridge header is deliberately *not* used for this. Hundreds of
+    ROM hacks ship the same header title ("POKEMON EMER" is a popular base),
+    so a shelf built from header titles shows the same name over and over
+    and the games become impossible to tell apart. The file name is what
+    tells them apart, and it is what the user named them in the first place.
+
+    The name is used verbatim (minus the extension): decorations such as
+    "(USA)", "(Rev 1)" or "[b]" are exactly what distinguishes two dumps of
+    the same game, so nothing is stripped here.
+    """
+    base = os.path.splitext(os.path.basename(file_path))[0].strip()
+    return base or os.path.basename(file_path)
+
+
 def extract_gba_title(file_path: str) -> str:
     """
     Reads the cartridge header title, falling back to a cleaned filename.
