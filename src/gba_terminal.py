@@ -177,8 +177,11 @@ class TerminalSession:
         # does) are only found if that directory is on the PATH - and the
         # profile that adds it is not always read.
         local_bin = os.path.join(os.path.expanduser("~"), ".local", "bin")
-        if os.path.isdir(local_bin) and local_bin not in env.get("PATH", "").split(":"):
-            env["PATH"] = local_bin + ":" + env.get("PATH", "")
+        path = env.get("PATH", "")
+        if os.path.isdir(local_bin) and local_bin not in path.split(":"):
+            # No trailing colon: an empty PATH entry means "the current
+            # directory", which is not somewhere a tool should be found.
+            env["PATH"] = f"{local_bin}:{path}" if path else local_bin
 
         try:
             master, slave = pty.openpty()
